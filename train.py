@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """ZERO continuous self-play training orchestrator with active memory guardrails."""
 
 from __future__ import annotations
@@ -16,7 +15,12 @@ from zero_chess.constants import BLACK, WHITE
 from zero_chess.elo import DEFAULT_ELO, update_rating_from_result
 from zero_chess.mcts import NetworkEvaluator, UniformEvaluator
 from zero_chess.replay import PrioritizedReplayBuffer
-from zero_chess.self_play import SelfPlayConfig, generate_parallel_games, start_persistent_cuda_training
+from zero_chess.self_play import (
+    SelfPlayConfig, 
+    generate_parallel_games, 
+    start_persistent_cuda_training,
+    _append_training_game_history
+)
 
 VERSION = "1.2.8"
 
@@ -74,8 +78,20 @@ def main() -> None:
                 print(f"Memory recovered ({ram_avail}MB available). Resuming game generation.", flush=True)
 
             games = generate_parallel_games(UniformEvaluator(), args.games_per_iteration, SelfPlayConfig(simulations=1, max_plies=128))
-            for _, experiences, _ in games:
+            for game_idx, (result, experiences, sans) in enumerate(games):
                 replay.extend(experiences)
+                _append_training_game_history(
+                    game_number=iteration * args.games_per_iteration + game_idx,
+                    generation=iteration,
+                    result=result,
+                    moves_san=sans,
+                    elo_after=0.0,
+                    elo_delta=0.0,
+                    rated_side=0,
+                    replay_size=len(replay),
+                    train_step=0,
+                    metrics={},
+                )
             iteration += 1
             replay.save("data/replay.pkl")
             print(f"iteration={iteration} replay={len(replay)} mode=bootstrap", flush=True)
@@ -220,16 +236,7 @@ def main() -> None:
                 args.games_per_iteration,
                 self_play_config,
             )
-            for game_idx, (result, experiences, _) in enumerate(games):
-                replay.extend(experiences)
-                rated_side = WHITE if (iteration + game_idx) % 2 else BLACK
-                elo, elo_delta = update_rating_from_result(elo, elo, result, rated_side)
-                print(
-                    f"rated game result={result} side={'white' if rated_side == WHITE else 'black'} "
-                    f"elo={elo:.1f} elo_delta={elo_delta:+.1f}",
-                    flush=True,
-                )
-
+            
             metrics = {"loss": 0.0, "replay_size": float(len(replay)), "lr": optimizer.param_groups[0]["lr"]}
             updates_this_iteration = 0
             if len(replay) > 256:
@@ -250,6 +257,28 @@ def main() -> None:
                     )
                     teacher.update(model)
                 metrics["updates_this_iteration"] = float(updates_this_iteration)
+
+            for game_idx, (result, experiences, sans) in enumerate(games):
+                replay.extend(experiences)
+                rated_side = WHITE if (iteration + game_idx) % 2 else BLACK
+                elo, elo_delta = update_rating_from_result(elo, elo, result, rated_side)
+                print(
+                    f"rated game result={result} side={'white' if rated_side == WHITE else 'black'} "
+                    f"elo={elo:.1f} elo_delta={elo_delta:+.1f}",
+                    flush=True,
+                )
+                _append_training_game_history(
+                    game_number=iteration * args.games_per_iteration + game_idx,
+                    generation=iteration,
+                    result=result,
+                    moves_san=sans,
+                    elo_after=elo,
+                    elo_delta=elo_delta,
+                    rated_side=rated_side,
+                    replay_size=len(replay),
+                    train_step=train_updates,
+                    metrics=metrics,
+                )
 
             if iteration % 20 == 0:
                 arena = play_arena(

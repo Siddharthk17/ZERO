@@ -21,6 +21,8 @@ class ModelConfig:
     attention_heads: int = 4
     policy_size: int = POLICY_SIZE
     dropout: float = 0.0
+    se_reduction: int = 8       # Dynamic Squeeze & Excitation reduction
+    policy_channels: int = 16   # Dynamic policy head intermediate channels
 
 
 class SqueezeExcitation(nn.Module):
@@ -42,13 +44,13 @@ class SqueezeExcitation(nn.Module):
 class ConvResidualBlock(nn.Module):
     """Standard residual convolutional block with Batch Normalization and Squeeze-and-Excitation."""
 
-    def __init__(self, channels: int) -> None:
+    def __init__(self, channels: int, reduction: int = 8) -> None:
         super().__init__()
         self.bn1 = nn.BatchNorm2d(channels)
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(channels)
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.se = SqueezeExcitation(channels)
+        self.se = SqueezeExcitation(channels, reduction=reduction)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
@@ -100,16 +102,16 @@ class ZeroNet(nn.Module):
             if (idx + 1) % self.config.transformer_every == 0:
                 tower.append(BoardTransformerBlock(c, self.config.attention_heads, self.config.dropout))
             else:
-                tower.append(ConvResidualBlock(c))
+                tower.append(ConvResidualBlock(c, reduction=self.config.se_reduction))
         self.tower = nn.Sequential(*tower)
 
         self.policy_head = nn.Sequential(
             nn.BatchNorm2d(c),
             nn.SiLU(),
-            nn.Conv2d(c, 16, kernel_size=1),
+            nn.Conv2d(c, self.config.policy_channels, kernel_size=1),
             nn.SiLU(),
             nn.Flatten(),
-            nn.Linear(16 * 8 * 8, self.config.policy_size),
+            nn.Linear(self.config.policy_channels * 8 * 8, self.config.policy_size),
         )
 
         self.value_pool = nn.AdaptiveAvgPool2d(1)
@@ -146,7 +148,7 @@ class ZeroNet(nn.Module):
         
         value_features = self.value_body(self.value_pool(y))
         
-        # CORRECTED SCALING: Maps directly to [-3.0, 1.0] matching the asymmetric draw-as-loss targets bounds
+        # Maps directly to [-3.0, 1.0] matching the asymmetric draw-as-loss targets bounds
         value = 2.0 * torch.tanh(self.value_head(value_features)) - 1.0
         
         wdl_logits = self.wdl_head(value_features)
@@ -194,7 +196,6 @@ class ZeroNet(nn.Module):
             )
         device_type = "cuda" if str(device).startswith("cuda") else "cpu"
         
-        # Safe try-except block to query driver precision support on multiple GPU architectures securely
         is_bf16 = False
         if device_type == "cuda":
             try:
@@ -220,11 +221,33 @@ class ZeroNet(nn.Module):
 
 
 def load_model(path: str | Path, device: str | torch.device = "cpu") -> ZeroNet:
-    """Load a model state payload from disk."""
+    """Load a model state payload from disk with automatic structural alignment."""
     payload = torch.load(path, map_location=device)
-    config = ModelConfig(**payload.get("config", {}))
+    state = payload.get("model", payload) if isinstance(payload, dict) else payload
+    config_dict = payload.get("config", {}) if isinstance(payload, dict) else {}
+
+    # Auto-detect architectural parameters from the loaded state_dict shapes
+    if "stem.0.weight" in state:
+        config_dict["channels"] = state["stem.0.weight"].shape[0]
+
+    tower_indices = set()
+    for key in state.keys():
+        if key.startswith("tower."):
+            parts = key.split(".")
+            if parts[1].isdigit():
+                tower_indices.add(int(parts[1]))
+    if tower_indices:
+        config_dict["blocks"] = max(tower_indices) + 1
+
+    if "tower.0.se.fc1.weight" in state:
+        hidden, channels = state["tower.0.se.fc1.weight"].shape
+        config_dict["se_reduction"] = channels // hidden
+
+    if "policy_head.2.weight" in state:
+        config_dict["policy_channels"] = state["policy_head.2.weight"].shape[0]
+
+    config = ModelConfig(**config_dict)
     model = ZeroNet(config).to(device)
-    state = payload.get("model", payload)
     model.load_state_dict(state)
     model.eval()
     return model

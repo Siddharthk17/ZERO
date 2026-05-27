@@ -127,7 +127,7 @@ def train_step(
         masks.append(encode_move_mask(legal, board, device=config.device))
         policy_targets.append(_policy_from_exp(board, exp, config.device))
         
-        # CORRECTED: Clamp value targets to [-3.0, 1.0] matching the asymmetric draw-as-loss targets bounds [2]
+        # Clamp value targets to [-3.0, 1.0] matching the asymmetric draw-as-loss targets bounds
         raw_target = td_blended_target(exp.value, exp.td_value, config.td_lambda) + exp.reward_bonus
         value_targets.append(max(-3.0, min(1.0, raw_target)))
         
@@ -152,7 +152,6 @@ def train_step(
     device_type = "cuda" if str(config.device).startswith("cuda") else "cpu"
     use_amp = config.mixed_precision and device_type == "cuda"
     
-    # Safe try-except block to query driver precision support on multiple GPU architectures securely
     is_bf16 = False
     if device_type == "cuda":
         try:
@@ -160,9 +159,9 @@ def train_step(
         except Exception:
             pass
             
-    amp_dtype = torch.bfloat16 if is_bf16 else torch.float16
+    # Fallback to bfloat16 for CPU device type to prevent dtype validation error on float16 CPU autocast
+    amp_dtype = torch.bfloat16 if (is_bf16 or device_type == "cpu") else torch.float16
     
-    # Dynamic compatibility check to initialize the correct scaler based on the available PyTorch API version
     if scaler is None:
         if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
             scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -298,5 +297,5 @@ def main(argv: list[str] | None = None) -> None:
     print({"params": parameter_count(model), **metrics})
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     main()

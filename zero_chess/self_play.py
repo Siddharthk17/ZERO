@@ -426,7 +426,23 @@ def start_persistent_cuda_training(
     )
     monitor.start()
 
-    return CudaTrainingRuntime(stop_event, [*workers, evaluator, trainer, monitor], [])
+    # Collect and keep strong references to all IPC resources to prevent GC unlinking
+    resources = [
+        request_queue,
+        response_queues,
+        game_queue,
+        stop_event,
+        weights_updated,
+        state_lock,
+        generation_value,
+        games_completed,
+        positions_evaluated,
+        eval_batches,
+        batch_positions,
+        active_workers,
+    ]
+
+    return CudaTrainingRuntime(stop_event, [*workers, evaluator, trainer, monitor], resources)
 
 
 def _persistent_self_play_process_main(
@@ -520,6 +536,15 @@ def _persistent_gpu_evaluator_process_main(
         if not requests:
             continue
         flat_boards = [board for _, _, _, boards in requests for board in boards]
+        
+        # Increment batch and evaluation stats counters
+        with positions_evaluated.get_lock():
+            positions_evaluated.value += len(flat_boards)
+        with eval_batches.get_lock():
+            eval_batches.value += 1
+        with batch_positions.get_lock():
+            batch_positions.value += len(flat_boards)
+
         try:
             flat_results = _evaluate_preallocated_chunk(
                 compiled_model,
@@ -544,6 +569,11 @@ def _persistent_gpu_evaluator_process_main(
             end = offset + len(boards)
             response_queues[worker_id].put((request_id, None if error else flat_results[offset:end], error))
             offset = end
+            
+        # Fulfill defined GPU cooldown sleep parameter to avoid thermal limits
+        if gpu_cooldown_ms > 0.0:
+            time.sleep(gpu_cooldown_ms / 1000.0)
+
         gc.collect()
 
 
@@ -662,10 +692,11 @@ def _trainer_process_main(
         elo, elo_delta = update_rating_from_result(elo, elo, result, rated_side)
         iteration += 1 if completed_games % max(1, games_per_generation) == 0 else 0
         generation_value.value = iteration
-        updates = 0
+        
+        metrics = {}
         if len(replay) > 256:
             train_updates += 1
-            train_step(
+            metrics = train_step(
                 model,
                 optimizer,
                 replay,
@@ -681,6 +712,21 @@ def _trainer_process_main(
 
         replay.save(replay_path)
         checkpoint_manager.save(model, iteration, elo, optimizer.state_dict())
+        
+        # Append completed self-play game history to PGN and JSONL files for the UI
+        _append_training_game_history(
+            game_number=completed_games,
+            generation=iteration,
+            result=result,
+            moves_san=sans,
+            elo_after=elo,
+            elo_delta=elo_delta,
+            rated_side=rated_side,
+            replay_size=len(replay),
+            train_step=train_updates,
+            metrics=metrics,
+        )
+
         gc.collect()
         if device == "cuda":
             torch.cuda.empty_cache()
@@ -797,13 +843,30 @@ def _utilization_monitor_process_main(
 ) -> None:
     path = Path(log_path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    start_time = time.monotonic()
     while not stop_event.is_set():
         time.sleep(30.0)
         gpu_util, vram_used, vram_total = _query_gpu_utilization()
         ram_used, ram_total, ram_available, swap_used, swap_total = _query_memory_utilization()
-        line = f"gpu_util={gpu_util:.0f}% vram={vram_used}/{vram_total}MiB ram_avail={ram_available}MiB"
+        
+        # Read absolute metrics
+        games = games_completed.value
+        pos_eval = positions_evaluated.value
+        batches = eval_batches.value
+        avg_batch = batch_positions.value / max(1, batches)
+        
+        # Calculate rates over elapsed time
+        elapsed_min = (time.monotonic() - start_time) / 60.0
+        pos_per_min = pos_eval / max(0.01, elapsed_min)
+        games_per_hour = (games / max(0.01, elapsed_min)) * 60.0
+        
+        line = (
+            f"games={games} ({games_per_hour:.1f} g/hr) | "
+            f"pos_eval={pos_eval} ({pos_per_min:.1f} p/min) | "
+            f"batches={batches} avg_batch={avg_batch:.1f} | "
+            f"gpu_util={gpu_util:.0f}% vram={vram_used}/{vram_total}MiB ram_avail={ram_available}MiB"
+        )
         print(line, flush=True)
-
 
 def _query_gpu_utilization() -> tuple[float, int, int]:
     try:

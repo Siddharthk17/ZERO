@@ -6,20 +6,12 @@ import argparse
 import asyncio
 import json
 import sys
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-
-app = FastAPI(title="ZERO Engine WebSocket")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
 @dataclass(slots=True)
@@ -144,6 +136,23 @@ def parse_info(line: str) -> tuple[float | None, int | None]:
 
 
 engine = UCIProcess()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Safely terminate the background engine process when FastAPI shuts down."""
+    yield
+    await engine.close()
+
+
+app = FastAPI(title="ZERO Engine WebSocket", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _tail_file_lines(path: Path, max_lines: int = 500) -> list[str]:
