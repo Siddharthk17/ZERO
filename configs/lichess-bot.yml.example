@@ -1,0 +1,30 @@
+token: "PUT_LICHESS_OAUTH_TOKEN_HERE"
+url: "https://lichess.org/"
+engine:
+  dir: "."
+  name: "ZERO"
+  protocol: "uci"
+  working_dir: "."
+  command: "python -m zero_chess.uci --checkpoint checkpoints/zero.pt --device cuda --simulations 800"
+  ponder: false
+  polyglot:
+    enabled: false
+challenge:
+  concurrency: 1
+  sort_by: "best"
+  accept_bot: true
+  only_bot: false
+  max_increment: 5
+  min_increment: 0
+  variants:
+    - "standard"
+  time_controls:
+    - "blitz"
+    - "rapid"
+  modes:
+    - "rated"
+    - "casual"
+matchmaking:
+  allow_matchmaking: false
+books:
+  enabled: false

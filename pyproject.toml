@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zero-chess"
+version = "0.1.0"
+description = "Self-play AlphaZero-style chess engine scaffold with UCI support."
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26.0; python_version < '3.14'",
+  "numpy>=2.2.0; python_version >= '3.14'",
+  "torch>=2.2.0; python_version < '3.14'",
+  "torch>=2.9.0; python_version >= '3.14'",
+  "fastapi>=0.136.0",
+  "uvicorn[standard]>=0.38.0",
+  "websockets>=16.0",
+]
+
+[project.optional-dependencies]
+train = []
+dev = ["pytest>=8.0.0"]
+
+[project.scripts]
+zero-uci = "zero_chess.uci:main"
+zero-selfplay = "zero_chess.self_play:main"
+zero-train = "zero_chess.training:main"
+zero-arena = "zero_chess.arena:main"
+zero-ws = "zero_chess.websocket_server:main"
+
+[tool.setuptools.packages.find]
+include = ["zero_chess*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,281 @@
+"""Thread-safe prioritized replay buffer with hot and cold tiers."""
+
+from __future__ import annotations
+
+import pickle
+import random
+import sqlite3
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+
+def _get_available_ram_bytes() -> int:
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    return int(parts[1]) * 1024
+    except Exception:
+        pass
+    return 8 * 1024 * 1024 * 1024
+
+
+@dataclass(slots=True)
+class Experience:
+    fen: str
+    policy: dict[str, float]
+    value: float
+    td_value: float
+    wdl: tuple[float, float, float]
+    priority: float = 0.0
+    value_prediction: float = 0.0
+    importance_weight: float = 1.0
+    reward_bonus: float = 0.0
+    aggression_score: float = 0.0
+    momentum_reward: float = 0.0
+    panic_penalty: float = 0.0
+
+    def __post_init__(self) -> None:
+        self.fen = str(self.fen)
+        self.policy = {str(k.uci() if hasattr(k, "uci") else k): float(v.item() if hasattr(v, "item") else v) for k, v in self.policy.items()}
+        self.value = float(self.value.item() if hasattr(self.value, "item") else self.value)
+        self.td_value = float(self.td_value.item() if hasattr(self.td_value, "item") else self.td_value)
+        self.wdl = tuple(float(x.item() if hasattr(x, "item") else x) for x in self.wdl)
+        self.priority = float(self.priority.item() if hasattr(self.priority, "item") else self.priority)
+        self.value_prediction = float(self.value_prediction.item() if hasattr(self.value_prediction, "item") else self.value_prediction)
+        self.importance_weight = float(self.importance_weight.item() if hasattr(self.importance_weight, "item") else self.importance_weight)
+        self.reward_bonus = float(self.reward_bonus.item() if hasattr(self.reward_bonus, "item") else self.reward_bonus)
+        self.aggression_score = float(self.aggression_score.item() if hasattr(self.aggression_score, "item") else self.aggression_score)
+        self.momentum_reward = float(self.momentum_reward.item() if hasattr(self.momentum_reward, "item") else self.momentum_reward)
+        self.panic_penalty = float(self.panic_penalty.item() if hasattr(self.panic_penalty, "item") else self.panic_penalty)
+
+
+
+@dataclass(slots=True)
+class SampleBatch:
+    experiences: list[Experience]
+    indices: list[int | None]
+    weights: list[float]
+
+
+class SumTree:
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity
+        self.tree = [0.0] * (2 * capacity)
+
+    @property
+    def total(self) -> float:
+        return self.tree[1]
+
+    def update(self, index: int, priority: float) -> None:
+        pos = index + self.capacity
+        change = priority - self.tree[pos]
+        self.tree[pos] = priority
+        pos //= 2
+        while pos:
+            self.tree[pos] += change
+            pos //= 2
+
+    def get(self, value: float) -> int:
+        idx = 1
+        while idx < self.capacity:
+            left = idx * 2
+            if value <= self.tree[left]:
+                idx = left
+            else:
+                value -= self.tree[left]
+                idx = left + 1
+        return idx - self.capacity
+
+
+class PrioritizedReplayBuffer:
+    def __init__(
+        self,
+        hot_capacity: int = 20_000,
+        cold_path: str | Path | None = None,
+        cold_capacity: int = 2_000_000,
+        alpha: float = 0.6,
+        beta: float = 0.4,
+        epsilon: float = 0.01,
+        rng: random.Random | None = None,
+    ) -> None:
+        ram_bytes = _get_available_ram_bytes()
+        limit = 10_000 if ram_bytes < 2 * 1024 * 1024 * 1024 else 20_000
+        self.hot_capacity = min(hot_capacity, limit)
+        self.cold_path = Path(cold_path) if cold_path else None
+        self.cold_capacity = cold_capacity
+        self.alpha = alpha
+        self.beta = beta
+        self.epsilon = epsilon
+        self.rng = rng or random.Random()
+        self.hot: list[Experience] = []
+        self._cursor = 0
+        self._tree = SumTree(self.hot_capacity)
+        self._max_priority = 1.0
+        self._lock = threading.Lock()
+        if self.cold_path is not None:
+            self._init_cold()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self.hot) + self._cold_count_unlocked()
+
+    @property
+    def hot_size(self) -> int:
+        with self._lock:
+            return len(self.hot)
+
+    def add(self, exp: Experience) -> None:
+        with self._lock:
+            if exp.priority <= 0:
+                exp.priority = self._max_priority
+            else:
+                exp.priority = self._priority_from_error(exp.priority)
+                self._max_priority = max(self._max_priority, exp.priority)
+            if len(self.hot) < self.hot_capacity:
+                index = len(self.hot)
+                self.hot.append(exp)
+            else:
+                index = self._cursor
+                self._append_cold_unlocked(self.hot[index])
+                self.hot[index] = exp
+                self._cursor = (self._cursor + 1) % self.hot_capacity
+            self._tree.update(index, exp.priority)
+
+    def extend(self, experiences: list[Experience]) -> None:
+        for exp in experiences:
+            self.add(exp)
+
+    def sample(self, batch_size: int) -> list[Experience]:
+        return self.sample_with_weights(batch_size).experiences
+
+    def sample_with_weights(self, batch_size: int, beta: float | None = None) -> SampleBatch:
+        with self._lock:
+            if not self.hot and self._cold_count_unlocked() == 0:
+                raise ValueError("cannot sample from an empty replay buffer")
+            beta = self.beta if beta is None else beta
+            hot_n = min(len(self.hot), int(round(batch_size * 0.8))) if self.hot else 0
+            cold_n = batch_size - hot_n
+            if self._cold_count_unlocked() == 0:
+                hot_n = batch_size
+                cold_n = 0
+            experiences: list[Experience] = []
+            indices: list[int | None] = []
+            probs: list[float] = []
+            total = max(self._tree.total, 1e-12)
+            for _ in range(hot_n):
+                value = self.rng.random() * total
+                index = min(self._tree.get(value), len(self.hot) - 1)
+                exp = self.hot[index]
+                experiences.append(exp)
+                indices.append(index)
+                probs.append(max(exp.priority / total, 1e-12))
+            for exp in self._sample_cold_unlocked(cold_n):
+                experiences.append(exp)
+                indices.append(None)
+                probs.append(1.0 / max(1, self._cold_count_unlocked()))
+            weights = [(max(1, len(self.hot)) * prob) ** (-beta) for prob in probs]
+            max_weight = max(weights) if weights else 1.0
+            weights = [weight / max_weight for weight in weights]
+            for exp, weight in zip(experiences, weights, strict=True):
+                exp.importance_weight = weight
+            return SampleBatch(experiences, indices, weights)
+
+    def update_priorities(self, indices_or_experiences, td_errors) -> None:
+        with self._lock:
+            for item, error in zip(indices_or_experiences, td_errors, strict=True):
+                priority = self._priority_from_error(float(error))
+                self._max_priority = max(self._max_priority, priority)
+                if isinstance(item, int):
+                    if 0 <= item < len(self.hot):
+                        self.hot[item].priority = priority
+                        self._tree.update(item, priority)
+                elif isinstance(item, Experience):
+                    item.priority = priority
+                    try:
+                        index = self.hot.index(item)
+                    except ValueError:
+                        continue
+                    self._tree.update(index, priority)
+
+    def anneal_beta(self, step: int, total_steps: int = 500_000) -> float:
+        self.beta = min(1.0, 0.4 + 0.6 * max(0, step) / max(1, total_steps))
+        return self.beta
+
+    def save(self, path: str | Path) -> None:
+        with self._lock:
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            with tmp_path.open("wb") as fh:
+                pickle.dump(
+                    {
+                        "hot": self.hot,
+                        "cursor": self._cursor,
+                        "max_priority": self._max_priority,
+                    },
+                    fh,
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                )
+            tmp_path.replace(path)
+
+    @classmethod
+    def load(cls, path: str | Path, **kwargs) -> "PrioritizedReplayBuffer":
+        with Path(path).open("rb") as fh:
+            payload = pickle.load(fh)
+        replay = cls(**kwargs)
+        replay.hot = payload["hot"]
+        replay._cursor = payload["cursor"]
+        replay._max_priority = payload.get("max_priority", 1.0)
+        
+        # If hot size exceeds capacity due to capping, truncate and move overflow to cold tier
+        if len(replay.hot) > replay.hot_capacity:
+            overflow = replay.hot[replay.hot_capacity:]
+            replay.hot = replay.hot[:replay.hot_capacity]
+            for exp in overflow:
+                replay._append_cold_unlocked(exp)
+            replay._cursor = replay._cursor % replay.hot_capacity
+            
+        replay._tree = SumTree(replay.hot_capacity)
+        for idx, exp in enumerate(replay.hot):
+            replay._tree.update(idx, exp.priority or replay._max_priority)
+        return replay
+
+    def _priority_from_error(self, error: float) -> float:
+        return (abs(error) + self.epsilon) ** self.alpha
+
+    def _init_cold(self) -> None:
+        assert self.cold_path is not None
+        self.cold_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.cold_path) as conn:
+            conn.execute("PRAGMA synchronous = FULL")
+            conn.execute("CREATE TABLE IF NOT EXISTS experiences (id INTEGER PRIMARY KEY AUTOINCREMENT, payload BLOB NOT NULL)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_experiences_id ON experiences(id)")
+
+    def _append_cold_unlocked(self, exp: Experience) -> None:
+        if self.cold_path is None:
+            return
+        with sqlite3.connect(self.cold_path) as conn:
+            conn.execute("PRAGMA synchronous = FULL")
+            conn.execute("INSERT INTO experiences(payload) VALUES (?)", (pickle.dumps(exp, protocol=pickle.HIGHEST_PROTOCOL),))
+            count = conn.execute("SELECT COUNT(*) FROM experiences").fetchone()[0]
+            overflow = max(0, count - self.cold_capacity)
+            if overflow:
+                conn.execute(
+                    "DELETE FROM experiences WHERE id IN (SELECT id FROM experiences ORDER BY id LIMIT ?)",
+                    (overflow,),
+                )
+
+    def _sample_cold_unlocked(self, count: int) -> list[Experience]:
+        if count <= 0 or self.cold_path is None:
+            return []
+        with sqlite3.connect(self.cold_path) as conn:
+            rows = conn.execute("SELECT payload FROM experiences ORDER BY RANDOM() LIMIT ?", (count,)).fetchall()
+        return [pickle.loads(row[0]) for row in rows]
+
+    def _cold_count_unlocked(self) -> int:
+        if self.cold_path is None or not self.cold_path.exists():
+            return 0
+        with sqlite3.connect(self.cold_path) as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM experiences").fetchone()[0])
