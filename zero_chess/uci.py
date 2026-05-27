@@ -1,4 +1,4 @@
-"""Universal Chess Interface entry point."""
+"""Universal Chess Interface (UCI) entry point supporting subtree reuse."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from .board import Board
 from .mcts import MCTS, NetworkEvaluator, SearchResult, UniformEvaluator
+from .move import Move
 
 
 @dataclass(slots=True)
@@ -22,9 +23,12 @@ class UCIOptions:
 
 
 class UCIEngine:
+    """Manages the standard Universal Chess Interface protocol for zero-latency GUI play."""
+
     def __init__(self, options: UCIOptions | None = None) -> None:
         self.options = options or UCIOptions()
         self.board = Board()
+        self.played_moves: list[str] = []
         self.evaluator = UniformEvaluator()
         self.mcts = MCTS(self.evaluator, simulations=self.options.simulations, c_puct=self.options.cpuct, add_noise=False)
         self._search_thread: threading.Thread | None = None
@@ -35,6 +39,7 @@ class UCIEngine:
         self._load_checkpoint()
 
     def loop(self) -> None:
+        """Standard input loop parsing UCI commands asynchronously."""
         for line in sys.stdin:
             if not self.handle(line.strip()):
                 return
@@ -56,6 +61,7 @@ class UCIEngine:
                 self._cmd_setoption(args)
             elif cmd == "ucinewgame":
                 self.board = Board()
+                self.played_moves.clear()
                 self.mcts.reset()
             elif cmd == "position":
                 self._cmd_position(args)
@@ -75,7 +81,7 @@ class UCIEngine:
 
     def _cmd_uci(self) -> None:
         print("id name ZERO", flush=True)
-        print("id author Sid", flush=True)
+        print("id author Sid & AI", flush=True)
         print("option name Simulations type spin default 200 min 1 max 100000", flush=True)
         print("option name CPuct type string default 1.5", flush=True)
         print("option name Checkpoint type string default", flush=True)
@@ -103,11 +109,13 @@ class UCIEngine:
             self._load_checkpoint()
 
     def _cmd_position(self, args: list[str]) -> None:
+        """Parse position commands, utilizing fast subtree reuse where possible."""
         if not args:
             return
         idx = 0
+        base_board = Board()
         if args[idx] == "startpos":
-            self.board = Board()
+            base_board = Board()
             idx += 1
         elif args[idx] == "fen":
             fen_fields = []
@@ -115,11 +123,44 @@ class UCIEngine:
             while idx < len(args) and args[idx] != "moves":
                 fen_fields.append(args[idx])
                 idx += 1
-            self.board = Board.from_fen(" ".join(fen_fields))
-        if idx < len(args) and args[idx] == "moves":
-            for move in args[idx + 1 :]:
-                self.board.push_uci(move)
-        self.mcts.reset()
+            base_board = Board.from_fen(" ".join(fen_fields))
+            
+        new_moves = args[idx + 1 :] if (idx < len(args) and args[idx] == "moves") else []
+        
+        # Check if the new state is an incremental extension of our existing active board
+        if self.played_moves and len(new_moves) >= len(self.played_moves) and new_moves[:len(self.played_moves)] == self.played_moves:
+            # Incremental Update (Tree Reuse Path)
+            added_moves = new_moves[len(self.played_moves) :]
+            for move_str in added_moves:
+                raw_move = Move.from_uci(move_str)
+                resolved_move = None
+                for legal in self.board.legal_moves():
+                    if legal.from_sq == raw_move.from_sq and legal.to_sq == raw_move.to_sq and legal.promotion == raw_move.promotion:
+                        resolved_move = legal
+                        break
+                if resolved_move is not None:
+                    self.board.push(resolved_move)
+                    self.mcts.advance_to(resolved_move)
+                else:
+                    self.board.push_uci(move_str)
+                    self.mcts.reset()
+            self.played_moves = new_moves
+        else:
+            # Full Reset
+            self.board = base_board
+            self.mcts.reset()
+            for move_str in new_moves:
+                raw_move = Move.from_uci(move_str)
+                resolved_move = None
+                for legal in self.board.legal_moves():
+                    if legal.from_sq == raw_move.from_sq and legal.to_sq == raw_move.to_sq and legal.promotion == raw_move.promotion:
+                        resolved_move = legal
+                        break
+                if resolved_move is not None:
+                    self.board.push(resolved_move)
+                else:
+                    self.board.push_uci(move_str)
+            self.played_moves = new_moves
 
     def _cmd_go(self, args: list[str]) -> None:
         self._searched = True

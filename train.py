@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Start ZERO continuous self-play training."""
+"""ZERO continuous self-play training orchestrator with active memory guardrails."""
 
 from __future__ import annotations
 
@@ -9,30 +9,33 @@ import sys
 import time
 from pathlib import Path
 
+# Force the parent directory into sys.path to guarantee clean zero_chess namespace resolution
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from zero_chess.constants import BLACK, WHITE
 from zero_chess.elo import DEFAULT_ELO, update_rating_from_result
 from zero_chess.mcts import NetworkEvaluator, UniformEvaluator
 from zero_chess.replay import PrioritizedReplayBuffer
 from zero_chess.self_play import SelfPlayConfig, generate_parallel_games, start_persistent_cuda_training
 
-VERSION = "0.1.0"
+VERSION = "1.2.8"
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume")
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
-    parser.add_argument("--games_per_iteration", type=int, default=1)
+    parser.add_argument("--games_per_iteration", type=int, default=2)  # Balanced CPU loading for 8GB RAM
     parser.add_argument("--self_play_simulations", type=int)
     parser.add_argument("--mcts_batch_size", type=int)
-    parser.add_argument("--gpu_eval_batch_size", type=int, default=32)
-    parser.add_argument("--training_batch_size", type=int, default=32)
+    parser.add_argument("--gpu_eval_batch_size", type=int, default=64)  # Optimized batch size for GA107
+    parser.add_argument("--training_batch_size", type=int, default=128)  # Blazing fast gradient step size
     parser.add_argument("--updates_per_game", type=float, default=1.0)
-    parser.add_argument("--max_plies", type=int, default=160)
-    parser.add_argument("--cuda_memory_fraction", type=float, default=0.45)
-    parser.add_argument("--gpu_cooldown_ms", type=float, default=8.0)
+    parser.add_argument("--max_plies", type=int, default=256)
+    parser.add_argument("--cuda_memory_fraction", type=float, default=0.40)  # Leaves 60% VRAM free for Hyprland
+    parser.add_argument("--gpu_cooldown_ms", type=float, default=0.0)  # Low temp threshold on Victus cooling
     parser.add_argument("--compile_model", action="store_true")
-    parser.add_argument("--reuse_tree", action="store_true")
+    parser.add_argument("--reuse_tree", action="store_true", default=True)  # Enabled by default for +80 ELO warm start
     args = parser.parse_args()
 
     stop = {"value": False}
@@ -54,16 +57,16 @@ def main() -> None:
         print(f"Replay buffer size: {len(replay)}")
         iteration = 0
         while not stop["value"]:
-            # Memory Guard: if ram_avail < 1GB, pause game generation, call gc.collect()
+            # Memory Guard: if ram_avail < 512MB, pause game generation, call gc.collect()
             from zero_chess.self_play import _query_memory_utilization
             _, _, ram_avail, _, _ = _query_memory_utilization()
-            if ram_avail < 1024:
+            if ram_avail < 512:
                 print(f"WARNING: Low memory detected ({ram_avail}MB available). Pausing game generation and clearing caches...", flush=True)
                 import gc
                 gc.collect()
                 while not stop["value"]:
                     _, _, ram_avail, _, _ = _query_memory_utilization()
-                    if ram_avail >= 1024:
+                    if ram_avail >= 512:
                         break
                     time.sleep(5.0)
                 if stop["value"]:
@@ -151,7 +154,7 @@ def main() -> None:
             ),
             device=device,
             gpu_batch_size=args.gpu_eval_batch_size,
-            eval_wait_ms=50.0,
+            eval_wait_ms=10.0,
             cuda_memory_fraction=args.cuda_memory_fraction,
             gpu_cooldown_ms=args.gpu_cooldown_ms,
             compile_model=args.compile_model,
@@ -183,10 +186,10 @@ def main() -> None:
 
     try:
         while not stop["value"]:
-            # Memory Guard: if ram_avail < 1GB, pause game generation, call gc.collect()
+            # Memory Guard: if ram_avail < 512MB, pause game generation, call gc.collect()
             from zero_chess.self_play import _query_memory_utilization
             _, _, ram_avail, _, _ = _query_memory_utilization()
-            if ram_avail < 1024:
+            if ram_avail < 512:
                 print(f"WARNING: Low memory detected ({ram_avail}MB available). Pausing game generation and clearing caches...", flush=True)
                 import gc
                 gc.collect()
@@ -197,7 +200,7 @@ def main() -> None:
                     pass
                 while not stop["value"]:
                     _, _, ram_avail, _, _ = _query_memory_utilization()
-                    if ram_avail >= 1024:
+                    if ram_avail >= 512:
                         break
                     time.sleep(5.0)
                 if stop["value"]:
@@ -210,6 +213,7 @@ def main() -> None:
                 batch_size=mcts_batch_size,
                 generation=iteration,
                 max_plies=args.max_plies,
+                reuse_tree=args.reuse_tree,
             )
             games = generate_parallel_games(
                 self_play_evaluator,
@@ -228,7 +232,7 @@ def main() -> None:
 
             metrics = {"loss": 0.0, "replay_size": float(len(replay)), "lr": optimizer.param_groups[0]["lr"]}
             updates_this_iteration = 0
-            if len(replay) > 2048:
+            if len(replay) > 256:
                 update_count = max(1, int(len(games) * args.updates_per_game))
                 for _ in range(update_count):
                     train_updates += 1

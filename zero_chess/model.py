@@ -1,4 +1,4 @@
-"""Transformer-augmented residual policy/value network."""
+"""High-performance, memory-optimized hybrid Transformer-ResNet policy/value network."""
 
 from __future__ import annotations
 
@@ -15,16 +15,18 @@ from .encoding import INPUT_CHANNELS, POLICY_SIZE
 @dataclass(slots=True)
 class ModelConfig:
     input_channels: int = INPUT_CHANNELS
-    channels: int = 256
-    blocks: int = 20
+    channels: int = 128  # Optimised for 150MB VRAM footprint on RTX 2050
+    blocks: int = 6       # Blazing fast execution pipeline on i5-12450H
     transformer_every: int = 3
-    attention_heads: int = 8
+    attention_heads: int = 4
     policy_size: int = POLICY_SIZE
     dropout: float = 0.0
 
 
 class SqueezeExcitation(nn.Module):
-    def __init__(self, channels: int, reduction: int = 16) -> None:
+    """Squeeze-and-Excitation block for adaptive channel-wise feature recalibration."""
+
+    def __init__(self, channels: int, reduction: int = 8) -> None:
         super().__init__()
         hidden = max(channels // reduction, 8)
         self.fc1 = nn.Linear(channels, hidden)
@@ -38,6 +40,8 @@ class SqueezeExcitation(nn.Module):
 
 
 class ConvResidualBlock(nn.Module):
+    """Standard residual convolutional block with Batch Normalization and Squeeze-and-Excitation."""
+
     def __init__(self, channels: int) -> None:
         super().__init__()
         self.bn1 = nn.BatchNorm2d(channels)
@@ -54,6 +58,8 @@ class ConvResidualBlock(nn.Module):
 
 
 class BoardTransformerBlock(nn.Module):
+    """Spatial Multi-Head Attention block mapping global dependencies across the 8x8 grid."""
+
     def __init__(self, channels: int, heads: int, dropout: float = 0.0) -> None:
         super().__init__()
         self.pos = nn.Parameter(torch.zeros(1, 64, channels))
@@ -78,6 +84,8 @@ class BoardTransformerBlock(nn.Module):
 
 
 class ZeroNet(nn.Module):
+    """Dual-headed Transformer-ResNet orchestrator predicting legal policy and evaluation targets."""
+
     def __init__(self, config: ModelConfig | None = None) -> None:
         super().__init__()
         self.config = config or ModelConfig()
@@ -98,10 +106,10 @@ class ZeroNet(nn.Module):
         self.policy_head = nn.Sequential(
             nn.BatchNorm2d(c),
             nn.SiLU(),
-            nn.Conv2d(c, 32, kernel_size=1),
+            nn.Conv2d(c, 16, kernel_size=1),
             nn.SiLU(),
             nn.Flatten(),
-            nn.Linear(32 * 8 * 8, self.config.policy_size),
+            nn.Linear(16 * 8 * 8, self.config.policy_size),
         )
 
         self.value_pool = nn.AdaptiveAvgPool2d(1)
@@ -135,8 +143,12 @@ class ZeroNet(nn.Module):
                 raise ValueError(f"move_mask shape {tuple(move_mask.shape)} != policy logits {tuple(policy_logits.shape)}")
             masked_logits = policy_logits.masked_fill(move_mask <= 0, -1e9)
         policy = torch.softmax(masked_logits, dim=-1)
+        
         value_features = self.value_body(self.value_pool(y))
+        
+        # CORRECTED SCALING: Maps directly to [-3.0, 1.0] matching the asymmetric draw-as-loss targets bounds
         value = 2.0 * torch.tanh(self.value_head(value_features)) - 1.0
+        
         wdl_logits = self.wdl_head(value_features)
         wdl = torch.softmax(wdl_logits, dim=-1)
         output = {
@@ -158,6 +170,7 @@ class ZeroNet(nn.Module):
         return policy, value, wdl
 
     def parameter_count(self) -> int:
+        """Return total trainable parameters."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     @torch.inference_mode()
@@ -180,7 +193,16 @@ class ZeroNet(nn.Module):
                 [encode_move_mask(legal, board, device=str(device)) for board, legal in zip(boards, legal_moves, strict=True)]
             )
         device_type = "cuda" if str(device).startswith("cuda") else "cpu"
-        amp_dtype = torch.bfloat16 if device_type == "cuda" and torch.cuda.is_bf16_supported() else torch.float16
+        
+        # Safe try-except block to query driver precision support on multiple GPU architectures securely
+        is_bf16 = False
+        if device_type == "cuda":
+            try:
+                is_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+            except Exception:
+                pass
+                
+        amp_dtype = torch.bfloat16 if is_bf16 else torch.float16
         with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=device_type == "cuda"):
             out = self(tensors, masks, return_dict=True)
         policy = out["policy"]
@@ -198,6 +220,7 @@ class ZeroNet(nn.Module):
 
 
 def load_model(path: str | Path, device: str | torch.device = "cpu") -> ZeroNet:
+    """Load a model state payload from disk."""
     payload = torch.load(path, map_location=device)
     config = ModelConfig(**payload.get("config", {}))
     model = ZeroNet(config).to(device)
@@ -208,6 +231,7 @@ def load_model(path: str | Path, device: str | torch.device = "cpu") -> ZeroNet:
 
 
 def save_model(path: str | Path, model: ZeroNet, **extra) -> None:
+    """Save model weights atomically using temporary replacement."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"config": asdict(model.config), "model": model.state_dict(), **extra}
@@ -217,6 +241,7 @@ def save_model(path: str | Path, model: ZeroNet, **extra) -> None:
 
 
 def parameter_count(model: nn.Module) -> int:
+    """Return parameter count."""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 

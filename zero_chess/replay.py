@@ -1,4 +1,4 @@
-"""Thread-safe prioritized replay buffer with hot and cold tiers."""
+"""High-performance thread-safe prioritized replay buffer with hot and cold storage."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import sqlite3
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+
 
 def _get_available_ram_bytes() -> int:
     try:
@@ -23,6 +24,8 @@ def _get_available_ram_bytes() -> int:
 
 @dataclass(slots=True)
 class Experience:
+    """Represents a single evaluated chess board state for reinforcement training."""
+
     fen: str
     policy: dict[str, float]
     value: float
@@ -38,7 +41,11 @@ class Experience:
 
     def __post_init__(self) -> None:
         self.fen = str(self.fen)
-        self.policy = {str(k.uci() if hasattr(k, "uci") else k): float(v.item() if hasattr(v, "item") else v) for k, v in self.policy.items()}
+        policy_dict = {}
+        for k, v in self.policy.items():
+            k_str = str(k.uci() if hasattr(k, "uci") else k)
+            policy_dict[k_str] = float(v.item() if hasattr(v, "item") else v)
+        self.policy = policy_dict
         self.value = float(self.value.item() if hasattr(self.value, "item") else self.value)
         self.td_value = float(self.td_value.item() if hasattr(self.td_value, "item") else self.td_value)
         self.wdl = tuple(float(x.item() if hasattr(x, "item") else x) for x in self.wdl)
@@ -51,7 +58,6 @@ class Experience:
         self.panic_penalty = float(self.panic_penalty.item() if hasattr(self.panic_penalty, "item") else self.panic_penalty)
 
 
-
 @dataclass(slots=True)
 class SampleBatch:
     experiences: list[Experience]
@@ -60,6 +66,8 @@ class SampleBatch:
 
 
 class SumTree:
+    """Binary prefix sum tree for O(log N) priority updates and sampling."""
+
     def __init__(self, capacity: int) -> None:
         self.capacity = capacity
         self.tree = [0.0] * (2 * capacity)
@@ -90,6 +98,8 @@ class SumTree:
 
 
 class PrioritizedReplayBuffer:
+    """Thread-safe prioritized experience replay with automatic hardware memory adaptation."""
+
     def __init__(
         self,
         hot_capacity: int = 20_000,
@@ -101,6 +111,7 @@ class PrioritizedReplayBuffer:
         rng: random.Random | None = None,
     ) -> None:
         ram_bytes = _get_available_ram_bytes()
+        # Protect tight systems (like 8GB RAM laptops) from crashing
         limit = 10_000 if ram_bytes < 2 * 1024 * 1024 * 1024 else 20_000
         self.hot_capacity = min(hot_capacity, limit)
         self.cold_path = Path(cold_path) if cold_path else None
@@ -109,11 +120,17 @@ class PrioritizedReplayBuffer:
         self.beta = beta
         self.epsilon = epsilon
         self.rng = rng or random.Random()
+        
         self.hot: list[Experience] = []
         self._cursor = 0
         self._tree = SumTree(self.hot_capacity)
         self._max_priority = 1.0
         self._lock = threading.Lock()
+        
+        # High speed id-to-index mapping for true O(1) priority updates
+        self._id_to_index: dict[int, int] = {}
+        self._sqlite_conn: sqlite3.Connection | None = None
+        
         if self.cold_path is not None:
             self._init_cold()
 
@@ -133,14 +150,20 @@ class PrioritizedReplayBuffer:
             else:
                 exp.priority = self._priority_from_error(exp.priority)
                 self._max_priority = max(self._max_priority, exp.priority)
+                
             if len(self.hot) < self.hot_capacity:
                 index = len(self.hot)
                 self.hot.append(exp)
             else:
                 index = self._cursor
-                self._append_cold_unlocked(self.hot[index])
+                # Evict oldest hot experience to SQL cold storage
+                old_exp = self.hot[index]
+                self._id_to_index.pop(id(old_exp), None)
+                self._append_cold_unlocked(old_exp)
                 self.hot[index] = exp
                 self._cursor = (self._cursor + 1) % self.hot_capacity
+                
+            self._id_to_index[id(exp)] = index
             self._tree.update(index, exp.priority)
 
     def extend(self, experiences: list[Experience]) -> None:
@@ -152,18 +175,22 @@ class PrioritizedReplayBuffer:
 
     def sample_with_weights(self, batch_size: int, beta: float | None = None) -> SampleBatch:
         with self._lock:
-            if not self.hot and self._cold_count_unlocked() == 0:
+            cold_count = self._cold_count_unlocked()
+            if not self.hot and cold_count == 0:
                 raise ValueError("cannot sample from an empty replay buffer")
+                
             beta = self.beta if beta is None else beta
             hot_n = min(len(self.hot), int(round(batch_size * 0.8))) if self.hot else 0
             cold_n = batch_size - hot_n
-            if self._cold_count_unlocked() == 0:
+            if cold_count == 0:
                 hot_n = batch_size
                 cold_n = 0
+                
             experiences: list[Experience] = []
             indices: list[int | None] = []
             probs: list[float] = []
             total = max(self._tree.total, 1e-12)
+            
             for _ in range(hot_n):
                 value = self.rng.random() * total
                 index = min(self._tree.get(value), len(self.hot) - 1)
@@ -171,15 +198,19 @@ class PrioritizedReplayBuffer:
                 experiences.append(exp)
                 indices.append(index)
                 probs.append(max(exp.priority / total, 1e-12))
+                
             for exp in self._sample_cold_unlocked(cold_n):
                 experiences.append(exp)
                 indices.append(None)
-                probs.append(1.0 / max(1, self._cold_count_unlocked()))
+                probs.append(1.0 / max(1, cold_count))
+                
             weights = [(max(1, len(self.hot)) * prob) ** (-beta) for prob in probs]
             max_weight = max(weights) if weights else 1.0
             weights = [weight / max_weight for weight in weights]
+            
             for exp, weight in zip(experiences, weights, strict=True):
                 exp.importance_weight = weight
+                
             return SampleBatch(experiences, indices, weights)
 
     def update_priorities(self, indices_or_experiences, td_errors) -> None:
@@ -187,17 +218,17 @@ class PrioritizedReplayBuffer:
             for item, error in zip(indices_or_experiences, td_errors, strict=True):
                 priority = self._priority_from_error(float(error))
                 self._max_priority = max(self._max_priority, priority)
+                
                 if isinstance(item, int):
                     if 0 <= item < len(self.hot):
                         self.hot[item].priority = priority
                         self._tree.update(item, priority)
                 elif isinstance(item, Experience):
                     item.priority = priority
-                    try:
-                        index = self.hot.index(item)
-                    except ValueError:
-                        continue
-                    self._tree.update(index, priority)
+                    # Real O(1) hash mapping lookup
+                    index = self._id_to_index.get(id(item))
+                    if index is not None and 0 <= index < len(self.hot):
+                        self._tree.update(index, priority)
 
     def anneal_beta(self, step: int, total_steps: int = 500_000) -> float:
         self.beta = min(1.0, 0.4 + 0.6 * max(0, step) / max(1, total_steps))
@@ -229,7 +260,6 @@ class PrioritizedReplayBuffer:
         replay._cursor = payload["cursor"]
         replay._max_priority = payload.get("max_priority", 1.0)
         
-        # If hot size exceeds capacity due to capping, truncate and move overflow to cold tier
         if len(replay.hot) > replay.hot_capacity:
             overflow = replay.hot[replay.hot_capacity:]
             replay.hot = replay.hot[:replay.hot_capacity]
@@ -238,7 +268,9 @@ class PrioritizedReplayBuffer:
             replay._cursor = replay._cursor % replay.hot_capacity
             
         replay._tree = SumTree(replay.hot_capacity)
+        replay._id_to_index.clear()
         for idx, exp in enumerate(replay.hot):
+            replay._id_to_index[id(exp)] = idx
             replay._tree.update(idx, exp.priority or replay._max_priority)
         return replay
 
@@ -248,34 +280,45 @@ class PrioritizedReplayBuffer:
     def _init_cold(self) -> None:
         assert self.cold_path is not None
         self.cold_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.cold_path) as conn:
-            conn.execute("PRAGMA synchronous = FULL")
-            conn.execute("CREATE TABLE IF NOT EXISTS experiences (id INTEGER PRIMARY KEY AUTOINCREMENT, payload BLOB NOT NULL)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_experiences_id ON experiences(id)")
+        # Persistent thread-safe connection with check_same_thread disabled since self._lock handles synchronization
+        self._sqlite_conn = sqlite3.connect(self.cold_path, check_same_thread=False)
+        # Write-Ahead Logging mode avoids write blocking
+        self._sqlite_conn.execute("PRAGMA journal_mode = WAL")
+        self._sqlite_conn.execute("PRAGMA synchronous = NORMAL")
+        self._sqlite_conn.execute(
+            "CREATE TABLE IF NOT EXISTS experiences (id INTEGER PRIMARY KEY AUTOINCREMENT, payload BLOB NOT NULL)"
+        )
+        self._sqlite_conn.execute("CREATE INDEX IF NOT EXISTS idx_experiences_id ON experiences(id)")
+        self._sqlite_conn.commit()
 
     def _append_cold_unlocked(self, exp: Experience) -> None:
-        if self.cold_path is None:
+        if self._sqlite_conn is None:
             return
-        with sqlite3.connect(self.cold_path) as conn:
-            conn.execute("PRAGMA synchronous = FULL")
-            conn.execute("INSERT INTO experiences(payload) VALUES (?)", (pickle.dumps(exp, protocol=pickle.HIGHEST_PROTOCOL),))
-            count = conn.execute("SELECT COUNT(*) FROM experiences").fetchone()[0]
-            overflow = max(0, count - self.cold_capacity)
-            if overflow:
-                conn.execute(
-                    "DELETE FROM experiences WHERE id IN (SELECT id FROM experiences ORDER BY id LIMIT ?)",
-                    (overflow,),
-                )
+        self._sqlite_conn.execute(
+            "INSERT INTO experiences(payload) VALUES (?)",
+            (pickle.dumps(exp, protocol=pickle.HIGHEST_PROTOCOL),)
+        )
+        self._sqlite_conn.commit()
+        
+        # Enforce maximum sqlite buffer limits
+        count = self._sqlite_conn.execute("SELECT COUNT(*) FROM experiences").fetchone()[0]
+        overflow = max(0, count - self.cold_capacity)
+        if overflow > 0:
+            self._sqlite_conn.execute(
+                "DELETE FROM experiences WHERE id IN (SELECT id FROM experiences ORDER BY id LIMIT ?)",
+                (overflow,),
+            )
+            self._sqlite_conn.commit()
 
     def _sample_cold_unlocked(self, count: int) -> list[Experience]:
-        if count <= 0 or self.cold_path is None:
+        if count <= 0 or self._sqlite_conn is None:
             return []
-        with sqlite3.connect(self.cold_path) as conn:
-            rows = conn.execute("SELECT payload FROM experiences ORDER BY RANDOM() LIMIT ?", (count,)).fetchall()
+        rows = self._sqlite_conn.execute(
+            "SELECT payload FROM experiences ORDER BY RANDOM() LIMIT ?", (count,)
+        ).fetchall()
         return [pickle.loads(row[0]) for row in rows]
 
     def _cold_count_unlocked(self) -> int:
-        if self.cold_path is None or not self.cold_path.exists():
+        if self._sqlite_conn is None:
             return 0
-        with sqlite3.connect(self.cold_path) as conn:
-            return int(conn.execute("SELECT COUNT(*) FROM experiences").fetchone()[0])
+        return int(self._sqlite_conn.execute("SELECT COUNT(*) FROM experiences").fetchone()[0])

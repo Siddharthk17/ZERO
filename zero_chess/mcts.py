@@ -1,4 +1,4 @@
-"""Parallel batch PUCT Monte Carlo tree search."""
+"""High-performance, Non-Zero-Sum parallel batch PUCT Monte Carlo tree search."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from threading import Condition, Event, RLock, Thread
 from typing import Protocol
 
 from .board import Board
+from .constants import WHITE, BLACK
 from .move import Move
 from .targets import DRAW_VALUE, apply_contempt, opponent_value
 
@@ -28,17 +29,21 @@ class UniformEvaluator:
     def evaluate_batch(self, boards: list[Board]) -> list[tuple[dict[Move, float], float, float]]:
         out = []
         for board in boards:
-            terminal = board.result_value(board.turn)
+            terminal = board.result_values()
             if terminal is not None:
-                out.append(({}, terminal, 0.0))
+                # Return the terminal value corresponding to the active player's turn
+                val = terminal[0] if board.turn == WHITE else terminal[1]
+                out.append(({}, val, 0.0))
                 continue
             moves = board.legal_moves()
             prob = 1.0 / len(moves) if moves else 0.0
-            out.append(({move: prob for move in moves}, apply_contempt(0.0), 1.0))
+            out.append(({move: prob for move in moves}, 0.0, 1.0))
         return out
 
 
 class NetworkEvaluator:
+    """Synchronous model evaluator utilizing local thread locks."""
+
     def __init__(self, model, device: str = "cpu") -> None:
         self.model = model
         self.device = device
@@ -60,7 +65,7 @@ class _EvalRequest:
 
 
 class SharedBatchEvaluator:
-    """Coalesce evaluator calls from multiple self-play threads into large GPU batches."""
+    """Coalesces evaluator calls from multiple self-play threads into large GPU batches."""
 
     def __init__(
         self,
@@ -143,7 +148,7 @@ class SharedBatchEvaluator:
         flat_boards = [board for request in requests for board in request.boards]
         try:
             flat_results = self.model.evaluate_batch(flat_boards, self.device)
-        except BaseException as exc:  # pragma: no cover - exercised only on runtime evaluator failure
+        except BaseException as exc:
             for request in requests:
                 request.error = exc
                 request.done.set()
@@ -161,7 +166,7 @@ class SharedBatchEvaluator:
             request.done.set()
 
 
-@dataclass
+@dataclass(slots=True)
 class Node:
     prior_probability: float = 0.0
     visit_count: int = 0
@@ -214,6 +219,7 @@ class SearchResult:
     visits: dict[Move, int]
     root: Node
     resigned: bool = False
+    root_q_with_contempt: float = 0.0
 
     @property
     def policy(self) -> dict[Move, float]:
@@ -235,6 +241,8 @@ class _Leaf:
 
 
 class MCTS:
+    """Search orchestrator supporting tree-reuse and custom reward rules."""
+
     def __init__(
         self,
         network: Evaluator | object | None = None,
@@ -277,7 +285,7 @@ class MCTS:
         return NetworkEvaluator(network)
 
     def reset(self) -> None:
-        # Iteratively break all child references to speed up GC and prevent leaks and recursion limits
+        """Iteratively tear down MCTS nodes to speed up GC and avoid recursion limit crashes."""
         def _clear_node(node: Node | None) -> None:
             if node is None:
                 return
@@ -345,7 +353,8 @@ class MCTS:
         visits = {move: child.visit_count for move, child in root.children.items()}
         resigned = self._should_resign(board, root, generation)
         move = None if resigned else self._select_move(visits, temperature)
-        return SearchResult(move, visits, root, resigned)
+        root_q_with_contempt = apply_contempt(root.q)
+        return SearchResult(move, visits, root, resigned, root_q_with_contempt)
 
     def search_time(
         self,
@@ -362,7 +371,8 @@ class MCTS:
         while time.monotonic() < deadline:
             self.search(board, self.batch_size, temperature, add_noise, generation)
         visits = {move: child.visit_count for move, child in root.children.items()}
-        return SearchResult(self._select_move(visits, temperature), visits, root)
+        root_q_with_contempt = apply_contempt(root.q)
+        return SearchResult(self._select_move(visits, temperature), visits, root, root_q_with_contempt=root_q_with_contempt)
 
     def _root_for(self, board: Board) -> Node:
         if self.root_hash is None and self.root.is_expanded:
@@ -401,7 +411,8 @@ class MCTS:
                     terminal = DRAW_VALUE
                 terminals.append((path, terminal))
             else:
-                node.apply_virtual_loss()
+                for n in path:
+                    n.apply_virtual_loss()
                 leaves.append(_Leaf(node, sim_board, path))
         return leaves, terminals
 
@@ -410,9 +421,10 @@ class MCTS:
             return
         results = self.evaluator.evaluate_batch([leaf.board for leaf in leaves])
         for leaf, (priors, value, uncertainty) in zip(leaves, results, strict=True):
-            leaf.node.undo_virtual_loss()
+            for n in leaf.path:
+                n.undo_virtual_loss()
             self._expand_with_priors(leaf.node, leaf.board, priors, uncertainty)
-            self._backpropagate(leaf.path, apply_contempt(value))
+            self._backpropagate(leaf.path, value)
 
     def _expand_with_priors(
         self, node: Node, board: Board, priors: dict[Move, float], uncertainty: float

@@ -1,4 +1,4 @@
-"""Core constants shared by the chess engine."""
+"""Core constants and high-performance algebraic coordinate utilities."""
 
 from __future__ import annotations
 
@@ -50,50 +50,59 @@ QUEEN_DIRS = ROOK_DIRS + BISHOP_DIRS
 
 
 def opposite(color: int) -> int:
-    return BLACK if color == WHITE else WHITE
+    """Return the opposite color using a fast bitwise XOR."""
+    return color ^ 1
 
 
 def color_of(piece: str) -> int | None:
-    if piece in WHITE_PIECES:
-        return WHITE
-    if piece in BLACK_PIECES:
-        return BLACK
-    return None
+    """Return the color of the piece, optimized to avoid set hashing overhead."""
+    if piece == EMPTY:
+        return None
+    return WHITE if piece.isupper() else BLACK
 
 
 def piece_type(piece: str) -> str:
+    """Return the base uppercase representation of a piece."""
     return piece.upper()
 
 
 def piece_for(color: int, kind: str) -> str:
+    """Format piece symbol representation according to color."""
     return kind.upper() if color == WHITE else kind.lower()
 
 
 def on_board(file_: int, rank: int) -> bool:
+    """Verify if file and rank indices lie inside the 8x8 boundaries."""
     return 0 <= file_ < 8 and 0 <= rank < 8
 
 
 def square(file_: int, rank: int) -> int:
-    return rank * 8 + file_
+    """Convert file and rank indices into a 0-63 square using fast bitwise shifts."""
+    return (rank << 3) | file_
 
 
 def file_of(sq: int) -> int:
+    """Extract the file (column) index of a square [0-7]."""
     return sq & 7
 
 
 def rank_of(sq: int) -> int:
+    """Extract the rank (row) index of a square [0-7]."""
     return sq >> 3
 
 
 def square_name(sq: int) -> str:
-    return f"{chr(ord('a') + file_of(sq))}{rank_of(sq) + 1}"
+    """Return standard algebraic notation (e.g. 'e4') for a square index."""
+    return f"{chr(97 + (sq & 7))}{(sq >> 3) + 1}"
 
 
 def parse_square(name: str) -> int:
+    """Convert standard algebraic notation (e.g. 'e4') into a 0-63 square index."""
     if len(name) != 2 or name[0] < "a" or name[0] > "h" or name[1] < "1" or name[1] > "8":
-        raise ValueError(f"invalid square: {name!r}")
-    return square(ord(name[0]) - ord("a"), int(name[1]) - 1)
+        raise ValueError(f"invalid square coordinate: {name!r}")
+    return ((int(name[1]) - 1) << 3) | (ord(name[0]) - 97)
 
 
 def square_color(sq: int) -> int:
-    return (file_of(sq) + rank_of(sq)) & 1
+    """Return 0 for dark squares, 1 for light squares."""
+    return ((sq & 7) + (sq >> 3)) & 1

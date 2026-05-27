@@ -1,4 +1,4 @@
-"""WebSocket bridge for the ZERO UCI engine."""
+"""Highly stable WebSocket bridge with self-healing subprocess recovery for the ZERO engine."""
 
 from __future__ import annotations
 
@@ -30,6 +30,8 @@ class UCIResult:
 
 
 class UCIProcess:
+    """Manages an asynchronous, self-healing UCI subprocess wrapper."""
+
     def __init__(self, command: list[str] | None = None) -> None:
         self.command = command or [
             sys.executable,
@@ -44,8 +46,11 @@ class UCIProcess:
         self.lock = asyncio.Lock()
 
     async def ensure(self) -> asyncio.subprocess.Process:
+        """Verify the subprocess status, spinning up a fresh handle if dead."""
         if self.process and self.process.returncode is None:
             return self.process
+        
+        await self.close()
         self.process = await asyncio.create_subprocess_exec(
             *self.command,
             stdin=asyncio.subprocess.PIPE,
@@ -59,6 +64,7 @@ class UCIProcess:
         return self.process
 
     async def best_move(self, fen: str, move_time: int) -> UCIResult:
+        """Acquire the best move from the engine, executing a transaction under lock."""
         async with self.lock:
             await self.ensure()
             await self._send(f"position fen {fen}")
@@ -74,21 +80,43 @@ class UCIProcess:
                 if line.startswith("bestmove "):
                     return UCIResult(line.split()[1], evaluation, nodes)
 
+    async def close(self) -> None:
+        """Atomic teardown of the background subprocess to release locked resources."""
+        if self.process:
+            try:
+                self.process.terminate()
+                await asyncio.wait_for(self.process.wait(), timeout=1.0)
+            except Exception:
+                try:
+                    self.process.kill()
+                except Exception:
+                    pass
+            self.process = None
+
     async def _send(self, command: str) -> None:
         process = self.process
         if process is None or process.stdin is None:
             raise RuntimeError("UCI process is not running")
-        process.stdin.write((command + "\n").encode())
-        await process.stdin.drain()
+        try:
+            process.stdin.write((command + "\n").encode())
+            await process.stdin.drain()
+        except Exception as exc:
+            await self.close()
+            raise RuntimeError("failed to transmit command to subprocess") from exc
 
     async def _read_line(self) -> str:
         process = self.process
         if process is None or process.stdout is None:
             raise RuntimeError("UCI process is not running")
-        data = await process.stdout.readline()
-        if not data:
-            raise RuntimeError("UCI process exited")
-        return data.decode(errors="replace").strip()
+        try:
+            data = await process.stdout.readline()
+            if not data:
+                await self.close()
+                raise RuntimeError("UCI process reached EOF")
+            return data.decode(errors="replace").strip()
+        except Exception as exc:
+            await self.close()
+            raise RuntimeError("failed to read stream from subprocess") from exc
 
     async def _read_until(self, token: str) -> None:
         while True:
@@ -118,17 +146,57 @@ def parse_info(line: str) -> tuple[float | None, int | None]:
 engine = UCIProcess()
 
 
+def _tail_file_lines(path: Path, max_lines: int = 500) -> list[str]:
+    """Optimized binary seek tail reader to prevent RAM exhaustion on large FEN logs."""
+    lines: list[bytes] = []
+    if not path.exists():
+        return []
+    
+    chunk_size = 4096
+    with path.open("rb") as f:
+        f.seek(0, 2)
+        file_size = f.tell()
+        
+        buffer = bytearray()
+        pointer = file_size
+        
+        while pointer > 0 and len(lines) <= max_lines:
+            pointer = max(0, pointer - chunk_size)
+            f.seek(pointer)
+            chunk = f.read(file_size - pointer if pointer == 0 else chunk_size)
+            buffer[:0] = chunk
+            
+            while b"\n" in buffer:
+                newline_index = buffer.rindex(b"\n")
+                line = buffer[newline_index + 1:]
+                if line:
+                    lines.append(bytes(line))
+                buffer = buffer[:newline_index]
+                if len(lines) > max_lines:
+                    break
+            
+            file_size = pointer
+            
+        if len(lines) <= max_lines and buffer:
+            lines.append(bytes(buffer))
+            
+    lines.reverse()
+    return [line.decode("utf-8") for line in lines[-max_lines:]]
+
+
 @app.get("/history")
 def training_history(limit: int = 50) -> dict[str, list[dict]]:
     path = Path("data/training_games.jsonl")
     if not path.exists():
         return {"games": []}
-    lines = path.read_text(encoding="utf-8").splitlines()
-    selected = lines[-max(1, min(limit, 500)) :]
+    limit_val = max(1, min(limit, 500))
+    selected = _tail_file_lines(path, limit_val)
     games = []
     for line in selected:
         try:
-            games.append(json.loads(line))
+            record = json.loads(line)
+            record.pop("pgn", None)
+            games.append(record)
         except json.JSONDecodeError:
             continue
     games.reverse()
@@ -143,12 +211,14 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         while True:
             payload = await websocket.receive_text()
             message = json.loads(payload)
-            result = await engine.best_move(message["fen"], int(message.get("move_time", 1000)))
-            await websocket.send_json({"move": result.move, "evaluation": result.evaluation, "nodes": result.nodes})
+            try:
+                result = await engine.best_move(message["fen"], int(message.get("move_time", 1000)))
+                await websocket.send_json({"move": result.move, "evaluation": result.evaluation, "nodes": result.nodes})
+            except Exception as sub_exc:
+                await engine.close()  # Force process recovery on transaction failures
+                await websocket.send_json({"move": "0000", "evaluation": 0.0, "nodes": 0, "error": str(sub_exc)})
     except WebSocketDisconnect:
         return
-    except Exception as exc:
-        await websocket.send_json({"move": "0000", "evaluation": 0.0, "nodes": 0, "error": str(exc)})
 
 
 def main(argv: list[str] | None = None) -> None:

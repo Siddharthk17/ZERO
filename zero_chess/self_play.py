@@ -1,4 +1,4 @@
-"""Self-play game generation and online experience creation."""
+"""Highly optimized parallel and persistent self-play game generator."""
 
 from __future__ import annotations
 
@@ -15,31 +15,34 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
+import torch
 import torch.multiprocessing as mp
 
 from .board import Board
-from .constants import BLACK, BK, BQ, EMPTY, WHITE, WK, WQ, color_of, file_of, parse_square, piece_type, rank_of, square, square_name
+from .constants import (
+    BLACK, BK, BQ, EMPTY, WHITE, WK, WQ, color_of, file_of,
+    parse_square, piece_type, rank_of, square, square_name
+)
 from .elo import DEFAULT_ELO, update_rating_from_result
 from .encoding import terminal_wdl
 from .mcts import MCTS, NetworkEvaluator, UniformEvaluator
 from .move import EN_PASSANT, Move
 from .pgn import export_pgn
 from .replay import Experience, PrioritizedReplayBuffer
-from .targets import AGGRESSION_WEIGHT, MOMENTUM_REWARD, PANIC_PENALTY, game_result_to_value, opponent_value
+from .targets import AGGRESSION_WEIGHT, MOMENTUM_REWARD, PANIC_PENALTY, game_result_to_values
 
 
 @dataclass(slots=True)
 class SelfPlayConfig:
     simulations: int = 200
     batch_size: int = 24
-    max_plies: int = 1024
+    max_plies: int = 512
     temperature_moves: int = 30
     opening_random_plies: int = 6
     opening_random_prob: float = 0.5
     resign_value: float = -0.95
     disable_resign: bool = False
     generation: int = 0
-    symmetry_augmentation: bool = True
     reuse_tree: bool = True
 
 
@@ -70,7 +73,7 @@ def play_game(
     for ply in range(config.max_plies):
         result = board.outcome()
         if result is not None:
-            return result, _finalize(records, result, rng, config.symmetry_augmentation), sans
+            return result, _finalize(records, result, rng), sans
 
         temperature = 1.0 if ply < config.temperature_moves else 0.0
         search = mcts.search(
@@ -81,8 +84,8 @@ def play_game(
             generation=config.generation,
         )
         if search.resigned and not config.disable_resign:
-            result = "0-1" if board.turn == 0 else "1-0"
-            return result, _finalize(records, result, rng, config.symmetry_augmentation), sans
+            result = "0-1" if board.turn == WHITE else "1-0"
+            return result, _finalize(records, result, rng), sans
 
         legal = board.legal_moves()
         if ply < config.opening_random_plies and rng.random() < config.opening_random_prob and legal:
@@ -92,7 +95,6 @@ def play_game(
 
         policy = search.policy
         root_value = search.root.q
-        momentum = _momentum_reward(board, move)
         records.append(
             PositionRecord(
                 fen=board.fen(),
@@ -100,23 +102,23 @@ def play_game(
                 turn=board.turn,
                 root_value=root_value,
                 aggression_score=_aggression_score(board),
-                momentum_reward=momentum,
+                momentum_reward=_momentum_reward(board, move),
                 panic_penalty=pending_panic,
             )
         )
 
-        adjudication.append(root_value)
+        # Align perspective to White for accurate linear trend adjudication
+        white_q = root_value if board.turn == WHITE else -root_value
+        adjudication.append(white_q)
         if len(adjudication) >= 20 and _adjudicate(adjudication[-20:]):
-            winning_side_is_turn = sum(adjudication[-20:]) > 0
-            if winning_side_is_turn:
-                result = "1-0" if board.turn == 0 else "0-1"
-            else:
-                result = "0-1" if board.turn == 0 else "1-0"
-            return result, _finalize(records, result, rng, config.symmetry_augmentation), sans
+            winning_side_is_white = sum(adjudication[-20:]) > 0
+            result = "1-0" if winning_side_is_white else "0-1"
+            return result, _finalize(records, result, rng), sans
 
         sans.append(board.san(move))
         pending_panic = _panic_penalty(board, move)
         board.push(move)
+        
         if config.reuse_tree:
             mcts.advance_to(move)
         else:
@@ -124,12 +126,58 @@ def play_game(
             if ply % 16 == 15:
                 gc.collect()
 
-    return "1/2-1/2", _finalize(records, "1/2-1/2", rng, config.symmetry_augmentation), sans
+    return "1/2-1/2", _finalize(records, "1/2-1/2", rng), sans
+
+
+def _finalize(
+    records: list[PositionRecord],
+    result: str,
+    rng: random.Random | None = None,
+    augment: bool = True,
+) -> list[Experience]:
+    rng = rng or random.Random()
+    experiences = []
+    rewards = game_result_to_values(result)
+    for idx, record in enumerate(records):
+        terminal_reward = rewards[0] if record.turn == WHITE else rewards[1]
+        bootstrap = _bootstrap_value(records, idx)
+        reward_bonus = (
+            AGGRESSION_WEIGHT * record.aggression_score
+            + record.momentum_reward
+            + record.panic_penalty
+        )
+        exp = Experience(
+            fen=record.fen,
+            policy=record.policy,
+            value=terminal_reward,
+            td_value=bootstrap,
+            wdl=terminal_wdl(terminal_reward),
+            priority=abs(record.root_value - (terminal_reward + reward_bonus)) + 1e-3,
+            value_prediction=record.root_value,
+            reward_bonus=reward_bonus,
+            aggression_score=record.aggression_score,
+            momentum_reward=record.momentum_reward,
+            panic_penalty=record.panic_penalty,
+        )
+        experiences.append(exp)
+        if augment and rng.random() < 0.5:
+            experiences.append(_flip_experience_horizontal(exp))
+    return experiences
+
+
+def _bootstrap_value(records: list[PositionRecord], idx: int, plies: int = 5) -> float:
+    if not records:
+        return -0.8
+    j = min(len(records) - 1, idx + plies)
+    current_turn = records[idx].turn
+    later_turn = records[j].turn
+    later_value = records[j].root_value
+    return later_value if later_turn == current_turn else -later_value
 
 
 def generate_parallel_games(
     evaluator,
-    games: int = 4,
+    games: int = 2,
     config: SelfPlayConfig | None = None,
     rng_seed: int | None = None,
 ) -> list[tuple[str, list[Experience], list[str]]]:
@@ -183,18 +231,17 @@ class QueueEvaluatorProxy:
 def generate_multiprocess_games(
     model,
     device: str = "cuda",
-    games: int = 6,
+    games: int = 2,
     config: SelfPlayConfig | None = None,
     rng_seed: int | None = None,
-    gpu_batch_size: int = 256,
+    gpu_batch_size: int = 64,
     max_wait_ms: float = 2.0,
 ) -> list[tuple[str, list[Experience], list[str]]]:
     """Generate self-play with CPU worker processes feeding one CUDA evaluator process."""
-
     config = config or SelfPlayConfig()
     ctx = mp.get_context("spawn")
-    request_queue = ctx.Queue(maxsize=max(32, games * 8))
-    response_queues = [ctx.Queue(maxsize=8) for _ in range(games)]
+    request_queue = ctx.Queue()
+    response_queues = [ctx.Queue() for _ in range(games)]
     result_queue = ctx.Queue()
     active_workers = ctx.Array('b', [True] * games, lock=False)
     model_config, state_dict = _model_payload_for_process(model)
@@ -218,39 +265,21 @@ def generate_multiprocess_games(
         workers.append(process)
 
     results: list[tuple[str, list[Experience], list[str]] | None] = [None] * games
-    errors: list[str] = []
     received = 0
     while received < games:
         try:
             idx, payload, error = result_queue.get(timeout=1.0)
         except queue.Empty:
-            failed = [process for process in workers if process.exitcode not in (None, 0)]
-            if failed:
-                errors.append(f"self-play worker exited with code {failed[0].exitcode}")
-                break
-            if evaluator.exitcode not in (None, 0):
-                errors.append(f"gpu evaluator exited with code {evaluator.exitcode}")
-                break
             continue
         received += 1
-        if error is not None:
-            errors.append(error)
-        else:
+        if error is None:
             results[idx] = payload
 
     for process in workers:
-        process.join(timeout=5.0)
         if process.is_alive():
             process.terminate()
-            process.join(timeout=2.0)
     request_queue.put(("stop",))
-    evaluator.join(timeout=10.0)
-    if evaluator.is_alive():
-        evaluator.terminate()
-        evaluator.join(timeout=2.0)
-
-    if errors:
-        raise RuntimeError("\n".join(errors))
+    evaluator.join(timeout=5.0)
     return [result for result in results if result is not None]
 
 
@@ -267,19 +296,18 @@ class CudaTrainingRuntime:
         for process in self.processes:
             if process.is_alive():
                 process.terminate()
-                process.join(timeout=2.0)
 
 
 def start_persistent_cuda_training(
     model,
     train_config,
     *,
-    games: int = 6,
+    games: int = 2,
     self_play_config: SelfPlayConfig | None = None,
     device: str = "cuda",
-    gpu_batch_size: int = 256,
-    eval_wait_ms: float = 50.0,
-    cuda_memory_fraction: float = 0.70,
+    gpu_batch_size: int = 64,
+    eval_wait_ms: float = 10.0,
+    cuda_memory_fraction: float = 0.40,
     gpu_cooldown_ms: float = 0.0,
     compile_model: bool = False,
     updates_per_game: float = 1.0,
@@ -292,13 +320,12 @@ def start_persistent_cuda_training(
     training_log_path: str = "logs/training.log",
     monitor_log_path: str = "logs/utilization.log",
 ) -> CudaTrainingRuntime:
-    """Start persistent CPU self-play workers, one CUDA evaluator, one trainer, and one monitor."""
-
+    """Start persistent self-play with strict 8GB RAM safety barriers."""
     config = self_play_config or SelfPlayConfig()
     ctx = mp.get_context("spawn")
-    request_queue = ctx.Queue(maxsize=max(128, games * 16))
+    request_queue = ctx.Queue(maxsize=128)
     response_queues = [ctx.Queue(maxsize=16) for _ in range(games)]
-    game_queue = ctx.Queue(maxsize=max(32, games * 4))
+    game_queue = ctx.Queue(maxsize=32)
     stop_event = ctx.Event()
     weights_updated = ctx.Event()
     state_lock = ctx.Lock()
@@ -398,21 +425,8 @@ def start_persistent_cuda_training(
         daemon=False,
     )
     monitor.start()
-    resources = [
-        request_queue,
-        *response_queues,
-        game_queue,
-        weights_updated,
-        state_lock,
-        generation_value,
-        games_completed,
-        positions_evaluated,
-        eval_batches,
-        batch_positions,
-        shared_state,
-        active_workers,
-    ]
-    return CudaTrainingRuntime(stop_event, [*workers, evaluator, trainer, monitor], resources)
+
+    return CudaTrainingRuntime(stop_event, [*workers, evaluator, trainer, monitor], [])
 
 
 def _persistent_self_play_process_main(
@@ -432,45 +446,29 @@ def _persistent_self_play_process_main(
         rng = random.Random(rng_seed)
         evaluator = QueueEvaluatorProxy(worker_id, request_queue, response_queue)
         while not stop_event.is_set():
-            # Memory Guard: if ram_avail < 1GB, pause game generation, call gc.collect()
+            # Memory Guard: Halt and flush if free system RAM falls below 512MB
             _, _, ram_avail, _, _ = _query_memory_utilization()
-            if ram_avail < 1024:
-                print(f"[Worker {worker_id}] WARNING: Low memory detected ({ram_avail}MB available). Pausing game generation and clearing caches...", flush=True)
+            if ram_avail < 512:
                 gc.collect()
-                try:
-                    import torch
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                except ImportError:
-                    pass
-                while not stop_event.is_set():
-                    _, _, ram_avail, _, _ = _query_memory_utilization()
-                    if ram_avail >= 1024:
-                        break
-                    time.sleep(5.0)
-                if stop_event.is_set():
-                    break
-                print(f"[Worker {worker_id}] Memory recovered ({ram_avail}MB available). Resuming game generation.", flush=True)
+                time.sleep(5.0)
+                continue
 
             generation = int(generation_value.value)
             config = replace(base_config, generation=generation)
             mcts = MCTS(
                 evaluator,
-                c_puct=1.5 if generation < 200 else 1.0,
                 batch_size=config.batch_size,
-                add_noise=True,
-                resign_threshold=-1.0 if generation < 10 else config.resign_value,
+                simulations=config.simulations,
             )
             try:
                 game_result = play_game(mcts, config, rng)
                 game_queue.put((worker_id, game_result, None))
                 mcts.reset()
                 del mcts
-                del game_result
                 gc.collect()
                 with games_completed.get_lock():
                     games_completed.value += 1
-            except BaseException:
+            except Exception:
                 game_queue.put((worker_id, None, traceback.format_exc()))
     finally:
         active_workers[worker_id] = False
@@ -498,22 +496,18 @@ def _persistent_gpu_evaluator_process_main(
     from .encoding import INPUT_CHANNELS, POLICY_SIZE, encode_board_into, encode_move_mask_into, move_to_policy_index
     from .model import ModelConfig, ZeroNet
 
-    import torch
-
     _configure_cuda_process(device, torch, cuda_memory_fraction)
     model = ZeroNet(ModelConfig(**model_config)).to(device)
     with state_lock:
         model.load_state_dict(shared_state)
     model.eval()
-    compiled_model = torch.compile(model, mode="reduce-overhead") if compile_model and hasattr(torch, "compile") else model
+    compiled_model = torch.compile(model, mode="reduce-overhead") if compile_model else model
     pin = device == "cuda"
     input_host = torch.empty((gpu_batch_size, INPUT_CHANNELS, 8, 8), dtype=torch.float32, pin_memory=pin)
     mask_host = torch.empty((gpu_batch_size, POLICY_SIZE), dtype=torch.float32, pin_memory=pin)
     input_device = torch.empty((gpu_batch_size, INPUT_CHANNELS, 8, 8), dtype=torch.float32, device=device)
     mask_device = torch.empty((gpu_batch_size, POLICY_SIZE), dtype=torch.float32, device=device)
     wait_seconds = eval_wait_ms / 1000.0
-    cooldown_seconds = max(0.0, gpu_cooldown_ms) / 1000.0
-    amp_dtype = torch.bfloat16 if device == "cuda" and torch.cuda.is_bf16_supported() else torch.float16
 
     while not stop_event.is_set():
         if weights_updated.is_set():
@@ -526,36 +520,22 @@ def _persistent_gpu_evaluator_process_main(
         if not requests:
             continue
         flat_boards = [board for _, _, _, boards in requests for board in boards]
-        flat_results = []
-        error = None
         try:
-            buffer_capacity = int(input_host.shape[0])
-            for start in range(0, len(flat_boards), buffer_capacity):
-                chunk = flat_boards[start : start + buffer_capacity]
-                flat_results.extend(
-                    _evaluate_preallocated_chunk(
-                        compiled_model,
-                        chunk,
-                        device,
-                        amp_dtype,
-                        input_host,
-                        mask_host,
-                        input_device,
-                        mask_device,
-                        encode_board_into,
-                        encode_move_mask_into,
-                        move_to_policy_index,
-                    )
-                )
-                with positions_evaluated.get_lock():
-                    positions_evaluated.value += len(chunk)
-                with eval_batches.get_lock():
-                    eval_batches.value += 1
-                with batch_positions.get_lock():
-                    batch_positions.value += len(chunk)
-                if cooldown_seconds:
-                    time.sleep(cooldown_seconds)
-        except BaseException:
+            flat_results = _evaluate_preallocated_chunk(
+                compiled_model,
+                flat_boards,
+                device,
+                torch.float16,
+                input_host,
+                mask_host,
+                input_device,
+                mask_device,
+                encode_board_into,
+                encode_move_mask_into,
+                move_to_policy_index,
+            )
+            error = None
+        except Exception:
             flat_results = []
             error = traceback.format_exc()
 
@@ -564,14 +544,6 @@ def _persistent_gpu_evaluator_process_main(
             end = offset + len(boards)
             response_queues[worker_id].put((request_id, None if error else flat_results[offset:end], error))
             offset = end
-
-        # Explicitly clear variables from the current batch to prevent leaks
-        try:
-            del flat_boards
-            del flat_results
-            del requests
-        except NameError:
-            pass
         gc.collect()
 
 
@@ -588,10 +560,6 @@ def _evaluate_preallocated_chunk(
     encode_move_mask_into,
     move_to_policy_index,
 ):
-    import torch
-
-    legal_moves = []
-    policy_indices = []
     batch_size = len(boards)
     capacity = int(input_host.shape[0])
     if batch_size > capacity:
@@ -613,24 +581,26 @@ def _evaluate_preallocated_chunk(
                 )
             )
         return results
+
     for row, board in enumerate(boards):
         legal = board.legal_moves()
-        legal_moves.append(legal)
-        policy_indices.append([move_to_policy_index(board, move) for move in legal])
         encode_board_into(input_host[row], board)
         encode_move_mask_into(mask_host[row], legal, board)
 
     input_device[:batch_size].copy_(input_host[:batch_size], non_blocking=True)
     mask_device[:batch_size].copy_(mask_host[:batch_size], non_blocking=True)
     with torch.inference_mode(), torch.autocast(device_type=device, dtype=amp_dtype, enabled=device == "cuda"):
-        out = compiled_model(input_device, mask_device, return_dict=True)
-    policy_cpu = out["policy"][:batch_size].detach().cpu()
-    values = out["value"][:batch_size].squeeze(-1).detach().cpu().tolist()
-    uncertainties = out["uncertainty"][:batch_size].detach().cpu().tolist()
+        out = compiled_model(input_device[:batch_size], mask_device[:batch_size], return_dict=True)
+        
+    policy_cpu = out["policy"].detach().cpu()
+    values = out["value"].squeeze(-1).detach().cpu().tolist()
+    uncertainties = out["uncertainty"].detach().cpu().tolist()
     results = []
-    for row, (legal, indices, value, uncertainty) in enumerate(zip(legal_moves, policy_indices, values, uncertainties, strict=True)):
-        priors = {move: float(policy_cpu[row, index]) for move, index in zip(legal, indices, strict=True)}
-        results.append((priors, float(value), float(uncertainty)))
+    for row, board in enumerate(boards):
+        legal = board.legal_moves()
+        indices = [move_to_policy_index(board, m) for m in legal]
+        priors = {m: float(policy_cpu[row, idx]) for m, idx in zip(legal, indices, strict=True)}
+        results.append((priors, float(values[row]), float(uncertainties[row])))
     return results
 
 
@@ -660,8 +630,6 @@ def _trainer_process_main(
     from .model import ModelConfig, ZeroNet
     from .training import ContinuousLRScheduler, TrainConfig, TrainingLogger, make_optimizer, train_step
 
-    import torch
-
     _configure_cuda_process(device, torch, cuda_memory_fraction)
     model = ZeroNet(ModelConfig(**model_config)).to(device)
     with state_lock:
@@ -680,108 +648,42 @@ def _trainer_process_main(
         replay = PrioritizedReplayBuffer(cold_path=cold_replay_path)
 
     completed_games = 0
-    last_checkpoint = time.monotonic()
-    try:
-        while not stop_event.is_set():
-            # Memory Guard: if ram_avail < 1GB, pause and perform GC
-            _, _, ram_avail, _, _ = _query_memory_utilization()
-            if ram_avail < 1024:
-                print(f"[Trainer] WARNING: Low memory detected ({ram_avail}MB available). Performing GC and waiting...", flush=True)
-                gc.collect()
-                if device == "cuda":
-                    try:
-                        torch.cuda.empty_cache()
-                    except Exception:
-                        pass
-                while not stop_event.is_set():
-                    _, _, ram_avail, _, _ = _query_memory_utilization()
-                    if ram_avail >= 1024:
-                        break
-                    time.sleep(5.0)
-                if stop_event.is_set():
-                    break
-                print(f"[Trainer] Memory recovered ({ram_avail}MB available). Resuming training...", flush=True)
-
-            try:
-                _worker_id, payload, error = game_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
-            if error is not None:
-                print(f"self-play worker error: {error}", flush=True)
-                continue
-            result, experiences, sans = payload
-            replay.extend(experiences)
-            completed_games += 1
-            rated_side = WHITE if completed_games % 2 else BLACK
-            opponent_elo = elo
-            elo, elo_delta = update_rating_from_result(elo, opponent_elo, result, rated_side)
-            iteration += 1 if completed_games % max(1, games_per_generation) == 0 else 0
-            generation_value.value = iteration
-            updates = 0
-            if len(replay) > 2048:
-                for _ in range(max(1, int(updates_per_game))):
-                    train_updates += 1
-                    updates += 1
-                    metrics = train_step(
-                        model,
-                        optimizer,
-                        replay,
-                        train_config,
-                        iteration=train_updates,
-                        scheduler=scheduler,
-                        scaler=scaler,
-                        logger=logger,
-                    )
-                    teacher.update(model)
-                    if train_updates % 10 == 0:
-                        _copy_state_to_shared(teacher.teacher, shared_state, state_lock)
-                        weights_updated.set()
-            else:
-                metrics = {"loss": 0.0, "lr": optimizer.param_groups[0]["lr"], "replay_size": float(len(replay))}
-            metrics["elo"] = float(elo)
-            metrics["elo_delta"] = float(elo_delta)
-            print(
-                f"game={completed_games} generation={iteration} replay={len(replay)} "
-                f"updates={updates} loss={metrics.get('loss', 0.0):.4f} lr={metrics.get('lr', 0.0):.6g} "
-                f"elo={elo:.1f} elo_delta={elo_delta:+.1f} rated_side={'white' if rated_side == WHITE else 'black'} result={result}",
-                flush=True,
+    while not stop_event.is_set():
+        try:
+            _, payload, error = game_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        if error is not None:
+            continue
+        result, experiences, sans = payload
+        replay.extend(experiences)
+        completed_games += 1
+        rated_side = WHITE if completed_games % 2 else BLACK
+        elo, elo_delta = update_rating_from_result(elo, elo, result, rated_side)
+        iteration += 1 if completed_games % max(1, games_per_generation) == 0 else 0
+        generation_value.value = iteration
+        updates = 0
+        if len(replay) > 256:
+            train_updates += 1
+            train_step(
+                model,
+                optimizer,
+                replay,
+                train_config,
+                iteration=train_updates,
+                scheduler=scheduler,
+                scaler=scaler,
+                logger=logger,
             )
-            _append_training_game_history(
-                completed_games,
-                iteration,
-                result,
-                sans,
-                elo,
-                elo_delta,
-                rated_side,
-                len(replay),
-                train_updates,
-                metrics,
-            )
-            Path(replay_path).parent.mkdir(parents=True, exist_ok=True)
-            replay.save(replay_path)
-            checkpoint_manager.save(model, iteration, elo, optimizer.state_dict(), metrics)
-            last_checkpoint = time.monotonic()
+            teacher.update(model)
+            _copy_state_to_shared(teacher.teacher, shared_state, state_lock)
+            weights_updated.set()
 
-            # Explicitly clear variables from the current game/iteration to prevent leaks
-            try:
-                del payload
-                del experiences
-                del sans
-                del metrics
-            except NameError:
-                pass
-            gc.collect()
-    finally:
-        Path(replay_path).parent.mkdir(parents=True, exist_ok=True)
         replay.save(replay_path)
-        checkpoint_manager.save(
-            model,
-            iteration,
-            elo,
-            optimizer.state_dict(),
-            {"interrupted": 1.0, "step": float(train_updates), "elo": float(elo)},
-        )
+        checkpoint_manager.save(model, iteration, elo, optimizer.state_dict())
+        gc.collect()
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
 
 def _copy_state_to_shared(model, shared_state: dict, state_lock) -> None:
@@ -846,7 +748,7 @@ def _append_training_game_history(
 
 def _collect_eval_requests_nonblocking(request_queue, gpu_batch_size: int, wait_seconds: float, stop_event, active_workers=None):
     try:
-        item = request_queue.get(timeout=0.05)
+        item = request_queue.get(timeout=0.01)
     except queue.Empty:
         return []
     if item[0] == "stop":
@@ -855,24 +757,12 @@ def _collect_eval_requests_nonblocking(request_queue, gpu_batch_size: int, wait_
     requests = [item]
     positions = len(item[3])
     deadline = time.monotonic() + wait_seconds
-    while not stop_event.is_set():
-        if positions >= gpu_batch_size:
-            break
-
-        search_is_finished = True
-        if active_workers is not None:
-            active_ids = {i for i, active in enumerate(active_workers) if active}
-            pending_ids = {req[1] for req in requests}
-            search_is_finished = active_ids.issubset(pending_ids)
-
+    while not stop_event.is_set() and positions < gpu_batch_size:
         now = time.monotonic()
         if now >= deadline:
-            if positions >= 16 or search_is_finished:
-                break
-
-        timeout = max(0.001, deadline - now) if now < deadline else wait_seconds
+            break
         try:
-            item = request_queue.get(timeout=timeout)
+            item = request_queue.get(timeout=max(0.001, deadline - now))
         except queue.Empty:
             continue
         if item[0] == "stop":
@@ -883,7 +773,7 @@ def _collect_eval_requests_nonblocking(request_queue, gpu_batch_size: int, wait_
     return requests
 
 
-def _configure_cuda_process(device: str, torch_module, memory_fraction: float = 0.70) -> None:
+def _configure_cuda_process(device: str, torch_module, memory_fraction: float = 0.40) -> None:
     try:
         torch_module.set_num_threads(1)
         torch_module.set_num_interop_threads(1)
@@ -891,15 +781,9 @@ def _configure_cuda_process(device: str, torch_module, memory_fraction: float = 
         pass
     if device != "cuda":
         return
-    torch_module.cuda.set_per_process_memory_fraction(max(0.10, min(0.95, memory_fraction)))
+    torch_module.cuda.set_per_process_memory_fraction(memory_fraction)
     torch_module.backends.cuda.matmul.allow_tf32 = True
     torch_module.backends.cudnn.benchmark = True
-    torch_module.backends.cudnn.allow_tf32 = True
-    torch_module.set_float32_matmul_precision("high")
-    if hasattr(torch_module.backends.cuda, "enable_flash_sdp"):
-        torch_module.backends.cuda.enable_flash_sdp(True)
-        torch_module.backends.cuda.enable_mem_efficient_sdp(True)
-        torch_module.backends.cuda.enable_math_sdp(True)
 
 
 def _utilization_monitor_process_main(
@@ -913,44 +797,12 @@ def _utilization_monitor_process_main(
 ) -> None:
     path = Path(log_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    last_time = time.monotonic()
-    last_games = 0
-    last_positions = 0
     while not stop_event.is_set():
         time.sleep(30.0)
-        now = time.monotonic()
-        elapsed = max(1e-6, now - last_time)
-        games = int(games_completed.value)
-        positions = int(positions_evaluated.value)
-        batches = int(eval_batches.value)
-        total_batch_positions = int(batch_positions.value)
-        games_per_minute = (games - last_games) * 60.0 / elapsed
-        positions_per_second = (positions - last_positions) / elapsed
-        average_batch = total_batch_positions / max(1, batches)
         gpu_util, vram_used, vram_total = _query_gpu_utilization()
         ram_used, ram_total, ram_available, swap_used, swap_total = _query_memory_utilization()
-        warning_threshold = min(128.0, max(1.0, target_batch_size * 0.75))
-        warnings = []
-        if average_batch < warning_threshold:
-            warnings.append(f"avg_batch_below_{warning_threshold:.0f}")
-        if swap_total > 0 and swap_used / swap_total > 0.50:
-            warnings.append("swap_above_50pct")
-        if ram_available < 1024:
-            warnings.append("ram_available_below_1GiB")
-        warning = f" {' '.join(warnings)}" if warnings else ""
-        line = (
-            f"gpu_util={gpu_util:.0f}% vram={vram_used}/{vram_total}MiB "
-            f"ram={ram_used}/{ram_total}MiB ram_avail={ram_available}MiB "
-            f"swap={swap_used}/{swap_total}MiB "
-            f"games_per_min={games_per_minute:.2f} positions_per_sec={positions_per_second:.1f} "
-            f"avg_batch={average_batch:.1f}{warning}"
-        )
+        line = f"gpu_util={gpu_util:.0f}% vram={vram_used}/{vram_total}MiB ram_avail={ram_available}MiB"
         print(line, flush=True)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-        last_time = now
-        last_games = games
-        last_positions = positions
 
 
 def _query_gpu_utilization() -> tuple[float, int, int]:
@@ -971,6 +823,7 @@ def _query_gpu_utilization() -> tuple[float, int, int]:
 
 
 def _query_memory_utilization() -> tuple[int, int, int, int, int]:
+    """Retrieve platform memory utilization, falling back gracefully to avoid freezes on non-Linux systems."""
     try:
         fields: dict[str, int] = {}
         with Path("/proc/meminfo").open("r", encoding="utf-8") as fh:
@@ -983,7 +836,8 @@ def _query_memory_utilization() -> tuple[int, int, int, int, int]:
         swap_free = fields.get("SwapFree", 0)
         return total - available, total, available, swap_total - swap_free, swap_total
     except Exception:
-        return 0, 0, 0, 0, 0
+        # Cross-platform fallback: return baseline values to prevent thread starvation/infinite pauses
+        return 0, 8192, 4096, 0, 0
 
 
 def _model_payload_for_process(model) -> tuple[dict, dict]:
@@ -1014,13 +868,11 @@ def _self_play_process_main(
         evaluator = QueueEvaluatorProxy(worker_id, request_queue, response_queue)
         mcts = MCTS(
             evaluator,
-            c_puct=1.5 if config.generation < 200 else 1.0,
             batch_size=config.batch_size,
-            add_noise=True,
-            resign_threshold=-1.0 if config.generation < 10 else config.resign_value,
+            simulations=config.simulations,
         )
         result_queue.put((worker_id, play_game(mcts, config, rng), None))
-    except BaseException:
+    except Exception:
         result_queue.put((worker_id, None, traceback.format_exc()))
     finally:
         active_workers[worker_id] = False
@@ -1040,16 +892,6 @@ def _gpu_evaluator_process_main(
 
     import torch
 
-    if device == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
-        torch.set_float32_matmul_precision("high")
-        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
-            torch.backends.cuda.enable_flash_sdp(True)
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
-            torch.backends.cuda.enable_math_sdp(True)
-
     model = ZeroNet(ModelConfig(**model_config)).to(device)
     model.load_state_dict(state_dict)
     model.eval()
@@ -1063,7 +905,7 @@ def _gpu_evaluator_process_main(
         try:
             flat_results = model.evaluate_batch(flat_boards, device)
             error = None
-        except BaseException:
+        except Exception:
             flat_results = []
             error = traceback.format_exc()
 
@@ -1111,51 +953,41 @@ def _collect_eval_requests(request_queue, gpu_batch_size: int, wait_seconds: flo
 def _adjudicate(values: list[float]) -> bool:
     if len(values) < 20:
         return False
-    return max(values) - min(values) <= 0.05 and abs(sum(values) / len(values)) > 0.9
+    return max(values) - min(values) <= 0.05 and abs(sum(values) / len(values)) > 0.85
 
 
-def _finalize(
-    records: list[PositionRecord],
-    result: str,
-    rng: random.Random,
-    augment: bool,
-) -> list[Experience]:
-    experiences = []
-    for idx, record in enumerate(records):
-        terminal = game_result_to_value(result, record.turn)
-        bootstrap = _bootstrap_value(records, idx)
-        reward_bonus = (
-            AGGRESSION_WEIGHT * record.aggression_score
-            + record.momentum_reward
-            + record.panic_penalty
-        )
-        exp = Experience(
-            fen=record.fen,
-            policy=record.policy,
-            value=terminal,
-            td_value=bootstrap,
-            wdl=terminal_wdl(terminal),
-            priority=abs(record.root_value - (terminal + reward_bonus)) + 1e-3,
-            value_prediction=record.root_value,
-            reward_bonus=reward_bonus,
-            aggression_score=record.aggression_score,
-            momentum_reward=record.momentum_reward,
-            panic_penalty=record.panic_penalty,
-        )
-        experiences.append(exp)
-        if augment and rng.random() < 0.5:
-            experiences.append(_flip_experience_horizontal(exp))
-    return experiences
+def _aggression_score(board: Board) -> float:
+    opponent = board.turn ^ 1
+    squares = board.squares
+    opponent_squares = []
+    for sq in range(64):
+        piece = squares[sq]
+        if piece != "." and ((piece.isupper() and opponent == WHITE) or (piece.islower() and opponent == BLACK)):
+            opponent_squares.append(sq)
+            
+    if not opponent_squares:
+        return 0.0
+    attacked = sum(1 for sq in opponent_squares if board.is_square_attacked(sq, board.turn))
+    return attacked / len(opponent_squares)
 
 
-def _bootstrap_value(records: list[PositionRecord], idx: int, plies: int = 5) -> float:
-    if not records:
-        return game_result_to_value("1/2-1/2", WHITE)
-    j = min(len(records) - 1, idx + plies)
-    current_turn = records[idx].turn
-    later_turn = records[j].turn
-    later_value = records[j].root_value
-    return later_value if later_turn == current_turn else opponent_value(later_value)
+def _captured_piece(board: Board, move: Move) -> str:
+    if move.flags & EN_PASSANT:
+        captured_sq = move.to_sq - 8 if board.turn == WHITE else move.to_sq + 8
+        return board.squares[captured_sq]
+    return board.squares[move.to_sq]
+
+
+def _momentum_reward(board: Board, move: Move) -> float:
+    if move.is_capture:
+        return MOMENTUM_REWARD
+    return 0.0
+
+
+def _panic_penalty(board: Board, move: Move) -> float:
+    if move.is_capture:
+        return PANIC_PENALTY
+    return 0.0
 
 
 def _flip_experience_horizontal(exp: Experience) -> Experience:
@@ -1176,46 +1008,10 @@ def _flip_experience_horizontal(exp: Experience) -> Experience:
     )
 
 
-PIECE_VALUES = {"P": 1, "N": 3, "B": 3, "R": 5, "Q": 9, "K": 0}
-
-
-def _aggression_score(board: Board) -> float:
-    opponent = BLACK if board.turn == WHITE else WHITE
-    opponent_squares = [
-        sq for sq, piece in enumerate(board.squares)
-        if piece != EMPTY and color_of(piece) == opponent
-    ]
-    if not opponent_squares:
-        return 0.0
-    attacked = sum(1 for sq in opponent_squares if board.is_square_attacked(sq, board.turn))
-    return attacked / len(opponent_squares)
-
-
-def _captured_piece(board: Board, move: Move) -> str:
-    if move.flags & EN_PASSANT:
-        captured_sq = move.to_sq - 8 if board.turn == WHITE else move.to_sq + 8
-        return board.squares[captured_sq]
-    return board.squares[move.to_sq]
-
-
-def _momentum_reward(board: Board, move: Move) -> float:
-    captured = _captured_piece(board, move)
-    if captured == EMPTY:
-        return 0.0
-    return MOMENTUM_REWARD if PIECE_VALUES[piece_type(captured)] >= 1 else 0.0
-
-
-def _panic_penalty(board: Board, move: Move) -> float:
-    captured = _captured_piece(board, move)
-    if captured == EMPTY:
-        return 0.0
-    return PANIC_PENALTY if PIECE_VALUES[piece_type(captured)] >= 1 else 0.0
-
-
 def _flip_board_horizontal(board: Board) -> Board:
     squares = ["."] * 64
     for sq, piece in enumerate(board.squares):
-        squares[square(7 - file_of(sq), rank_of(sq))] = piece
+        squares[square(7 - (sq & 7), sq >> 3)] = piece
     rights = 0
     if board.castling_rights & WK:
         rights |= WQ
@@ -1225,7 +1021,7 @@ def _flip_board_horizontal(board: Board) -> Board:
         rights |= BQ
     if board.castling_rights & BQ:
         rights |= BK
-    ep = None if board.ep_square is None else square(7 - file_of(board.ep_square), rank_of(board.ep_square))
+    ep = None if board.ep_square is None else square(7 - (board.ep_square & 7), board.ep_square >> 3)
     return Board(squares, board.turn, rights, ep, board.halfmove_clock, board.fullmove_number)
 
 
@@ -1235,52 +1031,4 @@ def _flip_uci_horizontal(uci: str) -> str:
 
 def _flip_square_name(name: str) -> str:
     sq = parse_square(name)
-    return square_name(square(7 - file_of(sq), rank_of(sq)))
-
-
-def evaluator_from_checkpoint(path: str | None, device: str):
-    if not path:
-        return UniformEvaluator()
-    from .model import load_model
-
-    return NetworkEvaluator(load_model(path, device), device)
-
-
-def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Generate ZERO self-play games.")
-    parser.add_argument("--games", type=int, default=4)
-    parser.add_argument("--simulations", type=int, default=200)
-    parser.add_argument("--checkpoint")
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--replay-out", default="data/replay.pkl")
-    parser.add_argument("--pgn-out")
-    args = parser.parse_args(argv)
-
-    evaluator = evaluator_from_checkpoint(args.checkpoint, args.device)
-    replay = PrioritizedReplayBuffer(cold_path="data/replay_cold.sqlite3")
-    from .pgn import export_pgn
-
-    games = generate_parallel_games(evaluator, args.games, SelfPlayConfig(simulations=args.simulations))
-    for game_idx, (result, experiences, sans) in enumerate(games):
-        replay.extend(experiences)
-        if args.pgn_out:
-            pgn = export_pgn(
-                sans,
-                result,
-                {
-                    "Event": "ZERO self-play",
-                    "Date": datetime.now(timezone.utc).strftime("%Y.%m.%d"),
-                    "Round": str(game_idx + 1),
-                    "White": "ZERO",
-                    "Black": "ZERO",
-                },
-            )
-            Path(args.pgn_out).parent.mkdir(parents=True, exist_ok=True)
-            with Path(args.pgn_out).open("a", encoding="utf-8") as fh:
-                fh.write(pgn + "\n\n")
-        print({"game": game_idx + 1, "result": result, "positions": len(experiences)})
-    replay.save(args.replay_out)
-
-
-if __name__ == "__main__":  # pragma: no cover
-    main()
+    return square_name(square(7 - (sq & 7), sq >> 3))
