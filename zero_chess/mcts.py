@@ -254,7 +254,7 @@ class MCTS:
         cpuct: float | None = None,
         dirichlet_alpha: float = 0.3,
         dirichlet_epsilon: float = 0.25,
-        use_transpositions: bool = True,
+        use_transpositions: bool = False, # CORRECTED: Disabled by default to prevent cyclic graphs and infinite loops
         rng: random.Random | None = None,
         **_: object,
     ) -> None:

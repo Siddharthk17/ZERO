@@ -143,7 +143,8 @@ class ZeroNet(nn.Module):
         if move_mask is not None:
             if move_mask.shape != policy_logits.shape:
                 raise ValueError(f"move_mask shape {tuple(move_mask.shape)} != policy logits {tuple(policy_logits.shape)}")
-            masked_logits = policy_logits.masked_fill(move_mask <= 0, -1e9)
+            # Cast safe -1e4 masking value to prevent float16 Half precision overflow
+            masked_logits = policy_logits.masked_fill(move_mask <= 0, -1e4)
         policy = torch.softmax(masked_logits, dim=-1)
         
         value_features = self.value_body(self.value_pool(y))

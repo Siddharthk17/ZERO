@@ -199,10 +199,14 @@ class UCIEngine:
             legal = self.board.legal_moves()
             best = legal[0].uci() if legal else "0000"
             nodes = 0
+            score_cp = 0
         else:
             best = result.move.uci()
             nodes = sum(result.visits.values())
-        print(f"info depth 1 nodes {nodes} score cp 0", flush=True)
+            # Convert asymmetric MCTS value (-1.0 is draw) to dynamic centipawns
+            score_cp = int((result.root_q_with_contempt + 1.0) * 100)
+            
+        print(f"info depth 1 nodes {nodes} score cp {score_cp}", flush=True)
         print(f"bestmove {best}", flush=True)
 
     def _simulations_for_go(self, args: list[str]) -> int:

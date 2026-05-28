@@ -683,8 +683,12 @@ def _trainer_process_main(
             _, payload, error = game_queue.get(timeout=1.0)
         except queue.Empty:
             continue
+        
+        # Output any swallowed exceptions to locate end-of-game process failures
         if error is not None:
+            print(f"\n[ERROR] Worker process encountered an exception:\n{error}", flush=True)
             continue
+            
         result, experiences, sans = payload
         replay.extend(experiences)
         completed_games += 1
@@ -692,6 +696,14 @@ def _trainer_process_main(
         elo, elo_delta = update_rating_from_result(elo, elo, result, rated_side)
         iteration += 1 if completed_games % max(1, games_per_generation) == 0 else 0
         generation_value.value = iteration
+        
+        # Log completed games, the outcome, rated side, and Elo delta tracking
+        print(
+            f"[GAME] Rated game completed: result={result} side={'white' if rated_side == WHITE else 'black'} "
+            f"elo={elo:.1f} elo_delta={elo_delta:+.1f} | total_games={completed_games} "
+            f"replay_size={len(replay)}",
+            flush=True,
+        )
         
         metrics = {}
         if len(replay) > 256:
@@ -849,7 +861,7 @@ def _utilization_monitor_process_main(
         gpu_util, vram_used, vram_total = _query_gpu_utilization()
         ram_used, ram_total, ram_available, swap_used, swap_total = _query_memory_utilization()
         
-        # Read absolute metrics
+        # Read and print utilization parameters from the evaluator and monitor
         games = games_completed.value
         pos_eval = positions_evaluated.value
         batches = eval_batches.value
@@ -867,6 +879,7 @@ def _utilization_monitor_process_main(
             f"gpu_util={gpu_util:.0f}% vram={vram_used}/{vram_total}MiB ram_avail={ram_available}MiB"
         )
         print(line, flush=True)
+
 
 def _query_gpu_utilization() -> tuple[float, int, int]:
     try:
