@@ -11,19 +11,17 @@ from torch.nn import functional as F
 
 from .encoding import INPUT_CHANNELS, POLICY_SIZE
 
-
 @dataclass(slots=True)
 class ModelConfig:
     input_channels: int = INPUT_CHANNELS
-    channels: int = 128  # Optimised for 150MB VRAM footprint on RTX 2050
-    blocks: int = 6       # Blazing fast execution pipeline on i5-12450H
-    transformer_every: int = 3
+    channels: int = 256         # Workstation-class convolution scale (Up from 128) [2]
+    blocks: int = 12             # Workstation-class depth (Up from 6) [2]
+    transformer_every: int = 3   # Every 3rd block is a spatial attention layer
     attention_heads: int = 4
     policy_size: int = POLICY_SIZE
     dropout: float = 0.0
-    se_reduction: int = 8       # Dynamic Squeeze & Excitation reduction
-    policy_channels: int = 16   # Dynamic policy head intermediate channels
-
+    se_reduction: int = 16       # Optimized reduction factor for 256 channels (Up from 8) [2]
+    policy_channels: int = 32   # Optimized intermediate policy head scale (Up from 16) [2]
 
 class SqueezeExcitation(nn.Module):
     """Squeeze-and-Excitation block for adaptive channel-wise feature recalibration."""
@@ -39,7 +37,6 @@ class SqueezeExcitation(nn.Module):
         pooled = x.mean(dim=(2, 3))
         scale = torch.sigmoid(self.fc2(F.silu(self.fc1(pooled))))
         return x * scale.view(batch, channels, 1, 1)
-
 
 class ConvResidualBlock(nn.Module):
     """Standard residual convolutional block with Batch Normalization and Squeeze-and-Excitation."""
@@ -57,7 +54,6 @@ class ConvResidualBlock(nn.Module):
         y = self.conv1(F.silu(self.bn1(x)))
         y = self.conv2(F.silu(self.bn2(y)))
         return residual + self.se(y)
-
 
 class BoardTransformerBlock(nn.Module):
     """Spatial Multi-Head Attention block mapping global dependencies across the 8x8 grid."""
@@ -83,7 +79,6 @@ class BoardTransformerBlock(nn.Module):
         tokens = tokens + attn
         tokens = tokens + self.ff(self.norm2(tokens))
         return tokens.transpose(1, 2).reshape(batch, channels, height, width)
-
 
 class ZeroNet(nn.Module):
     """Dual-headed Transformer-ResNet orchestrator predicting legal policy and evaluation targets."""
@@ -143,14 +138,14 @@ class ZeroNet(nn.Module):
         if move_mask is not None:
             if move_mask.shape != policy_logits.shape:
                 raise ValueError(f"move_mask shape {tuple(move_mask.shape)} != policy logits {tuple(policy_logits.shape)}")
-            # Cast safe -1e4 masking value to prevent float16 Half precision overflow
+            # Cast safe -1e4 masking value to prevent float16 Half precision overflow [2]
             masked_logits = policy_logits.masked_fill(move_mask <= 0, -1e4)
         policy = torch.softmax(masked_logits, dim=-1)
         
         value_features = self.value_body(self.value_pool(y))
         
-        # Maps directly to [-3.0, 1.0] matching the asymmetric draw-as-loss targets bounds
-        value = 2.0 * torch.tanh(self.value_head(value_features)) - 1.0
+        # Dynamically scales values to the [-31.0, 1.0] domain [2]
+        value = 16.0 * torch.tanh(self.value_head(value_features)) - 15.0
         
         wdl_logits = self.wdl_head(value_features)
         wdl = torch.softmax(wdl_logits, dim=-1)
@@ -220,7 +215,6 @@ class ZeroNet(nn.Module):
             results.append(({move: float(prob) for move, prob in zip(legal, probs, strict=True)}, float(value), float(uncertainty)))
         return results
 
-
 def load_model(path: str | Path, device: str | torch.device = "cpu") -> ZeroNet:
     """Load a model state payload from disk with automatic structural alignment."""
     payload = torch.load(path, map_location=device)
@@ -253,7 +247,6 @@ def load_model(path: str | Path, device: str | torch.device = "cpu") -> ZeroNet:
     model.eval()
     return model
 
-
 def save_model(path: str | Path, model: ZeroNet, **extra) -> None:
     """Save model weights atomically using temporary replacement."""
     path = Path(path)
@@ -267,7 +260,6 @@ def save_model(path: str | Path, model: ZeroNet, **extra) -> None:
 def parameter_count(model: nn.Module) -> int:
     """Return parameter count."""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
 
 ResidualBlock = ConvResidualBlock
 TransformerBlock = BoardTransformerBlock

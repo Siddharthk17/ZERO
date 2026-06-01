@@ -9,7 +9,6 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-
 def _get_available_ram_bytes() -> int:
     try:
         with open("/proc/meminfo", "r", encoding="utf-8") as f:
@@ -20,7 +19,6 @@ def _get_available_ram_bytes() -> int:
     except Exception:
         pass
     return 8 * 1024 * 1024 * 1024
-
 
 @dataclass(slots=True)
 class Experience:
@@ -64,7 +62,6 @@ class SampleBatch:
     indices: list[int | None]
     weights: list[float]
 
-
 class SumTree:
     """Binary prefix sum tree for O(log N) priority updates and sampling."""
 
@@ -95,7 +92,6 @@ class SumTree:
                 value -= self.tree[left]
                 idx = left + 1
         return idx - self.capacity
-
 
 class PrioritizedReplayBuffer:
     """Thread-safe prioritized experience replay with automatic hardware memory adaptation."""

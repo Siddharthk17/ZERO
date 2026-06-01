@@ -17,11 +17,9 @@ from .targets import DRAW_VALUE, apply_contempt, opponent_value
 VIRTUAL_LOSS_VALUE = 3.0
 VIRTUAL_LOSS_VISITS = 3
 
-
 class Evaluator(Protocol):
     def evaluate_batch(self, boards: list[Board]) -> list[tuple[dict[Move, float], float, float]]:
         """Return ``(legal_priors, value, uncertainty)`` for each board."""
-
 
 class UniformEvaluator:
     """Fallback evaluator for bootstrap self-play and CPU-only smoke tests."""
@@ -40,7 +38,6 @@ class UniformEvaluator:
             out.append(({move: prob for move in moves}, 0.0, 1.0))
         return out
 
-
 class NetworkEvaluator:
     """Synchronous model evaluator utilizing local thread locks."""
 
@@ -55,14 +52,12 @@ class NetworkEvaluator:
         with self._lock:
             return self.model.evaluate_batch(boards, self.device)
 
-
 @dataclass(slots=True)
 class _EvalRequest:
     boards: list[Board]
     done: Event = field(default_factory=Event)
     results: list[tuple[dict[Move, float], float, float]] | None = None
     error: BaseException | None = None
-
 
 class SharedBatchEvaluator:
     """Coalesces evaluator calls from multiple self-play threads into large GPU batches."""
@@ -165,7 +160,6 @@ class SharedBatchEvaluator:
             offset = end
             request.done.set()
 
-
 @dataclass(slots=True)
 class Node:
     prior_probability: float = 0.0
@@ -212,7 +206,6 @@ class Node:
         self.visit_count -= VIRTUAL_LOSS_VISITS
         self.virtual_loss_count -= 1
 
-
 @dataclass(slots=True)
 class SearchResult:
     move: Move | None
@@ -232,13 +225,11 @@ class SearchResult:
         yield self.move
         yield self.policy
 
-
 @dataclass(slots=True)
 class _Leaf:
     node: Node
     board: Board
     path: list[Node]
-
 
 class MCTS:
     """Search orchestrator supporting tree-reuse and custom reward rules."""
@@ -254,7 +245,7 @@ class MCTS:
         cpuct: float | None = None,
         dirichlet_alpha: float = 0.3,
         dirichlet_epsilon: float = 0.25,
-        use_transpositions: bool = False, # CORRECTED: Disabled by default to prevent cyclic graphs and infinite loops
+        use_transpositions: bool = False, # Defaulted to False to prevent cyclic graphs [2]
         rng: random.Random | None = None,
         **_: object,
     ) -> None:
@@ -451,22 +442,34 @@ class MCTS:
         node.is_expanded = True
 
     def _select_child(self, node: Node) -> tuple[Move, Node]:
+        c_puct = self.c_puct
+        parent_visit = node.visit_count
+        # Precompute square root once per parent selection step to reduce CPU overhead [2]
+        sqrt_parent_visit = math.sqrt(max(1, parent_visit))
+        
         best_score = -float("inf")
         best: tuple[Move, Node] | None = None
+        
         for move, child in node.children.items():
-            score = self._puct_score(node, child)
+            # Corrected: unvisited nodes default to -1.0 (standard draw) instead of opponent_value(0.0) (-30.0) [2]
+            q_from_parent = opponent_value(child.total_value / child.visit_count) if child.visit_count > 0 else opponent_value(-1.0)
+            
+            exploration = c_puct * child.prior_probability * sqrt_parent_visit / (1 + child.visit_count)
+            score = q_from_parent + exploration
+            
             if score > best_score:
                 best_score = score
                 best = (move, child)
+                
         if best is None:
             raise RuntimeError("cannot select from a node without children")
         return best
 
     def _puct_score(self, parent: Node, child: Node) -> float:
-        q_from_parent = opponent_value(child.q)
-        exploration = self.c_puct * child.prior_probability * math.sqrt(max(1, parent.visit_count)) / (
-            1 + child.visit_count
-        )
+        parent_visit = parent.visit_count
+        sqrt_parent_visit = math.sqrt(max(1, parent_visit))
+        q_from_parent = opponent_value(child.total_value / child.visit_count) if child.visit_count > 0 else opponent_value(-1.0)
+        exploration = self.c_puct * child.prior_probability * sqrt_parent_visit / (1 + child.visit_count)
         return q_from_parent + exploration
 
     def _backpropagate(self, path: list[Node], value: float) -> None:
@@ -511,7 +514,6 @@ class MCTS:
         self.root = Node()
         self.root_hash = None
         self.transposition_table.clear()
-
 
 def _dirichlet(alphas: list[float], rng: random.Random) -> list[float]:
     samples = [rng.gammavariate(alpha, 1.0) for alpha in alphas]

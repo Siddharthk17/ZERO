@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import datetime
 
-
 def export_pgn(moves_san: list[str], result: str, headers: dict[str, str] | None = None) -> str:
     """Export a list of SAN moves and metadata into a standard, valid PGN string."""
     now = datetime.datetime.now()

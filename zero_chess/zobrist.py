@@ -15,7 +15,6 @@ TURN_KEY = _rng.getrandbits(64)
 CASTLING_KEYS = [_rng.getrandbits(64) for _ in range(16)]
 EP_FILE_KEYS = [_rng.getrandbits(64) for _ in range(8)]
 
-
 def mask64(value: int) -> int:
     """Mask arbitrary-precision Python integers to standard 64-bit unsigned bounds."""
     return value & 0xFFFF_FFFF_FFFF_FFFF

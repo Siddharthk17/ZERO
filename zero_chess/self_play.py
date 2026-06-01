@@ -11,6 +11,7 @@ import subprocess
 import threading
 import time
 import traceback
+from collections import deque
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,14 +24,16 @@ from .constants import (
     BLACK, BK, BQ, EMPTY, WHITE, WK, WQ, color_of, file_of,
     parse_square, piece_type, rank_of, square, square_name
 )
-from .elo import DEFAULT_ELO, update_rating_from_result
+from .elo import DEFAULT_ELO, update_rating_with_reason
 from .encoding import terminal_wdl
 from .mcts import MCTS, NetworkEvaluator, UniformEvaluator
 from .move import EN_PASSANT, Move
 from .pgn import export_pgn
 from .replay import Experience, PrioritizedReplayBuffer
-from .targets import AGGRESSION_WEIGHT, MOMENTUM_REWARD, PANIC_PENALTY, game_result_to_values
-
+from .targets import (
+    AGGRESSION_WEIGHT, MOMENTUM_REWARD, PANIC_PENALTY, 
+    opponent_value, game_result_to_values
+)
 
 @dataclass(slots=True)
 class SelfPlayConfig:
@@ -45,7 +48,6 @@ class SelfPlayConfig:
     generation: int = 0
     reuse_tree: bool = True
 
-
 @dataclass(slots=True)
 class PositionRecord:
     fen: str
@@ -56,12 +58,11 @@ class PositionRecord:
     momentum_reward: float
     panic_penalty: float
 
-
 def play_game(
     mcts: MCTS,
     config: SelfPlayConfig | None = None,
     rng: random.Random | None = None,
-) -> tuple[str, list[Experience], list[str]]:
+) -> tuple[str, list[Experience], list[str], str, dict]:
     config = config or SelfPlayConfig()
     rng = rng or random.Random()
     board = Board()
@@ -69,11 +70,22 @@ def play_game(
     sans: list[str] = []
     adjudication: list[float] = []
     pending_panic = 0.0
+    start_time = time.monotonic()
 
     for ply in range(config.max_plies):
         result = board.outcome()
         if result is not None:
-            return result, _finalize(records, result, rng), sans
+            if board.is_checkmate():
+                reason = "checkmate"
+            elif board.is_stalemate():
+                reason = "stalemate"
+            elif board.has_insufficient_material():
+                reason = "draw_material"
+            else:
+                reason = "draw_repetition"
+            
+            meta = _compile_game_metadata(board, sans, start_time)
+            return result, _finalize(records, result, reason, rng), sans, reason, meta
 
         temperature = 1.0 if ply < config.temperature_moves else 0.0
         search = mcts.search(
@@ -85,7 +97,8 @@ def play_game(
         )
         if search.resigned and not config.disable_resign:
             result = "0-1" if board.turn == WHITE else "1-0"
-            return result, _finalize(records, result, rng), sans
+            meta = _compile_game_metadata(board, sans, start_time)
+            return result, _finalize(records, result, "resignation", rng), sans, "resignation", meta
 
         legal = board.legal_moves()
         if ply < config.opening_random_plies and rng.random() < config.opening_random_prob and legal:
@@ -107,13 +120,14 @@ def play_game(
             )
         )
 
-        # Align perspective to White for accurate linear trend adjudication
-        white_q = root_value if board.turn == WHITE else -root_value
+        white_q = root_value if board.turn == WHITE else opponent_value(root_value)
         adjudication.append(white_q)
         if len(adjudication) >= 20 and _adjudicate(adjudication[-20:]):
-            winning_side_is_white = sum(adjudication[-20:]) > 0
+            avg = sum(adjudication[-20:]) / 20.0
+            winning_side_is_white = avg > -1.0
             result = "1-0" if winning_side_is_white else "0-1"
-            return result, _finalize(records, result, rng), sans
+            meta = _compile_game_metadata(board, sans, start_time)
+            return result, _finalize(records, result, "adjudication", rng), sans, "adjudication", meta
 
         sans.append(board.san(move))
         pending_panic = _panic_penalty(board, move)
@@ -126,18 +140,56 @@ def play_game(
             if ply % 16 == 15:
                 gc.collect()
 
-    return "1/2-1/2", _finalize(records, "1/2-1/2", rng), sans
+    meta = _compile_game_metadata(board, sans, start_time)
+    return "1/2-1/2", _finalize(records, "1/2-1/2", "max_plies", rng), sans, "max_plies", meta
 
+def _compile_game_metadata(board: Board, sans: list[str], start_time: float) -> dict:
+    """Calculates active game metrics and positional attributes at termination."""
+    values = {"P": 1, "N": 3, "B": 3, "R": 5, "Q": 9, "p": -1, "n": -3, "b": -3, "r": -5, "q": -9}
+    material_delta = sum(values.get(p, 0) for p in board.squares if p != ".")
+    opening_str = " ".join(sans[:6]) if len(sans) >= 6 else " ".join(sans)
+    return {
+        "duration": time.monotonic() - start_time,
+        "material_delta": material_delta,
+        "opening": opening_str or "Standard Open"
+    }
 
 def _finalize(
     records: list[PositionRecord],
     result: str,
+    reason_or_rng: str | random.Random | None = "checkmate",
     rng: random.Random | None = None,
-    augment: bool = True,
+    augment: bool = False,
 ) -> list[Experience]:
-    rng = rng or random.Random()
+    if isinstance(reason_or_rng, random.Random):
+        rng = reason_or_rng
+        reason = "checkmate"
+    elif reason_or_rng is None:
+        reason = "checkmate"
+    else:
+        reason = reason_or_rng
+
     experiences = []
-    rewards = game_result_to_values(result)
+    
+    # Calculate custom rewards mapping directly to the new scale
+    if result == "1/2-1/2":
+        if reason == "stalemate":
+            rewards = (-10.0, -10.0)
+        elif reason == "max_plies":
+            rewards = (-20.0, -20.0)
+        else:
+            rewards = (-1.0, -1.0)
+    elif result == "1-0":
+        if reason == "resignation":
+            rewards = (0.0, -30.0)
+        else:
+            rewards = (1.0, -3.0)
+    else:
+        if reason == "resignation":
+            rewards = (-30.0, 0.0)
+        else:
+            rewards = (-3.0, 1.0)
+            
     for idx, record in enumerate(records):
         terminal_reward = rewards[0] if record.turn == WHITE else rewards[1]
         bootstrap = _bootstrap_value(records, idx)
@@ -160,29 +212,103 @@ def _finalize(
             panic_penalty=record.panic_penalty,
         )
         experiences.append(exp)
-        if augment and rng.random() < 0.5:
+        if augment and rng is not None and rng.random() < 0.5:
             experiences.append(_flip_experience_horizontal(exp))
     return experiences
 
-
 def _bootstrap_value(records: list[PositionRecord], idx: int, plies: int = 5) -> float:
     if not records:
-        return -0.8
+        return -1.0
     j = min(len(records) - 1, idx + plies)
     current_turn = records[idx].turn
     later_turn = records[j].turn
     later_value = records[j].root_value
-    return later_value if later_turn == current_turn else -later_value
+    return later_value if later_turn == current_turn else opponent_value(later_value)
 
+def _flip_square_name(name: str) -> str:
+    sq = parse_square(name)
+    return square_name(square(7 - file_of(sq), rank_of(sq)))
+
+def _flip_uci_horizontal(uci: str) -> str:
+    if len(uci) >= 4:
+        promo = uci[4:]
+        return _flip_square_name(uci[:2]) + _flip_square_name(uci[2:4]) + promo
+    return uci
+
+def _flip_board_horizontal(board: Board) -> Board:
+    squares = ["."] * 64
+    for sq, piece in enumerate(board.squares):
+        squares[square(7 - file_of(sq), rank_of(sq))] = piece
+    rights = 0
+    if board.castling_rights & WK:
+        rights |= WQ
+    if board.castling_rights & WQ:
+        rights |= WK
+    if board.castling_rights & BK:
+        rights |= BQ
+    if board.castling_rights & BQ:
+        rights |= BK
+    ep = None if board.ep_square is None else square(7 - file_of(board.ep_square), rank_of(board.ep_square))
+    return Board(squares, board.turn, rights, ep, board.halfmove_clock, board.fullmove_number)
+
+def _flip_experience_horizontal(exp: Experience) -> Experience:
+    board = _flip_board_horizontal(Board.from_fen(exp.fen))
+    return Experience(
+        fen=board.fen(),
+        policy={_flip_uci_horizontal(uci): prob for uci, prob in exp.policy.items()},
+        value=exp.value,
+        td_value=exp.td_value,
+        wdl=exp.wdl,
+        priority=exp.priority,
+        value_prediction=exp.value_prediction,
+        importance_weight=exp.importance_weight,
+        reward_bonus=exp.reward_bonus,
+        aggression_score=exp.aggression_score,
+        momentum_reward=exp.momentum_reward,
+        panic_penalty=exp.panic_penalty,
+    )
+
+def _collect_eval_requests(request_queue, gpu_batch_size: int, wait_seconds: float, active_workers=None):
+    item = request_queue.get()
+    if item[0] == "stop":
+        return None
+    requests = [item]
+    positions = len(item[3])
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        if positions >= gpu_batch_size:
+            break
+
+        search_is_finished = True
+        if active_workers is not None:
+            active_ids = {i for i, active in enumerate(active_workers) if active}
+            pending_ids = {req[1] for req in requests}
+            search_is_finished = active_ids.issubset(pending_ids)
+
+        now = time.monotonic()
+        if now >= deadline:
+            if positions >= 16 or search_is_finished:
+                break
+
+        timeout = max(0.001, deadline - now) if now < deadline else wait_seconds
+        try:
+            item = request_queue.get(timeout=timeout)
+        except queue.Empty:
+            continue
+        if item[0] == "stop":
+            break
+        requests.append(item)
+        positions += len(item[3])
+    return requests
 
 def generate_parallel_games(
     evaluator,
     games: int = 2,
     config: SelfPlayConfig | None = None,
     rng_seed: int | None = None,
-) -> list[tuple[str, list[Experience], list[str]]]:
+) -> list[tuple[str, list[Experience], list[str], str, dict]]:
     config = config or SelfPlayConfig()
-    results: list[tuple[str, list[Experience], list[str]] | None] = [None] * games
+    results: list[tuple[str, list[Experience], list[str], str, dict] | None] = [None] * games
 
     def worker(index: int) -> None:
         rng = random.Random(None if rng_seed is None else rng_seed + index)
@@ -190,8 +316,7 @@ def generate_parallel_games(
             evaluator,
             c_puct=1.5 if config.generation < 200 else 1.0,
             batch_size=config.batch_size,
-            add_noise=True,
-            resign_threshold=-1.0 if config.generation < 10 else config.resign_value,
+            simulations=config.simulations,
         )
         results[index] = play_game(mcts, config, rng)
         mcts.reset()
@@ -204,7 +329,6 @@ def generate_parallel_games(
     for thread in threads:
         thread.join()
     return [result for result in results if result is not None]
-
 
 class QueueEvaluatorProxy:
     """Synchronous MCTS evaluator proxy backed by multiprocessing queues."""
@@ -227,7 +351,6 @@ class QueueEvaluatorProxy:
                 raise RuntimeError(error)
             return results
 
-
 def generate_multiprocess_games(
     model,
     device: str = "cuda",
@@ -236,7 +359,7 @@ def generate_multiprocess_games(
     rng_seed: int | None = None,
     gpu_batch_size: int = 64,
     max_wait_ms: float = 2.0,
-) -> list[tuple[str, list[Experience], list[str]]]:
+) -> list[tuple[str, list[Experience], list[str], str, dict]]:
     """Generate self-play with CPU worker processes feeding one CUDA evaluator process."""
     config = config or SelfPlayConfig()
     ctx = mp.get_context("spawn")
@@ -264,7 +387,7 @@ def generate_multiprocess_games(
         process.start()
         workers.append(process)
 
-    results: list[tuple[str, list[Experience], list[str]] | None] = [None] * games
+    results: list[tuple[str, list[Experience], list[str], str, dict] | None] = [None] * games
     received = 0
     while received < games:
         try:
@@ -282,7 +405,6 @@ def generate_multiprocess_games(
     evaluator.join(timeout=5.0)
     return [result for result in results if result is not None]
 
-
 @dataclass(slots=True)
 class CudaTrainingRuntime:
     stop_event: object
@@ -296,7 +418,6 @@ class CudaTrainingRuntime:
         for process in self.processes:
             if process.is_alive():
                 process.terminate()
-
 
 def start_persistent_cuda_training(
     model,
@@ -444,7 +565,6 @@ def start_persistent_cuda_training(
 
     return CudaTrainingRuntime(stop_event, [*workers, evaluator, trainer, monitor], resources)
 
-
 def _persistent_self_play_process_main(
     worker_id: int,
     request_queue,
@@ -489,7 +609,6 @@ def _persistent_self_play_process_main(
     finally:
         active_workers[worker_id] = False
 
-
 def _persistent_gpu_evaluator_process_main(
     model_config: dict,
     shared_state: dict,
@@ -533,8 +652,11 @@ def _persistent_gpu_evaluator_process_main(
             model.eval()
 
         requests = _collect_eval_requests_nonblocking(request_queue, gpu_batch_size, wait_seconds, stop_event, active_workers)
+        if requests is None:
+            return  # Clean stop
         if not requests:
-            continue
+            continue  # Idle loop back
+
         flat_boards = [board for _, _, _, boards in requests for board in boards]
         
         # Increment batch and evaluation stats counters
@@ -575,7 +697,6 @@ def _persistent_gpu_evaluator_process_main(
             time.sleep(gpu_cooldown_ms / 1000.0)
 
         gc.collect()
-
 
 def _evaluate_preallocated_chunk(
     compiled_model,
@@ -633,6 +754,228 @@ def _evaluate_preallocated_chunk(
         results.append((priors, float(values[row]), float(uncertainties[row])))
     return results
 
+def _collect_eval_requests_nonblocking(request_queue, gpu_batch_size: int, wait_seconds: float, stop_event=None, active_workers=None):
+    try:
+        item = request_queue.get(timeout=0.01)
+    except queue.Empty:
+        return []
+    if item[0] == "stop":
+        if stop_event is not None:
+            stop_event.set()
+        return None # Return None to signal a clean, cooperative shutdown [2]
+    requests = [item]
+    positions = len(item[3])
+    deadline = time.monotonic() + wait_seconds
+    while (stop_event is None or not stop_event.is_set()) and positions < gpu_batch_size:
+        now = time.monotonic()
+        if now >= deadline:
+            break
+        try:
+            item = request_queue.get(timeout=max(0.001, deadline - now))
+        except queue.Empty:
+            continue
+        if item[0] == "stop":
+            if stop_event is not None:
+                stop_event.set()
+            return None # Return None to signal a clean, cooperative shutdown [2]
+        requests.append(item)
+        positions += len(item[3])
+    return requests
+
+def _configure_cuda_process(device: str, torch_module, memory_fraction: float = 0.40) -> None:
+    try:
+        torch_module.set_num_threads(1)
+        torch_module.set_num_interop_threads(1)
+    except Exception:
+        pass
+    if device != "cuda":
+        return
+    torch_module.cuda.set_per_process_memory_fraction(memory_fraction)
+    torch_module.backends.cuda.matmul.allow_tf32 = True
+    torch_module.backends.cudnn.benchmark = True
+
+def _utilization_monitor_process_main(
+    stop_event,
+    games_completed,
+    positions_evaluated,
+    eval_batches,
+    batch_positions,
+    target_batch_size: int,
+    log_path: str,
+) -> None:
+    path = Path(log_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    start_time = time.monotonic()
+    while not stop_event.is_set():
+        time.sleep(30.0)
+        gpu_util, vram_used, vram_total = _query_gpu_utilization()
+        ram_used, ram_total, ram_available, swap_used, swap_total = _query_memory_utilization()
+        
+        # Read and print utilization parameters from the evaluator and monitor
+        games = games_completed.value
+        pos_eval = positions_evaluated.value
+        batches = eval_batches.value
+        avg_batch = batch_positions.value / max(1, batches)
+        
+        # Calculate rates over elapsed time
+        elapsed_min = (time.monotonic() - start_time) / 60.0
+        pos_per_min = pos_eval / max(0.01, elapsed_min)
+        games_per_hour = (games / max(0.01, elapsed_min)) * 60.0
+        
+        line = (
+            f"games={games} ({games_per_hour:.1f} g/hr) | "
+            f"pos_eval={pos_eval} ({pos_per_min:.1f} p/min) | "
+            f"batches={batches} avg_batch={avg_batch:.1f} | "
+            f"gpu_util={gpu_util:.0f}% vram={vram_used}/{vram_total}MiB ram_avail={ram_available}MiB"
+        )
+        print(line, flush=True)
+
+def _query_gpu_utilization() -> tuple[float, int, int]:
+    try:
+        output = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            timeout=5.0,
+        )
+        util, used, total = [part.strip() for part in output.splitlines()[0].split(",")]
+        return float(util), int(used), int(total)
+    except Exception:
+        return 0.0, 0, 0
+
+def _query_memory_utilization() -> tuple[int, int, int, int, int]:
+    """Retrieve platform memory utilization, falling back gracefully to avoid freezes on non-Linux systems."""
+    try:
+        fields: dict[str, int] = {}
+        with Path("/proc/meminfo").open("r", encoding="utf-8") as fh:
+            for line in fh:
+                name, raw_value = line.split(":", 1)
+                fields[name] = int(raw_value.strip().split()[0]) // 1024
+        total = fields.get("MemTotal", 0)
+        available = fields.get("MemAvailable", 0)
+        swap_total = fields.get("SwapTotal", 0)
+        swap_free = fields.get("SwapFree", 0)
+        return total - available, total, available, swap_total - swap_free, swap_total
+    except Exception:
+        # Cross-platform fallback: return baseline values to prevent thread starvation/infinite pauses
+        return 0, 8192, 4096, 0, 0
+
+def _model_payload_for_process(model) -> tuple[dict, dict]:
+    config = asdict(model.config) if hasattr(model, "config") else {}
+    state_dict = {}
+    for name, tensor in model.state_dict().items():
+        value = tensor.detach().cpu()
+        try:
+            value.share_memory_()
+        except RuntimeError:
+            pass
+        state_dict[name] = value
+    return config, state_dict
+
+def _self_play_process_main(
+    worker_id: int,
+    request_queue,
+    response_queue,
+    game_queue,
+    config: SelfPlayConfig,
+    rng_seed: int | None,
+    active_workers,
+) -> None:
+    active_workers[worker_id] = True
+    try:
+        rng = random.Random(rng_seed)
+        evaluator = QueueEvaluatorProxy(worker_id, request_queue, response_queue)
+        mcts = MCTS(
+            evaluator,
+            batch_size=config.batch_size,
+            simulations=config.simulations,
+        )
+        # Play exactly one game, put results in queue, reset, and exit cleanly [2]
+        game_result = play_game(mcts, config, rng)
+        game_queue.put((worker_id, game_result, None))
+        mcts.reset()
+        del mcts
+        gc.collect()
+    except Exception:
+        game_queue.put((worker_id, None, traceback.format_exc()))
+    finally:
+        active_workers[worker_id] = False
+
+def _gpu_evaluator_process_main(
+    model_config: dict,
+    state_dict: dict,
+    device: str,
+    request_queue,
+    response_queues,
+    gpu_batch_size: int,
+    max_wait_ms: float,
+    active_workers,
+) -> None:
+    from .model import ModelConfig, ZeroNet
+
+    import torch
+
+    model = ZeroNet(ModelConfig(**model_config)).to(device)
+    model.load_state_dict(state_dict)
+    model.eval()
+    wait_seconds = max_wait_ms / 1000.0
+
+    while True:
+        requests = _collect_eval_requests_nonblocking(request_queue, gpu_batch_size, wait_seconds, None, active_workers) # Corrected target signature [2]
+        if requests is None:
+            return  # Clean stop signal received, terminate process [2]
+        if not requests:
+            continue  # Idle timeout, loop back safely without evaluating [2]
+            
+        flat_boards = [board for _, _, _, boards in requests for board in boards]
+        try:
+            flat_results = model.evaluate_batch(flat_boards, device)
+            error = None
+        except Exception:
+            flat_results = []
+            error = traceback.format_exc()
+
+        offset = 0
+        for _, worker_id, request_id, boards in requests:
+            end = offset + len(boards)
+            response_queues[worker_id].put((request_id, None if error else flat_results[offset:end], error))
+            offset = end
+
+def _adjudicate(values: list[float]) -> bool:
+    if len(values) < 20:
+        return False
+    # Corrected: Adjudication respects asymmetric scale around the -1.0 draw baseline [2]
+    avg = sum(values) / len(values)
+    is_stable = (max(values) - min(values)) <= 0.05
+    is_crushing = (avg > 0.70) or (avg < -2.70)
+    return is_stable and is_crushing
+
+def _aggression_score(board: Board) -> float:
+    opponent = board.turn ^ 1
+    squares = board.squares
+    opponent_squares = []
+    for sq in range(64):
+        piece = squares[sq]
+        if piece != "." and ((piece.isupper() and opponent == WHITE) or (piece.islower() and opponent == BLACK)):
+            opponent_squares.append(sq)
+            
+    if not opponent_squares:
+        return 0.0
+    attacked = sum(1 for sq in opponent_squares if board.is_square_attacked(sq, board.turn))
+    return attacked / len(opponent_squares)
+
+def _momentum_reward(board: Board, move: Move) -> float:
+    if move.is_capture:
+        return MOMENTUM_REWARD
+    return 0.0
+
+def _panic_penalty(board: Board, move: Move) -> float:
+    if move.is_capture:
+        return PANIC_PENALTY
+    return 0.0
 
 def _trainer_process_main(
     model_config: dict,
@@ -678,30 +1021,112 @@ def _trainer_process_main(
         replay = PrioritizedReplayBuffer(cold_path=cold_replay_path)
 
     completed_games = 0
+    # Sliding windows for rolling analytics
+    plies_window = deque(maxlen=100)
+    reasons_window = deque(maxlen=100)
+    durations_window = deque(maxlen=100)
+
     while not stop_event.is_set():
         try:
             _, payload, error = game_queue.get(timeout=1.0)
         except queue.Empty:
+            # Run Arena Evaluation dynamically every 100 completed games
+            if completed_games > 0 and completed_games % 100 == 0:
+                print("\n" + "="*20 + " [ARENA EVALUATION] " + "="*20, flush=True)
+                print(f"Starting Arena Match: Student vs. EMA Teacher (Iteration {iteration})", flush=True)
+                print("Games: 20 | MCTS Simulations: 160 | Device: " + str(device), flush=True)
+                
+                from .arena import play_arena
+                from .mcts import NetworkEvaluator
+                
+                student_eval = NetworkEvaluator(model, device)
+                teacher_eval = NetworkEvaluator(teacher.teacher, device)
+                
+                arena = play_arena(
+                    student_eval,
+                    teacher_eval,
+                    games=20,
+                    simulations=160,
+                    iteration=iteration,
+                    elo_a=elo,
+                    log_path="logs/arena.log",
+                )
+                
+                elo = float(arena["elo_a"])
+                print(f"Results: Student Score: {arena['student_score']} | Teacher Score: {arena['teacher_score']}", flush=True)
+                print(f"Match Stats: Student Wins: {arena['wins_a']} | Teacher Wins: {arena['wins_b']} | Draws: {arena['draws']}", flush=True)
+                
+                if arena["promote"]:
+                    teacher.promote(model)
+                    print(f"Status: [PROMOTED] Student defeated Teacher (>60% score)! Student is now the new EMA Teacher.", flush=True)
+                else:
+                    print(f"Status: [RETAINED] Teacher retained its title (Student score <=60%).", flush=True)
+                print(f"New Running Elo: {elo:.1f}", flush=True)
+                print("="*60 + "\n", flush=True)
+                
+                completed_games += 1  # Offset to prevent infinite evaluation triggers
             continue
-        
-        # Output any swallowed exceptions to locate end-of-game process failures
+            
         if error is not None:
             print(f"\n[ERROR] Worker process encountered an exception:\n{error}", flush=True)
             continue
             
-        result, experiences, sans = payload
+        result, experiences, sans, reason, meta = payload # Unpack 5-tuple with metadata!
         replay.extend(experiences)
         completed_games += 1
         rated_side = WHITE if completed_games % 2 else BLACK
-        elo, elo_delta = update_rating_from_result(elo, elo, result, rated_side)
+        elo, elo_delta = update_rating_with_reason(elo, result, rated_side, reason) # Use custom Elo rules!
         iteration += 1 if completed_games % max(1, games_per_generation) == 0 else 0
         generation_value.value = iteration
         
-        # Log completed games, the outcome, rated side, and Elo delta tracking
+        # Append to sliding windows
+        plies_window.append(len(sans))
+        reasons_window.append(reason)
+        durations_window.append(meta["duration"])
+
+        # Format a highly descriptive string for the game outcome
+        if result == "1/2-1/2":
+            if reason == "stalemate":
+                outcome_desc = "Draw by Stalemate"
+            elif reason == "max_plies":
+                outcome_desc = "Draw by Max Plies"
+            elif reason == "draw_material":
+                outcome_desc = "Draw by Dead Material"
+            else:
+                outcome_desc = "Draw by Threefold Repetition"
+        elif result == "1-0":
+            if reason == "resignation":
+                outcome_desc = "White won by Resignation"
+            elif reason == "adjudication":
+                outcome_desc = "White won by Adjudication"
+            else:
+                outcome_desc = "White won by CHECKMATE"
+        else: # "0-1"
+            if reason == "resignation":
+                outcome_desc = "Black won by Resignation"
+            elif reason == "adjudication":
+                outcome_desc = "Black won by Adjudication"
+            else:
+                outcome_desc = "Black won by CHECKMATE"
+
+        # Calculate Rolling 100-Game Percentages for the console log
+        total_in_window = len(reasons_window)
+        checkmate_pct = (reasons_window.count("checkmate") / total_in_window) * 100.0
+        resign_pct = (reasons_window.count("resignation") / total_in_window) * 100.0
+        draw_pct = (sum(1 for r in reasons_window if r in ("stalemate", "max_plies", "draw_material", "draw_repetition")) / total_in_window) * 100.0
+        avg_plies = sum(plies_window) / total_in_window
+        avg_seconds = sum(durations_window) / total_in_window
+
+        # Print the highly descriptive, detailed game logging line
         print(
-            f"[GAME] Rated game completed: result={result} side={'white' if rated_side == WHITE else 'black'} "
-            f"elo={elo:.1f} elo_delta={elo_delta:+.1f} | total_games={completed_games} "
-            f"replay_size={len(replay)}",
+            f"[GAME #{completed_games:05d}] Plies: {len(sans):3d} ({avg_plies:.1f} avg) | "
+            f"Reason: {outcome_desc:<25} | "
+            f"Roll %: Mate={checkmate_pct:.1f}% Resign={resign_pct:.1f}% Draw={draw_pct:.1f}% | "
+            f"Imbalance: {meta['material_delta']:+2d} | "
+            f"Opening: {meta['opening']:<28} | "
+            f"Duration: {meta['duration']:4.1f}s ({avg_seconds:.1f}s avg) | "
+            f"Elo: {elo:.1f} ({elo_delta:+.1f}) | "
+            f"Replay Buffer: {len(replay):,}",
             flush=True,
         )
         
@@ -717,6 +1142,18 @@ def _trainer_process_main(
                 scheduler=scheduler,
                 scaler=scaler,
                 logger=logger,
+            )
+            
+            # Print active gradient update metrics directly alongside game completion logs
+            print(
+                f"[TRAIN #{train_updates:05d}] Loss: {metrics.get('loss', 0.0):.4f} | "
+                f"Policy Loss: {metrics.get('policy_loss', 0.0):.4f} | "
+                f"Value Loss: {metrics.get('value_loss', 0.0):.4f} | "
+                f"Entropy: {metrics.get('policy_entropy', 0.0):.4f} | "
+                f"Value Error: {metrics.get('value_error', 0.0):.4f} | "
+                f"Aux Losses: Mat={metrics.get('material_loss', 0.0):.4f} Mob={metrics.get('mobility_loss', 0.0):.4f} King={metrics.get('king_safety_loss', 0.0):.4f} | "
+                f"LR: {metrics.get('lr', 0.0):.6g}",
+                flush=True,
             )
             teacher.update(model)
             _copy_state_to_shared(teacher.teacher, shared_state, state_lock)
@@ -743,12 +1180,10 @@ def _trainer_process_main(
         if device == "cuda":
             torch.cuda.empty_cache()
 
-
 def _copy_state_to_shared(model, shared_state: dict, state_lock) -> None:
     with state_lock:
         for name, tensor in model.state_dict().items():
             shared_state[name].copy_(tensor.detach().cpu())
-
 
 def _append_training_game_history(
     game_number: int,
@@ -802,309 +1237,3 @@ def _append_training_game_history(
     pgn_file.parent.mkdir(parents=True, exist_ok=True)
     with pgn_file.open("a", encoding="utf-8") as fh:
         fh.write(pgn + "\n\n")
-
-
-def _collect_eval_requests_nonblocking(request_queue, gpu_batch_size: int, wait_seconds: float, stop_event, active_workers=None):
-    try:
-        item = request_queue.get(timeout=0.01)
-    except queue.Empty:
-        return []
-    if item[0] == "stop":
-        stop_event.set()
-        return []
-    requests = [item]
-    positions = len(item[3])
-    deadline = time.monotonic() + wait_seconds
-    while not stop_event.is_set() and positions < gpu_batch_size:
-        now = time.monotonic()
-        if now >= deadline:
-            break
-        try:
-            item = request_queue.get(timeout=max(0.001, deadline - now))
-        except queue.Empty:
-            continue
-        if item[0] == "stop":
-            stop_event.set()
-            break
-        requests.append(item)
-        positions += len(item[3])
-    return requests
-
-
-def _configure_cuda_process(device: str, torch_module, memory_fraction: float = 0.40) -> None:
-    try:
-        torch_module.set_num_threads(1)
-        torch_module.set_num_interop_threads(1)
-    except Exception:
-        pass
-    if device != "cuda":
-        return
-    torch_module.cuda.set_per_process_memory_fraction(memory_fraction)
-    torch_module.backends.cuda.matmul.allow_tf32 = True
-    torch_module.backends.cudnn.benchmark = True
-
-
-def _utilization_monitor_process_main(
-    stop_event,
-    games_completed,
-    positions_evaluated,
-    eval_batches,
-    batch_positions,
-    target_batch_size: int,
-    log_path: str,
-) -> None:
-    path = Path(log_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    start_time = time.monotonic()
-    while not stop_event.is_set():
-        time.sleep(30.0)
-        gpu_util, vram_used, vram_total = _query_gpu_utilization()
-        ram_used, ram_total, ram_available, swap_used, swap_total = _query_memory_utilization()
-        
-        # Read and print utilization parameters from the evaluator and monitor
-        games = games_completed.value
-        pos_eval = positions_evaluated.value
-        batches = eval_batches.value
-        avg_batch = batch_positions.value / max(1, batches)
-        
-        # Calculate rates over elapsed time
-        elapsed_min = (time.monotonic() - start_time) / 60.0
-        pos_per_min = pos_eval / max(0.01, elapsed_min)
-        games_per_hour = (games / max(0.01, elapsed_min)) * 60.0
-        
-        line = (
-            f"games={games} ({games_per_hour:.1f} g/hr) | "
-            f"pos_eval={pos_eval} ({pos_per_min:.1f} p/min) | "
-            f"batches={batches} avg_batch={avg_batch:.1f} | "
-            f"gpu_util={gpu_util:.0f}% vram={vram_used}/{vram_total}MiB ram_avail={ram_available}MiB"
-        )
-        print(line, flush=True)
-
-
-def _query_gpu_utilization() -> tuple[float, int, int]:
-    try:
-        output = subprocess.check_output(
-            [
-                "nvidia-smi",
-                "--query-gpu=utilization.gpu,memory.used,memory.total",
-                "--format=csv,noheader,nounits",
-            ],
-            text=True,
-            timeout=5.0,
-        )
-        util, used, total = [part.strip() for part in output.splitlines()[0].split(",")]
-        return float(util), int(used), int(total)
-    except Exception:
-        return 0.0, 0, 0
-
-
-def _query_memory_utilization() -> tuple[int, int, int, int, int]:
-    """Retrieve platform memory utilization, falling back gracefully to avoid freezes on non-Linux systems."""
-    try:
-        fields: dict[str, int] = {}
-        with Path("/proc/meminfo").open("r", encoding="utf-8") as fh:
-            for line in fh:
-                name, raw_value = line.split(":", 1)
-                fields[name] = int(raw_value.strip().split()[0]) // 1024
-        total = fields.get("MemTotal", 0)
-        available = fields.get("MemAvailable", 0)
-        swap_total = fields.get("SwapTotal", 0)
-        swap_free = fields.get("SwapFree", 0)
-        return total - available, total, available, swap_total - swap_free, swap_total
-    except Exception:
-        # Cross-platform fallback: return baseline values to prevent thread starvation/infinite pauses
-        return 0, 8192, 4096, 0, 0
-
-
-def _model_payload_for_process(model) -> tuple[dict, dict]:
-    config = asdict(model.config) if hasattr(model, "config") else {}
-    state_dict = {}
-    for name, tensor in model.state_dict().items():
-        value = tensor.detach().cpu()
-        try:
-            value.share_memory_()
-        except RuntimeError:
-            pass
-        state_dict[name] = value
-    return config, state_dict
-
-
-def _self_play_process_main(
-    worker_id: int,
-    request_queue,
-    response_queue,
-    result_queue,
-    config: SelfPlayConfig,
-    rng_seed: int | None,
-    active_workers,
-) -> None:
-    active_workers[worker_id] = True
-    try:
-        rng = random.Random(rng_seed)
-        evaluator = QueueEvaluatorProxy(worker_id, request_queue, response_queue)
-        mcts = MCTS(
-            evaluator,
-            batch_size=config.batch_size,
-            simulations=config.simulations,
-        )
-        result_queue.put((worker_id, play_game(mcts, config, rng), None))
-    except Exception:
-        result_queue.put((worker_id, None, traceback.format_exc()))
-    finally:
-        active_workers[worker_id] = False
-
-
-def _gpu_evaluator_process_main(
-    model_config: dict,
-    state_dict: dict,
-    device: str,
-    request_queue,
-    response_queues,
-    gpu_batch_size: int,
-    max_wait_ms: float,
-    active_workers,
-) -> None:
-    from .model import ModelConfig, ZeroNet
-
-    import torch
-
-    model = ZeroNet(ModelConfig(**model_config)).to(device)
-    model.load_state_dict(state_dict)
-    model.eval()
-    wait_seconds = max_wait_ms / 1000.0
-
-    while True:
-        requests = _collect_eval_requests(request_queue, gpu_batch_size, wait_seconds, active_workers)
-        if requests is None:
-            return
-        flat_boards = [board for _, _, _, boards in requests for board in boards]
-        try:
-            flat_results = model.evaluate_batch(flat_boards, device)
-            error = None
-        except Exception:
-            flat_results = []
-            error = traceback.format_exc()
-
-        offset = 0
-        for _, worker_id, request_id, boards in requests:
-            end = offset + len(boards)
-            response_queues[worker_id].put((request_id, None if error else flat_results[offset:end], error))
-            offset = end
-
-
-def _collect_eval_requests(request_queue, gpu_batch_size: int, wait_seconds: float, active_workers=None):
-    item = request_queue.get()
-    if item[0] == "stop":
-        return None
-    requests = [item]
-    positions = len(item[3])
-    deadline = time.monotonic() + wait_seconds
-    while True:
-        if positions >= gpu_batch_size:
-            break
-
-        search_is_finished = True
-        if active_workers is not None:
-            active_ids = {i for i, active in enumerate(active_workers) if active}
-            pending_ids = {req[1] for req in requests}
-            search_is_finished = active_ids.issubset(pending_ids)
-
-        now = time.monotonic()
-        if now >= deadline:
-            if positions >= 16 or search_is_finished:
-                break
-
-        timeout = max(0.001, deadline - now) if now < deadline else wait_seconds
-        try:
-            item = request_queue.get(timeout=timeout)
-        except queue.Empty:
-            continue
-        if item[0] == "stop":
-            break
-        requests.append(item)
-        positions += len(item[3])
-    return requests
-
-
-def _adjudicate(values: list[float]) -> bool:
-    if len(values) < 20:
-        return False
-    return max(values) - min(values) <= 0.05 and abs(sum(values) / len(values)) > 0.85
-
-
-def _aggression_score(board: Board) -> float:
-    opponent = board.turn ^ 1
-    squares = board.squares
-    opponent_squares = []
-    for sq in range(64):
-        piece = squares[sq]
-        if piece != "." and ((piece.isupper() and opponent == WHITE) or (piece.islower() and opponent == BLACK)):
-            opponent_squares.append(sq)
-            
-    if not opponent_squares:
-        return 0.0
-    attacked = sum(1 for sq in opponent_squares if board.is_square_attacked(sq, board.turn))
-    return attacked / len(opponent_squares)
-
-
-def _captured_piece(board: Board, move: Move) -> str:
-    if move.flags & EN_PASSANT:
-        captured_sq = move.to_sq - 8 if board.turn == WHITE else move.to_sq + 8
-        return board.squares[captured_sq]
-    return board.squares[move.to_sq]
-
-
-def _momentum_reward(board: Board, move: Move) -> float:
-    if move.is_capture:
-        return MOMENTUM_REWARD
-    return 0.0
-
-
-def _panic_penalty(board: Board, move: Move) -> float:
-    if move.is_capture:
-        return PANIC_PENALTY
-    return 0.0
-
-
-def _flip_experience_horizontal(exp: Experience) -> Experience:
-    board = _flip_board_horizontal(Board.from_fen(exp.fen))
-    return Experience(
-        fen=board.fen(),
-        policy={_flip_uci_horizontal(uci): prob for uci, prob in exp.policy.items()},
-        value=exp.value,
-        td_value=exp.td_value,
-        wdl=exp.wdl,
-        priority=exp.priority,
-        value_prediction=exp.value_prediction,
-        importance_weight=exp.importance_weight,
-        reward_bonus=exp.reward_bonus,
-        aggression_score=exp.aggression_score,
-        momentum_reward=exp.momentum_reward,
-        panic_penalty=exp.panic_penalty,
-    )
-
-
-def _flip_board_horizontal(board: Board) -> Board:
-    squares = ["."] * 64
-    for sq, piece in enumerate(board.squares):
-        squares[square(7 - (sq & 7), sq >> 3)] = piece
-    rights = 0
-    if board.castling_rights & WK:
-        rights |= WQ
-    if board.castling_rights & WQ:
-        rights |= WK
-    if board.castling_rights & BK:
-        rights |= BQ
-    if board.castling_rights & BQ:
-        rights |= BK
-    ep = None if board.ep_square is None else square(7 - (board.ep_square & 7), board.ep_square >> 3)
-    return Board(squares, board.turn, rights, ep, board.halfmove_clock, board.fullmove_number)
-
-
-def _flip_uci_horizontal(uci: str) -> str:
-    return _flip_square_name(uci[:2]) + _flip_square_name(uci[2:4]) + uci[4:]
-
-
-def _flip_square_name(name: str) -> str:
-    sq = parse_square(name)
-    return square_name(square(7 - (sq & 7), sq >> 3))

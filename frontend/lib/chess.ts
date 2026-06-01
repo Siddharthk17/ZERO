@@ -2,25 +2,38 @@ import type { Chess, Move, Square } from "chess.js";
 
 export type Captured = Record<"w" | "b", string[]>;
 
-const pieceValues: Record<string, number> = {
+export const pieceValues: Record<string, number> = {
   p: 1,
   n: 3,
   b: 3,
   r: 5,
   q: 9,
-  k: 99
+  k: 0
 };
 
 export function capturedPieces(history: Move[]): Captured {
   const captured: Captured = { w: [], b: [] };
   history.forEach((move) => {
     if (move.captured) {
-      captured[move.color === "w" ? "w" : "b"].push(move.captured);
+      // If White made the move, a Black piece was captured.
+      // If Black made the move, a White piece was captured.
+      const capColor = move.color === "w" ? "b" : "w";
+      captured[capColor].push(move.captured);
     }
   });
   captured.w.sort((a, b) => pieceValues[a] - pieceValues[b]);
   captured.b.sort((a, b) => pieceValues[a] - pieceValues[b]);
   return captured;
+}
+
+export function getMaterialDifference(history: Move[]): { whiteAdvantage: number; blackAdvantage: number } {
+  const captured = capturedPieces(history);
+  const wSum = captured.w.reduce((sum, p) => sum + pieceValues[p], 0);
+  const bSum = captured.b.reduce((sum, p) => sum + pieceValues[p], 0);
+  return {
+    whiteAdvantage: bSum > wSum ? bSum - wSum : 0,
+    blackAdvantage: wSum > bSum ? wSum - bSum : 0
+  };
 }
 
 export function legalTargets(game: Chess, square: Square) {

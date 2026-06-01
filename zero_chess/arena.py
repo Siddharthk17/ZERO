@@ -12,13 +12,11 @@ from .constants import BLACK, WHITE
 from .elo import DEFAULT_ELO, update_rating, update_rating_from_result
 from .mcts import MCTS, NetworkEvaluator, UniformEvaluator
 
-
 def update_elo(elo_a: float, elo_b: float, score_a: float, games: int, k: float = 32.0) -> tuple[float, float]:
     score = score_a / max(1, games)
     new_elo_a, _ = update_rating(elo_a, elo_b, score, k * max(1, games))
     new_elo_b, _ = update_rating(elo_b, elo_a, 1.0 - score, k * max(1, games))
     return new_elo_a, new_elo_b
-
 
 def play_arena(
     evaluator_a,
@@ -116,14 +114,12 @@ def play_arena(
             
     return result_summary
 
-
 def _load_eval(path: str | None, device: str):
     if not path or path == "uniform":
         return UniformEvaluator()
     from .model import load_model
 
     return NetworkEvaluator(load_model(path, device), device)
-
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Evaluate two ZERO checkpoints.")
@@ -142,7 +138,6 @@ def main(argv: list[str] | None = None) -> None:
     )
     result["win_rate_a"] = result["student_score"] / max(1, result["games"])
     print(result)
-
 
 if __name__ == "__main__":  # pragma: no cover
     main()

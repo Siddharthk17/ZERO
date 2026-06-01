@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,7 +21,6 @@ from .model import ModelConfig, ZeroNet, load_model, parameter_count, save_model
 from .move import Move
 from .replay import Experience, PrioritizedReplayBuffer
 
-
 @dataclass(slots=True)
 class TrainConfig:
     batch_size: int = 128  # Highly stable, memory-safe batch size for 8GB system RAM
@@ -36,7 +36,6 @@ class TrainConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     mixed_precision: bool = True
     log_path: str = "logs/training.log"
-
 
 class ContinuousLRScheduler:
     """Manages cosine annealing rates decaying down to strict continuous baselines."""
@@ -64,7 +63,6 @@ class ContinuousLRScheduler:
         import math
         return self.final_lr + 0.5 * (self.initial_lr - self.final_lr) * (1.0 + math.cos(math.pi * iteration / 500.0))
 
-
 class TrainingLogger:
     """Monitors losses and writes averages across sliding windows."""
 
@@ -76,13 +74,19 @@ class TrainingLogger:
     def log(self, metrics: dict[str, float]) -> dict[str, float]:
         self.window.append(metrics)
         averages = {}
-        for key in ("policy_loss", "value_loss", "wdl_loss", "ewc_loss", "aux_loss", "loss"):
-            averages[f"avg_{key}_100"] = sum(row.get(key, 0.0) for row in self.window) / len(self.window)
+        target_keys = (
+            "policy_loss", "value_loss", "wdl_loss", "ewc_loss", 
+            "aux_loss", "loss", "policy_entropy", "value_error",
+            "material_loss", "mobility_loss", "king_safety_loss"
+        )
+        for key in target_keys:
+            if any(key in row for row in self.window):
+                valid_vals = [row[key] for row in self.window if key in row]
+                averages[f"avg_{key}_100"] = sum(valid_vals) / len(valid_vals)
         payload = {**metrics, **averages}
         with self.path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(payload, sort_keys=True) + "\n")
         return payload
-
 
 def make_optimizer(model: torch.nn.Module, config: TrainConfig) -> torch.optim.Optimizer:
     """Instantiate a fused or regular AdamW optimizer based on hardware capabilities."""
@@ -93,7 +97,6 @@ def make_optimizer(model: torch.nn.Module, config: TrainConfig) -> torch.optim.O
         return torch.optim.AdamW(model.parameters(), lr=config.initial_lr, weight_decay=config.weight_decay, **kwargs)
     except (RuntimeError, TypeError):
         return torch.optim.AdamW(model.parameters(), lr=config.initial_lr, weight_decay=config.weight_decay)
-
 
 def train_step(
     model: ZeroNet,
@@ -127,9 +130,9 @@ def train_step(
         masks.append(encode_move_mask(legal, board, device=config.device))
         policy_targets.append(_policy_from_exp(board, exp, config.device))
         
-        # Clamp value targets to [-3.0, 1.0] matching the asymmetric draw-as-loss targets bounds
+        # Clamp value targets to [-31.0, 1.0] matching the custom aggressive RL bounds
         raw_target = td_blended_target(exp.value, exp.td_value, config.td_lambda) + exp.reward_bonus
-        value_targets.append(max(-3.0, min(1.0, raw_target)))
+        value_targets.append(max(-31.0, min(1.0, raw_target)))
         
         wdl_targets.append(exp.wdl)
         
@@ -159,7 +162,6 @@ def train_step(
         except Exception:
             pass
             
-    # Fallback to bfloat16 for CPU device type to prevent dtype validation error on float16 CPU autocast
     amp_dtype = torch.bfloat16 if (is_bf16 or device_type == "cpu") else torch.float16
     
     if scaler is None:
@@ -177,10 +179,11 @@ def train_step(
         value_loss_vec = F.mse_loss(value_pred, value_target, reduction="none")
         wdl_loss_vec = -(wdl_target * F.log_softmax(out["wdl_logits"], dim=-1)).sum(dim=-1)
         
-        material_loss = F.mse_loss(out["material"], material_target, reduction="none")
-        mobility_loss = F.mse_loss(out["mobility"], mobility_target, reduction="none")
-        king_loss = F.mse_loss(out["king_safety"], king_target, reduction="none")
-        aux_loss_vec = material_loss + mobility_loss + king_loss
+        # Calculate individual auxiliary target losses [1]
+        mat_loss_vec = F.mse_loss(out["material"], material_target, reduction="none")
+        mob_loss_vec = F.mse_loss(out["mobility"], mobility_target, reduction="none")
+        king_loss_vec = F.mse_loss(out["king_safety"], king_target, reduction="none")
+        aux_loss_vec = mat_loss_vec + mob_loss_vec + king_loss_vec
         
         policy_loss = (policy_loss_vec * sample_weights).mean()
         value_loss = (value_loss_vec * sample_weights).mean()
@@ -196,12 +199,20 @@ def train_step(
             + config.aux_weight * aux_loss
         )
 
+        # Advanced Telemetry: Policy Entropy and Value Prediction Error
+        with torch.no_grad():
+            probs = torch.softmax(out["masked_policy_logits"], dim=-1)
+            # Clip probabilities to prevent log(0)
+            clipped_probs = torch.clamp(probs, min=1e-9)
+            policy_entropy = -(probs * torch.log(clipped_probs)).sum(dim=-1).mean()
+            value_error = torch.abs(value_pred - value_target).mean()
+
     loss_val = float(loss.detach().cpu())
     grad_norm_before = torch.zeros((), device=config.device)
 
-    if loss_val > 100.0:
+    if loss_val > 2000.0:
         import warnings
-        warnings.warn(f"Loss sanity check failed: loss = {loss_val:.4f} > 100.0. Skipping optimizer step and replay buffer priority update to prevent weight corruption.")
+        warnings.warn(f"Loss sanity check failed: loss = {loss_val:.4f} > 2000.0. Skipping optimizer step and replay buffer priority update to prevent weight corruption.")
         optimizer.zero_grad(set_to_none=True)
     else:
         scaler.scale(loss).backward()
@@ -218,12 +229,17 @@ def train_step(
 
     metrics = {
         "step": float(iteration),
-        "loss": float(loss.detach().cpu()),
+        "loss": float(loss_val),
         "policy_loss": float(policy_loss.detach().cpu()),
         "value_loss": float(value_loss.detach().cpu()),
         "wdl_loss": float(wdl_loss.detach().cpu()),
         "ewc_loss": float(ewc_loss.detach().cpu()),
         "aux_loss": float(aux_loss.detach().cpu()),
+        "material_loss": float(mat_loss_vec.mean().detach().cpu()),
+        "mobility_loss": float(mob_loss_vec.mean().detach().cpu()),
+        "king_safety_loss": float(king_loss_vec.mean().detach().cpu()),
+        "policy_entropy": float(policy_entropy.cpu()),
+        "value_error": float(value_error.cpu()),
         "grad_norm": float(min(float(grad_norm_before.detach().cpu()), config.grad_clip)),
         "lr": optimizer.param_groups[0]["lr"],
         "replay_size": float(len(replay)),
@@ -233,11 +249,9 @@ def train_step(
         metrics = logger.log(metrics)
     return metrics
 
-
 def td_blended_target(outcome: float, bootstrap: float, lambda_td: float = 0.7) -> float:
     """Weight the terminal result and the bootstrapped TD reward prediction."""
     return lambda_td * outcome + (1.0 - lambda_td) * bootstrap
-
 
 def _policy_from_exp(board: Board, exp: Experience, device: str) -> torch.Tensor:
     """Format experience probabilities into the target policy vector shape."""
@@ -255,10 +269,9 @@ def _policy_from_exp(board: Board, exp: Experience, device: str) -> torch.Tensor
         target[move_to_policy_index(board, move)] = float(prob) / total
     return target
 
-
 def _auxiliary_targets(board: Board) -> tuple[float, float, float]:
     """Calculate material balance, move mobility, and king safety auxiliary targets."""
-    values = {"P": 1, "N": 3, "B": 3, "R": 5, "Q": 9}
+    values = {"P": 1, "N": 3, "B": 3, "R": 5, "Q": 9, "p": -1, "n": -3, "b": -3, "r": -5, "q": -9}
     own = opp = 0
     squares = board.squares
     turn = board.turn
@@ -277,7 +290,6 @@ def _auxiliary_targets(board: Board) -> tuple[float, float, float]:
     king_safety = 0.0 if board.is_check(board.turn) else 1.0
     return material, mobility, king_safety
 
-
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Run one ZERO training step from a replay buffer.")
     parser.add_argument("--replay", required=True)
@@ -295,7 +307,6 @@ def main(argv: list[str] | None = None) -> None:
     metrics = train_step(model, optimizer, replay, config, iteration=0, scheduler=scheduler, logger=TrainingLogger(config.log_path))
     save_model(args.out, model, optimizer=optimizer.state_dict(), metrics=metrics)
     print({"params": parameter_count(model), **metrics})
-
 
 if __name__ == "__main__":
     main()

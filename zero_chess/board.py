@@ -43,7 +43,6 @@ from .move import (
 from .zobrist import CASTLING_KEYS, EP_FILE_KEYS, PIECE_INDEX, PIECE_KEYS, TURN_KEY, mask64
 from .targets import game_result_to_values
 
-
 @dataclass(slots=True)
 class _State:
     move: Move
@@ -53,7 +52,6 @@ class _State:
     halfmove_clock: int
     fullmove_number: int
     zobrist_hash: int
-
 
 class Board:
     """Complete chess position with highly optimized legal move generation."""

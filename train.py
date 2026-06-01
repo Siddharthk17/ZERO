@@ -12,7 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from zero_chess.constants import BLACK, WHITE
-from zero_chess.elo import DEFAULT_ELO, update_rating_from_result
+from zero_chess.elo import DEFAULT_ELO, update_rating_with_reason
 from zero_chess.mcts import NetworkEvaluator, UniformEvaluator
 from zero_chess.replay import PrioritizedReplayBuffer
 from zero_chess.self_play import (
@@ -22,8 +22,7 @@ from zero_chess.self_play import (
     _append_training_game_history
 )
 
-VERSION = "1.2.8"
-
+VERSION = "1.2.8.7"
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -78,7 +77,7 @@ def main() -> None:
                 print(f"Memory recovered ({ram_avail}MB available). Resuming game generation.", flush=True)
 
             games = generate_parallel_games(UniformEvaluator(), args.games_per_iteration, SelfPlayConfig(simulations=1, max_plies=128))
-            for game_idx, (result, experiences, sans) in enumerate(games):
+            for game_idx, (result, experiences, sans, reason, meta) in enumerate(games):
                 replay.extend(experiences)
                 _append_training_game_history(
                     game_number=iteration * args.games_per_iteration + game_idx,
@@ -258,10 +257,10 @@ def main() -> None:
                     teacher.update(model)
                 metrics["updates_this_iteration"] = float(updates_this_iteration)
 
-            for game_idx, (result, experiences, sans) in enumerate(games):
+            for game_idx, (result, experiences, sans, reason, meta) in enumerate(games):
                 replay.extend(experiences)
                 rated_side = WHITE if (iteration + game_idx) % 2 else BLACK
-                elo, elo_delta = update_rating_from_result(elo, elo, result, rated_side)
+                elo, elo_delta = update_rating_with_reason(elo, result, rated_side, reason)
                 print(
                     f"rated game result={result} side={'white' if rated_side == WHITE else 'black'} "
                     f"elo={elo:.1f} elo_delta={elo_delta:+.1f}",
@@ -321,12 +320,10 @@ def main() -> None:
         checkpoint_manager.save(model, iteration, elo, optimizer.state_dict(), {"interrupted": 1.0, "elo": float(elo)})
         print(f"Saved checkpoint at iteration {iteration}", flush=True)
 
-
 def resolve_device(requested: str, torch_module) -> str:
     if requested == "cuda" and torch_module.cuda.is_available():
         return "cuda"
     return "cpu"
-
 
 def print_device(device: str, torch_module) -> None:
     if device == "cuda":
@@ -335,7 +332,6 @@ def print_device(device: str, torch_module) -> None:
         print(f"Device: CUDA {props.name} ({props.total_memory / (1024**3):.1f} GB VRAM)")
     else:
         print("Device: CPU")
-
 
 def configure_torch_for_speed(device: str, torch_module) -> None:
     if device != "cuda":
@@ -349,7 +345,6 @@ def configure_torch_for_speed(device: str, torch_module) -> None:
         torch_module.backends.cuda.enable_mem_efficient_sdp(True)
         torch_module.backends.cuda.enable_math_sdp(True)
 
-
 def print_header() -> None:
     print(
         r"""
@@ -362,7 +357,6 @@ def print_header() -> None:
 """.strip()
     )
     print(f"ZERO {VERSION}", flush=True)
-
 
 if __name__ == "__main__":
     main()

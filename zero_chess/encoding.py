@@ -38,16 +38,13 @@ PIECE_TO_PLANE = {
     "p": 6, "n": 7, "b": 8, "r": 9, "q": 10, "k": 11
 }
 
-
 def orient_square(sq: int, turn: int) -> int:
     """Rotate the square 180 degrees for Black to align perspectives."""
     return sq if turn == WHITE else 63 - sq
 
-
 def deorient_square(sq: int, turn: int) -> int:
     """Convert oriented coordinate back to actual board index."""
     return sq if turn == WHITE else 63 - sq
-
 
 def move_to_policy_index(board: Board, move: Move) -> int:
     """Map a legal move to one of 4672 AlphaZero-style policy logits."""
@@ -70,7 +67,6 @@ def move_to_policy_index(board: Board, move: Move) -> int:
     plane = QUEEN_DIRS_POLICY.index(direction) * 7 + (distance - 1)
     return plane * 64 + from_sq
 
-
 def _queen_direction(df: int, dr: int) -> tuple[tuple[int, int], int]:
     if df == 0 and dr != 0:
         direction = (0, 1 if dr > 0 else -1)
@@ -87,11 +83,9 @@ def _queen_direction(df: int, dr: int) -> tuple[tuple[int, int], int]:
         raise ValueError(f"invalid queen-like distance: {distance}")
     return direction, distance
 
-
 def legal_policy_indices(board: Board) -> dict[Move, int]:
     """Map all legal moves in the position to their policy tensor indices."""
     return {move: move_to_policy_index(board, move) for move in board.legal_moves()}
-
 
 def encode_board(board: Board, history: list[Board] | None = None, device: str | None = None):
     """Return a torch tensor of shape ``(119, 8, 8)`` oriented for the active player."""
@@ -102,7 +96,6 @@ def encode_board(board: Board, history: list[Board] | None = None, device: str |
 
     planes = torch.zeros((INPUT_CHANNELS, 8, 8), dtype=torch.float32, device=device)
     return encode_board_into(planes, board, history)
-
 
 def encode_board_into(planes, board: Board, history: list[Board] | None = None):
     """Fill pre-allocated ``planes`` tensor with the board representation."""
@@ -151,7 +144,6 @@ def encode_board_into(planes, board: Board, history: list[Board] | None = None):
     planes[extra + 6].fill_(min(board.fullmove_number, 512) / 512.0)
     return planes
 
-
 def policy_target(board: Board, visits: dict[Move, int], device: str | None = None):
     """Generate the policy target plane from MCTS statistics."""
     try:
@@ -173,7 +165,6 @@ def policy_target(board: Board, visits: dict[Move, int], device: str | None = No
         target[move_to_policy_index(board, move)] = count / total
     return target
 
-
 def policy_mask(board: Board, device: str | None = None):
     """Generate a bool mask indicating legal moves in the policy output shape."""
     try:
@@ -186,7 +177,6 @@ def policy_mask(board: Board, device: str | None = None):
         mask[move_to_policy_index(board, move)] = True
     return mask
 
-
 def encode_move_mask(legal_moves: list[Move] | None, board: Board, device: str | None = None):
     """Generate a float mask indicating legal moves in the policy output shape."""
     try:
@@ -197,14 +187,12 @@ def encode_move_mask(legal_moves: list[Move] | None, board: Board, device: str |
     mask = torch.zeros(POLICY_SIZE, dtype=torch.float32, device=device)
     return encode_move_mask_into(mask, legal_moves, board)
 
-
 def encode_move_mask_into(mask, legal_moves: list[Move] | None, board: Board):
     """Fill pre-allocated float ``mask`` with legal move coordinates."""
     mask.zero_()
     for move in legal_moves if legal_moves is not None else board.legal_moves():
         mask[move_to_policy_index(board, move)] = 1.0
     return mask
-
 
 def terminal_wdl(value: float) -> tuple[float, float, float]:
     """Map a value scalar into Win, Draw, Loss target probabilities."""

@@ -12,7 +12,6 @@ from pathlib import Path
 
 from .model import ZeroNet, save_model
 
-
 @dataclass(slots=True)
 class CheckpointMeta:
     iteration: int
@@ -20,7 +19,6 @@ class CheckpointMeta:
     path: str
     created_at: str
     metrics: dict[str, float]
-
 
 class CheckpointManager:
     """Manages atomic saves, thread-safe indexing, and automatic self-healing pruned file states."""

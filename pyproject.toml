@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zero-chess"
-version = "0.1.0"
+version = "1.2.8.7"
 description = "Self-play AlphaZero-style chess engine scaffold with UCI support."
 requires-python = ">=3.10"
 dependencies = [

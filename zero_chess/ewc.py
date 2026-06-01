@@ -12,13 +12,11 @@ from .encoding import POLICY_SIZE, encode_board, move_to_policy_index
 from .move import Move
 from .replay import PrioritizedReplayBuffer
 
-
 @dataclass(slots=True)
 class EWCConfig:
     lambda_: float = 0.1
     sample_size: int = 500
     batch_size: int = 32
-
 
 class ElasticWeightConsolidation:
     """Computes and enforces quadratic penalties on weight drift from historical benchmarks."""
@@ -96,7 +94,6 @@ class ElasticWeightConsolidation:
                 
         return self.config.lambda_ * total
 
-
 def _policy_target(board: Board, policy: dict[str, float], device: str) -> torch.Tensor:
     """Format and normalize the policy target vector for cross-entropy training."""
     target = torch.zeros(POLICY_SIZE, dtype=torch.float32, device=device)
@@ -112,6 +109,5 @@ def _policy_target(board: Board, policy: dict[str, float], device: str) -> torch
     for uci, prob in policy.items():
         target[move_to_policy_index(board, Move.from_uci(uci))] = float(prob) / total
     return target
-
 
 EWC = ElasticWeightConsolidation

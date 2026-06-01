@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 import torch
 
-
 class EMATeacher:
     """Manages an Exponential Moving Average (EMA) teacher network to stabilize reinforcement learning."""
 
@@ -44,7 +43,6 @@ class EMATeacher:
         self.teacher.eval()
         for param in self.teacher.parameters():
             param.requires_grad_(False)
-
 
 @torch.no_grad()
 def update_ema_teacher(student: torch.nn.Module, teacher: torch.nn.Module, decay: float = 0.999) -> None:

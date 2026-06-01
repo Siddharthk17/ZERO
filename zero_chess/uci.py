@@ -13,14 +13,12 @@ from .board import Board
 from .mcts import MCTS, NetworkEvaluator, SearchResult, UniformEvaluator
 from .move import Move
 
-
 @dataclass(slots=True)
 class UCIOptions:
     simulations: int = 200
     cpuct: float = 1.5
     checkpoint: str | None = None
     device: str = "cpu"
-
 
 class UCIEngine:
     """Manages the standard Universal Chess Interface protocol for zero-latency GUI play."""
@@ -81,7 +79,7 @@ class UCIEngine:
 
     def _cmd_uci(self) -> None:
         print("id name ZERO", flush=True)
-        print("id author Sid & AI", flush=True)
+        print("id author Sid", flush=True)
         print("option name Simulations type spin default 200 min 1 max 100000", flush=True)
         print("option name CPuct type string default 1.5", flush=True)
         print("option name Checkpoint type string default", flush=True)
@@ -252,7 +250,6 @@ class UCIEngine:
             resign_threshold=-1.0,
         )
 
-
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--checkpoint")
@@ -260,7 +257,6 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--simulations", type=int, default=200)
     args, _ = parser.parse_known_args(argv)
     UCIEngine(UCIOptions(args.simulations, checkpoint=args.checkpoint, device=args.device)).loop()
-
 
 if __name__ == "__main__":  # pragma: no cover
     main()

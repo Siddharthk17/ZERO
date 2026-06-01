@@ -13,13 +13,11 @@ from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-
 @dataclass(slots=True)
 class UCIResult:
     move: str
     evaluation: float = 0.0
     nodes: int = 0
-
 
 class UCIProcess:
     """Manages an asynchronous, self-healing UCI subprocess wrapper."""
@@ -115,7 +113,6 @@ class UCIProcess:
             if await self._read_line() == token:
                 return
 
-
 def parse_info(line: str) -> tuple[float | None, int | None]:
     parts = line.split()
     evaluation = None
@@ -137,13 +134,11 @@ def parse_info(line: str) -> tuple[float | None, int | None]:
 
 engine = UCIProcess()
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Safely terminate the background engine process when FastAPI shuts down."""
     yield
     await engine.close()
-
 
 app = FastAPI(title="ZERO Engine WebSocket", lifespan=lifespan)
 app.add_middleware(
@@ -153,7 +148,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 def _tail_file_lines(path: Path, max_lines: int = 500) -> list[str]:
     """Optimized binary seek tail reader to prevent RAM exhaustion on large FEN logs."""
@@ -192,7 +186,6 @@ def _tail_file_lines(path: Path, max_lines: int = 500) -> list[str]:
     lines.reverse()
     return [line.decode("utf-8") for line in lines[-max_lines:]]
 
-
 @app.get("/history")
 def training_history(limit: int = 50) -> dict[str, list[dict]]:
     path = Path("data/training_games.jsonl")
@@ -211,7 +204,6 @@ def training_history(limit: int = 50) -> dict[str, list[dict]]:
     games.reverse()
     return {"games": games}
 
-
 @app.websocket("/")
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
@@ -228,7 +220,6 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 await websocket.send_json({"move": "0000", "evaluation": 0.0, "nodes": 0, "error": str(sub_exc)})
     except WebSocketDisconnect:
         return
-
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Run ZERO WebSocket engine bridge.")
@@ -252,7 +243,6 @@ def main(argv: list[str] | None = None) -> None:
     import uvicorn
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
-
 
 if __name__ == "__main__":
     main()

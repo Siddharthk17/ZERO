@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-
 def default_uci_command(checkpoint: str = "checkpoints/latest.pt", device: str = "cuda", simulations: int = 800) -> str:
     """Return the standard command string used to launch the ZERO UCI engine on Lichess."""
     return f"python -m zero_chess.uci --checkpoint {checkpoint} --device {device} --simulations {simulations}"
-
 
 def generate_lichess_config(
     token: str,

@@ -14,15 +14,20 @@ from zero_chess.self_play import (
 from zero_chess.targets import (
     AGGRESSION_WEIGHT,
     DRAW_VALUE,
-    LOSS_VALUE,
+    CHECKMATE_LOSS as LOSS_VALUE,
     MOMENTUM_REWARD,
     PANIC_PENALTY,
-    WIN_VALUE,
+    CHECKMATE_WIN as WIN_VALUE,
     apply_contempt,
-    game_result_to_value,
+    game_result_to_values,
     opponent_value,
 )
 from zero_chess.uci import UCIEngine
+
+
+def game_result_to_value(result: str, perspective: int) -> float:
+    return game_result_to_values(result)[perspective]
+
 
 
 def test_outcome_values_are_hunter_scaled() -> None:
