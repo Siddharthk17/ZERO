@@ -99,3 +99,17 @@ def test_arena_draws_are_student_losses_and_promotion_needs_sixty_percent(monkey
     result = play_arena(UniformEvaluator(), UniformEvaluator(), games=40, simulations=1, max_plies=0, log_path=None)
     assert result["student_score"] == 25.0
     assert result["promote"]
+
+
+def test_self_play_main_cli(tmp_path) -> None:
+    from zero_chess.self_play import main as self_play_main
+    pgn_file = tmp_path / "test_selfplay.pgn"
+    self_play_main([
+        "--games", "1",
+        "--simulations", "1",
+        "--max-plies", "2",
+        "--out-pgn", str(pgn_file)
+    ])
+    assert pgn_file.exists()
+    assert pgn_file.read_text(encoding="utf-8") != ""
+

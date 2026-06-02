@@ -47,15 +47,10 @@ class ContinuousLRScheduler:
         self.cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500, eta_min=final_lr)
 
     def step(self, iteration: int) -> float:
-        if iteration <= 500:
-            for group in self.optimizer.param_groups:
-                group["lr"] = self.initial_lr
-            self.cosine.last_epoch = iteration - 1
-            self.cosine.step()
-        else:
-            for group in self.optimizer.param_groups:
-                group["lr"] = self.final_lr
-        return self.optimizer.param_groups[0]["lr"]
+        lr = self.lr_at(iteration)
+        for group in self.optimizer.param_groups:
+            group["lr"] = lr
+        return lr
 
     def lr_at(self, iteration: int) -> float:
         if iteration >= 500:

@@ -1237,3 +1237,71 @@ def _append_training_game_history(
     pgn_file.parent.mkdir(parents=True, exist_ok=True)
     with pgn_file.open("a", encoding="utf-8") as fh:
         fh.write(pgn + "\n\n")
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Generate self-play games using a ZERO checkpoint.")
+    parser.add_argument("--checkpoint", help="Path to model checkpoint. If not specified, UniformEvaluator is used.")
+    parser.add_argument("--games", type=int, default=2, help="Number of games to generate.")
+    parser.add_argument("--simulations", type=int, default=200, help="Number of MCTS simulations per move.")
+    parser.add_argument("--batch-size", type=int, default=24, help="MCTS batch size.")
+    parser.add_argument("--max-plies", type=int, default=512, help="Maximum plies per game.")
+    parser.add_argument("--device", default="cpu", help="Device to run on ('cpu' or 'cuda').")
+    parser.add_argument("--seed", type=int, help="Random seed.")
+    parser.add_argument("--out-pgn", default="data/selfplay.pgn", help="File to write PGN output to.")
+    args = parser.parse_args(argv)
+
+    if args.checkpoint:
+        from .model import load_model
+        model = load_model(args.checkpoint, args.device)
+    else:
+        model = None
+
+    config = SelfPlayConfig(
+        simulations=args.simulations,
+        batch_size=args.batch_size,
+        max_plies=args.max_plies,
+    )
+
+    print(f"Generating {args.games} self-play games on {args.device}...")
+    
+    if args.device == "cuda" and model is not None:
+        games_data = generate_multiprocess_games(
+            model,
+            device=args.device,
+            games=args.games,
+            config=config,
+            rng_seed=args.seed,
+        )
+    else:
+        if model is not None:
+            evaluator = NetworkEvaluator(model, args.device)
+        else:
+            evaluator = UniformEvaluator()
+        games_data = generate_parallel_games(
+            evaluator,
+            games=args.games,
+            config=config,
+            rng_seed=args.seed,
+        )
+
+    from .pgn import export_pgn
+    from pathlib import Path
+    pgn_path = Path(args.out_pgn)
+    pgn_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    with pgn_path.open("a", encoding="utf-8") as fh:
+        for idx, (result, experiences, sans, reason, meta) in enumerate(games_data):
+            pgn_str = export_pgn(
+                sans,
+                result,
+                {
+                    "Event": "ZERO CLI Self-Play",
+                    "Round": str(idx + 1),
+                    "White": "ZERO",
+                    "Black": "ZERO",
+                }
+            )
+            fh.write(pgn_str + "\n\n")
+            print(f"Game {idx + 1}: Result={result}, Reason={reason}, Plies={len(sans)}, Duration={meta['duration']:.1f}s")
+            
+    print(f"Saved PGN to {args.out_pgn}")
