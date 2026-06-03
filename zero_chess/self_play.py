@@ -333,10 +333,11 @@ def generate_parallel_games(
 class QueueEvaluatorProxy:
     """Synchronous MCTS evaluator proxy backed by multiprocessing queues."""
 
-    def __init__(self, worker_id: int, request_queue, response_queue) -> None:
+    def __init__(self, worker_id: int, request_queue, response_queue, stop_event=None) -> None:
         self.worker_id = worker_id
         self.request_queue = request_queue
         self.response_queue = response_queue
+        self.stop_event = stop_event
         self._next_request_id = 0
 
     def evaluate_batch(self, boards: list[Board]):
@@ -344,7 +345,15 @@ class QueueEvaluatorProxy:
         request_id = self._next_request_id
         self.request_queue.put(("eval", self.worker_id, request_id, boards))
         while True:
-            response_id, results, error = self.response_queue.get()
+            if self.stop_event is not None and self.stop_event.is_set():
+                raise RuntimeError("Evaluation aborted: stop event is set")
+            try:
+                response_id, results, error = self.response_queue.get(timeout=1.0)
+            except queue.Empty:
+                import os
+                if os.getppid() == 1:
+                    raise RuntimeError("Evaluation aborted: parent process died")
+                continue
             if response_id != request_id:
                 continue
             if error is not None:
@@ -580,7 +589,7 @@ def _persistent_self_play_process_main(
     active_workers[worker_id] = True
     try:
         rng = random.Random(rng_seed)
-        evaluator = QueueEvaluatorProxy(worker_id, request_queue, response_queue)
+        evaluator = QueueEvaluatorProxy(worker_id, request_queue, response_queue, stop_event)
         while not stop_event.is_set():
             # Memory Guard: Halt and flush if free system RAM falls below 512MB
             _, _, ram_avail, _, _ = _query_memory_utilization()
@@ -1026,159 +1035,171 @@ def _trainer_process_main(
     reasons_window = deque(maxlen=100)
     durations_window = deque(maxlen=100)
 
-    while not stop_event.is_set():
-        try:
-            _, payload, error = game_queue.get(timeout=1.0)
-        except queue.Empty:
-            # Run Arena Evaluation dynamically every 100 completed games
-            if completed_games > 0 and completed_games % 100 == 0:
-                print("\n" + "="*20 + " [ARENA EVALUATION] " + "="*20, flush=True)
-                print(f"Starting Arena Match: Student vs. EMA Teacher (Iteration {iteration})", flush=True)
-                print("Games: 20 | MCTS Simulations: 160 | Device: " + str(device), flush=True)
+    try:
+        while not stop_event.is_set():
+            try:
+                _, payload, error = game_queue.get(timeout=1.0)
+            except queue.Empty:
+                # Run Arena Evaluation dynamically every 100 completed games
+                if completed_games > 0 and completed_games % 100 == 0:
+                    print("\n" + "="*20 + " [ARENA EVALUATION] " + "="*20, flush=True)
+                    print(f"Starting Arena Match: Student vs. EMA Teacher (Iteration {iteration})", flush=True)
+                    print("Games: 20 | MCTS Simulations: 160 | Device: " + str(device), flush=True)
+                    
+                    from .arena import play_arena
+                    from .mcts import NetworkEvaluator
+                    
+                    student_eval = NetworkEvaluator(model, device)
+                    teacher_eval = NetworkEvaluator(teacher.teacher, device)
+                    
+                    arena = play_arena(
+                        student_eval,
+                        teacher_eval,
+                        games=20,
+                        simulations=160,
+                        iteration=iteration,
+                        elo_a=elo,
+                        log_path="logs/arena.log",
+                    )
+                    
+                    elo = float(arena["elo_a"])
+                    print(f"Results: Student Score: {arena['student_score']} | Teacher Score: {arena['teacher_score']}", flush=True)
+                    print(f"Match Stats: Student Wins: {arena['wins_a']} | Teacher Wins: {arena['wins_b']} | Draws: {arena['draws']}", flush=True)
+                    
+                    if arena["promote"]:
+                        teacher.promote(model)
+                        print(f"Status: [PROMOTED] Student defeated Teacher (>60% score)! Student is now the new EMA Teacher.", flush=True)
+                    else:
+                        print(f"Status: [RETAINED] Teacher retained its title (Student score <=60%).", flush=True)
+                    print(f"New Running Elo: {elo:.1f}", flush=True)
+                    print("="*60 + "\n", flush=True)
+                    
+                    completed_games += 1  # Offset to prevent infinite evaluation triggers
+                continue
                 
-                from .arena import play_arena
-                from .mcts import NetworkEvaluator
+            if error is not None:
+                print(f"\n[ERROR] Worker process encountered an exception:\n{error}", flush=True)
+                continue
                 
-                student_eval = NetworkEvaluator(model, device)
-                teacher_eval = NetworkEvaluator(teacher.teacher, device)
-                
-                arena = play_arena(
-                    student_eval,
-                    teacher_eval,
-                    games=20,
-                    simulations=160,
-                    iteration=iteration,
-                    elo_a=elo,
-                    log_path="logs/arena.log",
-                )
-                
-                elo = float(arena["elo_a"])
-                print(f"Results: Student Score: {arena['student_score']} | Teacher Score: {arena['teacher_score']}", flush=True)
-                print(f"Match Stats: Student Wins: {arena['wins_a']} | Teacher Wins: {arena['wins_b']} | Draws: {arena['draws']}", flush=True)
-                
-                if arena["promote"]:
-                    teacher.promote(model)
-                    print(f"Status: [PROMOTED] Student defeated Teacher (>60% score)! Student is now the new EMA Teacher.", flush=True)
+            result, experiences, sans, reason, meta = payload # Unpack 5-tuple with metadata!
+            replay.extend(experiences)
+            completed_games += 1
+            rated_side = WHITE if completed_games % 2 else BLACK
+            elo, elo_delta = update_rating_with_reason(elo, result, rated_side, reason) # Use custom Elo rules!
+            
+            is_boundary = (completed_games % max(1, games_per_generation) == 0)
+            if is_boundary:
+                iteration += 1
+                generation_value.value = iteration
+            
+            # Append to sliding windows
+            plies_window.append(len(sans))
+            reasons_window.append(reason)
+            durations_window.append(meta["duration"])
+
+            # Format a highly descriptive string for the game outcome
+            if result == "1/2-1/2":
+                if reason == "stalemate":
+                    outcome_desc = "Draw by Stalemate"
+                elif reason == "max_plies":
+                    outcome_desc = "Draw by Max Plies"
+                elif reason == "draw_material":
+                    outcome_desc = "Draw by Dead Material"
                 else:
-                    print(f"Status: [RETAINED] Teacher retained its title (Student score <=60%).", flush=True)
-                print(f"New Running Elo: {elo:.1f}", flush=True)
-                print("="*60 + "\n", flush=True)
-                
-                completed_games += 1  # Offset to prevent infinite evaluation triggers
-            continue
-            
-        if error is not None:
-            print(f"\n[ERROR] Worker process encountered an exception:\n{error}", flush=True)
-            continue
-            
-        result, experiences, sans, reason, meta = payload # Unpack 5-tuple with metadata!
-        replay.extend(experiences)
-        completed_games += 1
-        rated_side = WHITE if completed_games % 2 else BLACK
-        elo, elo_delta = update_rating_with_reason(elo, result, rated_side, reason) # Use custom Elo rules!
-        iteration += 1 if completed_games % max(1, games_per_generation) == 0 else 0
-        generation_value.value = iteration
-        
-        # Append to sliding windows
-        plies_window.append(len(sans))
-        reasons_window.append(reason)
-        durations_window.append(meta["duration"])
+                    outcome_desc = "Draw by Threefold Repetition"
+            elif result == "1-0":
+                if reason == "resignation":
+                    outcome_desc = "White won by Resignation"
+                elif reason == "adjudication":
+                    outcome_desc = "White won by Adjudication"
+                else:
+                    outcome_desc = "White won by CHECKMATE"
+            else: # "0-1"
+                if reason == "resignation":
+                    outcome_desc = "Black won by Resignation"
+                elif reason == "adjudication":
+                    outcome_desc = "Black won by Adjudication"
+                else:
+                    outcome_desc = "Black won by CHECKMATE"
 
-        # Format a highly descriptive string for the game outcome
-        if result == "1/2-1/2":
-            if reason == "stalemate":
-                outcome_desc = "Draw by Stalemate"
-            elif reason == "max_plies":
-                outcome_desc = "Draw by Max Plies"
-            elif reason == "draw_material":
-                outcome_desc = "Draw by Dead Material"
-            else:
-                outcome_desc = "Draw by Threefold Repetition"
-        elif result == "1-0":
-            if reason == "resignation":
-                outcome_desc = "White won by Resignation"
-            elif reason == "adjudication":
-                outcome_desc = "White won by Adjudication"
-            else:
-                outcome_desc = "White won by CHECKMATE"
-        else: # "0-1"
-            if reason == "resignation":
-                outcome_desc = "Black won by Resignation"
-            elif reason == "adjudication":
-                outcome_desc = "Black won by Adjudication"
-            else:
-                outcome_desc = "Black won by CHECKMATE"
+            # Calculate Rolling 100-Game Percentages for the console log
+            total_in_window = len(reasons_window)
+            checkmate_pct = (reasons_window.count("checkmate") / total_in_window) * 100.0
+            resign_pct = (reasons_window.count("resignation") / total_in_window) * 100.0
+            draw_pct = (sum(1 for r in reasons_window if r in ("stalemate", "max_plies", "draw_material", "draw_repetition")) / total_in_window) * 100.0
+            avg_plies = sum(plies_window) / total_in_window
+            avg_seconds = sum(durations_window) / total_in_window
 
-        # Calculate Rolling 100-Game Percentages for the console log
-        total_in_window = len(reasons_window)
-        checkmate_pct = (reasons_window.count("checkmate") / total_in_window) * 100.0
-        resign_pct = (reasons_window.count("resignation") / total_in_window) * 100.0
-        draw_pct = (sum(1 for r in reasons_window if r in ("stalemate", "max_plies", "draw_material", "draw_repetition")) / total_in_window) * 100.0
-        avg_plies = sum(plies_window) / total_in_window
-        avg_seconds = sum(durations_window) / total_in_window
-
-        # Print the highly descriptive, detailed game logging line
-        print(
-            f"[GAME #{completed_games:05d}] Plies: {len(sans):3d} ({avg_plies:.1f} avg) | "
-            f"Reason: {outcome_desc:<25} | "
-            f"Roll %: Mate={checkmate_pct:.1f}% Resign={resign_pct:.1f}% Draw={draw_pct:.1f}% | "
-            f"Imbalance: {meta['material_delta']:+2d} | "
-            f"Opening: {meta['opening']:<28} | "
-            f"Duration: {meta['duration']:4.1f}s ({avg_seconds:.1f}s avg) | "
-            f"Elo: {elo:.1f} ({elo_delta:+.1f}) | "
-            f"Replay Buffer: {len(replay):,}",
-            flush=True,
-        )
-        
-        metrics = {}
-        if len(replay) > 256:
-            train_updates += 1
-            metrics = train_step(
-                model,
-                optimizer,
-                replay,
-                train_config,
-                iteration=train_updates,
-                scheduler=scheduler,
-                scaler=scaler,
-                logger=logger,
-            )
-            
-            # Print active gradient update metrics directly alongside game completion logs
+            # Print the highly descriptive, detailed game logging line
             print(
-                f"[TRAIN #{train_updates:05d}] Loss: {metrics.get('loss', 0.0):.4f} | "
-                f"Policy Loss: {metrics.get('policy_loss', 0.0):.4f} | "
-                f"Value Loss: {metrics.get('value_loss', 0.0):.4f} | "
-                f"Entropy: {metrics.get('policy_entropy', 0.0):.4f} | "
-                f"Value Error: {metrics.get('value_error', 0.0):.4f} | "
-                f"Aux Losses: Mat={metrics.get('material_loss', 0.0):.4f} Mob={metrics.get('mobility_loss', 0.0):.4f} King={metrics.get('king_safety_loss', 0.0):.4f} | "
-                f"LR: {metrics.get('lr', 0.0):.6g}",
+                f"[GAME #{completed_games:05d}] Plies: {len(sans):3d} ({avg_plies:.1f} avg) | "
+                f"Reason: {outcome_desc:<25} | "
+                f"Roll %: Mate={checkmate_pct:.1f}% Resign={resign_pct:.1f}% Draw={draw_pct:.1f}% | "
+                f"Imbalance: {meta['material_delta']:+2d} | "
+                f"Opening: {meta['opening']:<28} | "
+                f"Duration: {meta['duration']:4.1f}s ({avg_seconds:.1f}s avg) | "
+                f"Elo: {elo:.1f} ({elo_delta:+.1f}) | "
+                f"Replay Buffer: {len(replay):,}",
                 flush=True,
             )
-            teacher.update(model)
-            _copy_state_to_shared(teacher.teacher, shared_state, state_lock)
-            weights_updated.set()
+            
+            metrics = {}
+            if len(replay) > 256:
+                train_updates += 1
+                metrics = train_step(
+                    model,
+                    optimizer,
+                    replay,
+                    train_config,
+                    iteration=train_updates,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    logger=logger,
+                )
+                
+                # Print active gradient update metrics directly alongside game completion logs
+                print(
+                    f"[TRAIN #{train_updates:05d}] Loss: {metrics.get('loss', 0.0):.4f} | "
+                    f"Policy Loss: {metrics.get('policy_loss', 0.0):.4f} | "
+                    f"Value Loss: {metrics.get('value_loss', 0.0):.4f} | "
+                    f"Entropy: {metrics.get('policy_entropy', 0.0):.4f} | "
+                    f"Value Error: {metrics.get('value_error', 0.0):.4f} | "
+                    f"Aux Losses: Mat={metrics.get('material_loss', 0.0):.4f} Mob={metrics.get('mobility_loss', 0.0):.4f} King={metrics.get('king_safety_loss', 0.0):.4f} | "
+                    f"LR: {metrics.get('lr', 0.0):.6g}",
+                    flush=True,
+                )
+                teacher.update(model)
+                _copy_state_to_shared(teacher.teacher, shared_state, state_lock)
+                weights_updated.set()
 
-        replay.save(replay_path)
-        checkpoint_manager.save(model, iteration, elo, optimizer.state_dict())
-        
-        # Append completed self-play game history to PGN and JSONL files for the UI
-        _append_training_game_history(
-            game_number=completed_games,
-            generation=iteration,
-            result=result,
-            moves_san=sans,
-            elo_after=elo,
-            elo_delta=elo_delta,
-            rated_side=rated_side,
-            replay_size=len(replay),
-            train_step=train_updates,
-            metrics=metrics,
-        )
+            if is_boundary:
+                replay.save(replay_path)
+                checkpoint_manager.save(model, iteration, elo, optimizer.state_dict())
+            
+            # Append completed self-play game history to PGN and JSONL files for the UI
+            _append_training_game_history(
+                game_number=completed_games,
+                generation=iteration,
+                result=result,
+                moves_san=sans,
+                elo_after=elo,
+                elo_delta=elo_delta,
+                rated_side=rated_side,
+                replay_size=len(replay),
+                train_step=train_updates,
+                metrics=metrics,
+            )
 
-        gc.collect()
-        if device == "cuda":
-            torch.cuda.empty_cache()
+            gc.collect()
+            if device == "cuda":
+                torch.cuda.empty_cache()
+    finally:
+        try:
+            replay.save(replay_path)
+            checkpoint_manager.save(model, iteration, elo, optimizer.state_dict())
+            print(f"[TRAIN] Saved final checkpoint and replay buffer at iteration {iteration}.", flush=True)
+        except Exception as e:
+            print(f"[TRAIN] Error saving final checkpoint: {e}", flush=True)
 
 def _copy_state_to_shared(model, shared_state: dict, state_lock) -> None:
     with state_lock:
