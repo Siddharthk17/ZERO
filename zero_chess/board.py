@@ -14,7 +14,6 @@ from .constants import (
     EMPTY,
     KING_DELTAS,
     KNIGHT_DELTAS,
-    PIECE_TYPES,
     PROMOTION_TYPES,
     QUEEN_DIRS,
     ROOK_DIRS,
@@ -27,7 +26,6 @@ from .constants import (
     parse_square,
     piece_for,
     piece_type,
-    square,
     square_color,
     square_name,
 )
@@ -157,6 +155,7 @@ class Board:
         return board
 
     def copy(self) -> "Board":
+        """Return a deep copy of the board including move stack and hash history."""
         return Board(
             self.squares,
             self.turn,
@@ -168,6 +167,7 @@ class Board:
         )
 
     def fen(self) -> str:
+        """Return the standard FEN string for the current position."""
         ranks: list[str] = []
         for rank in range(7, -1, -1):
             empty = 0
@@ -190,6 +190,7 @@ class Board:
         return f"{'/'.join(ranks)} {active} {castling} {ep} {self.halfmove_clock} {self.fullmove_number}"
 
     def castling_fen(self) -> str:
+        """Return the castling-rights portion of a FEN string (e.g. ``'KQkq'`` or ``'-'``)."""
         text = ""
         if self.castling_rights & WK:
             text += "K"
@@ -202,6 +203,7 @@ class Board:
         return text or "-"
 
     def compute_zobrist(self) -> int:
+        """Compute the full 64-bit Zobrist hash from scratch for the current position."""
         value = 0
         for sq, piece in enumerate(self.squares):
             if piece != EMPTY:
@@ -214,6 +216,7 @@ class Board:
         return mask64(value)
 
     def piece_bitboards(self) -> dict[str, int]:
+        """Return a dict mapping each piece symbol to its occupancy bitboard (64-bit int)."""
         bitboards = {piece: 0 for piece in "PNBRQKpnbrqk"}
         for sq, piece in enumerate(self.squares):
             if piece != EMPTY:
@@ -221,6 +224,7 @@ class Board:
         return bitboards
 
     def occupancy_bitboards(self) -> tuple[int, int, int]:
+        """Return ``(white_occ, black_occ, total_occ)`` as 64-bit bitboard integers."""
         white = black = 0
         for sq, piece in enumerate(self.squares):
             if piece in "PNBRQK":
@@ -230,6 +234,10 @@ class Board:
         return white, black, white | black
 
     def king_square(self, color: int) -> int:
+        """Return the 0-63 square index of the king for the given color.
+
+        Raises ValueError if the position has no king of that color.
+        """
         king = "K" if color == WHITE else "k"
         for sq, piece in enumerate(self.squares):
             if piece == king:
@@ -237,10 +245,12 @@ class Board:
         raise ValueError("position has no king")
 
     def is_check(self, color: int | None = None) -> bool:
+        """Return True if the given color's king (default: side to move) is attacked."""
         color = self.turn if color is None else color
         return self.is_square_attacked(self.king_square(color), opposite(color))
 
     def is_square_attacked(self, sq: int, by_color: int) -> bool:
+        """Return True if ``sq`` is attacked by any piece of ``by_color``."""
         file_ = sq & 7
         rank = sq >> 3
         squares = self.squares
@@ -291,6 +301,7 @@ class Board:
         return False
 
     def legal_moves(self) -> list[Move]:
+        """Return all fully legal moves (king-safety verified) for the side to move."""
         moves: list[Move] = []
         moving = self.turn
         for move in self.pseudo_legal_moves():
@@ -301,7 +312,23 @@ class Board:
                 moves.append(move)
         return moves
 
+    def has_legal_moves(self) -> bool:
+        """Return True as soon as a single legal move is found (early-exit optimization).
+
+        This avoids generating the complete move list when the caller only needs to
+        know whether the game is over, which is the hot path in MCTS terminal checks.
+        """
+        moving = self.turn
+        for move in self.pseudo_legal_moves():
+            self.push(move)
+            legal = not self.is_check(moving)
+            self.pop()
+            if legal:
+                return True
+        return False
+
     def pseudo_legal_moves(self) -> list[Move]:
+        """Return all pseudo-legal moves (may leave own king in check)."""
         moves: list[Move] = []
         turn = self.turn
         squares = self.squares
@@ -427,7 +454,10 @@ class Board:
         return not any(self.is_square_attacked(parse_square(name), enemy) for name in safe_squares)
 
     def push_uci(self, text: str) -> Move:
-        # CORRECTED: Cleaned up trailing syntax typo parenthesis
+        """Parse and play a UCI move string, returning the resolved Move object.
+
+        Raises ValueError if the move is illegal in the current position.
+        """
         raw = Move.from_uci(text)
         for move in self.legal_moves():
             if move.from_sq == raw.from_sq and move.to_sq == raw.to_sq and move.promotion == raw.promotion:
@@ -436,6 +466,10 @@ class Board:
         raise ValueError(f"illegal move {text!r} in position {self.fen()}")
 
     def push(self, move: Move) -> None:
+        """Apply a move to the board, updating state and pushing to the undo stack.
+
+        Raises ValueError if the source square is empty.
+        """
         piece = self.squares[move.from_sq]
         if piece == EMPTY:
             raise ValueError(f"cannot move from empty square: {move}")
@@ -553,6 +587,7 @@ class Board:
                 self.castling_rights &= ~BQ
 
     def pop(self) -> Move:
+        """Undo the last move, restoring all board state. Raises IndexError if the stack is empty."""
         if not self._stack:
             raise IndexError("pop from empty move stack")
         state = self._stack.pop()
@@ -593,6 +628,7 @@ class Board:
         return move
 
     def has_insufficient_material(self) -> bool:
+        """Return True if the position is a forced draw by insufficient material."""
         pieces = [(sq, piece) for sq, piece in enumerate(self.squares) if piece != EMPTY and piece_type(piece) != "K"]
         if not pieces:
             return True
@@ -605,28 +641,40 @@ class Board:
         return False
 
     def is_fifty_move_draw(self) -> bool:
+        """Return True if the halfmove clock has reached 100 (fifty full moves without pawn/capture)."""
         return self.halfmove_clock >= 100
 
     def is_threefold_repetition(self) -> bool:
+        """Return True if the current position has occurred three or more times in the game."""
         return Counter(self.hash_history)[self.zobrist_hash] >= 3
 
     def is_checkmate(self) -> bool:
-        return self.is_check(self.turn) and not self.legal_moves()
+        """Return True if the side to move is in checkmate (in check with no legal moves)."""
+        return self.is_check(self.turn) and not self.has_legal_moves()
 
     def is_stalemate(self) -> bool:
-        legal = self.legal_moves()
-        stalemate = not legal and not self.is_check(self.turn)
-        if stalemate:
-            assert not self.is_check(self.turn)
-        return stalemate
+        """Return True if the side to move is stalemated (no legal moves but not in check)."""
+        return not self.is_check(self.turn) and not self.has_legal_moves()
 
     def outcome(self, claim_draws: bool = True) -> str | None:
+        """Return the game result string ('1-0', '0-1', '1/2-1/2') or None if ongoing.
+
+        Parameters
+        ----------
+        claim_draws:
+            When True, claim draws by the fifty-move rule, threefold repetition,
+            or insufficient material before checking for checkmate/stalemate.
+
+        Returns
+        -------
+        ``'1-0'`` if White wins, ``'0-1'`` if Black wins, ``'1/2-1/2'`` for a draw,
+        or ``None`` if the game is still in progress.
+        """
         if self.has_insufficient_material():
             return "1/2-1/2"
         if claim_draws and (self.is_fifty_move_draw() or self.is_threefold_repetition()):
             return "1/2-1/2"
-        legal = self.legal_moves()
-        if legal:
+        if self.has_legal_moves():
             return None
         if self.is_check(self.turn):
             return "0-1" if self.turn == WHITE else "1-0"

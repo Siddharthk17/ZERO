@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import queue
 import random
 import subprocess
@@ -16,27 +17,35 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-import torch
-import torch.multiprocessing as mp
+import multiprocessing
 
 from .board import Board
 from .constants import (
-    BLACK, BK, BQ, EMPTY, WHITE, WK, WQ, color_of, file_of,
-    parse_square, piece_type, rank_of, square, square_name
+    BLACK, BK, BQ, WHITE, WK, WQ,
+    file_of, parse_square, rank_of, square, square_name
 )
 from .elo import DEFAULT_ELO, update_rating_with_reason
 from .encoding import terminal_wdl
 from .mcts import MCTS, NetworkEvaluator, UniformEvaluator
-from .move import EN_PASSANT, Move
+from .move import Move
 from .pgn import export_pgn
 from .replay import Experience, PrioritizedReplayBuffer
 from .targets import (
-    AGGRESSION_WEIGHT, MOMENTUM_REWARD, PANIC_PENALTY, 
-    opponent_value, game_result_to_values
+    AGGRESSION_WEIGHT, MOMENTUM_REWARD, PANIC_PENALTY,
+    opponent_value,
 )
+
+
+def _ensure_importable() -> None:
+    """Ensure zero_chess is importable in Windows spawn child processes."""
+    import sys
+    root = str(Path(__file__).resolve().parent.parent)
+    if root not in sys.path:
+        sys.path.insert(0, root)
 
 @dataclass(slots=True)
 class SelfPlayConfig:
+    """Configuration for self-play game generation: simulations, batch size, and opening randomness."""
     simulations: int = 200
     batch_size: int = 24
     max_plies: int = 512
@@ -50,6 +59,7 @@ class SelfPlayConfig:
 
 @dataclass(slots=True)
 class PositionRecord:
+    """A single position recorded during self-play for later training target generation."""
     fen: str
     policy: dict[str, float]
     turn: int
@@ -58,18 +68,30 @@ class PositionRecord:
     momentum_reward: float
     panic_penalty: float
 
+
+def _make_mcts(evaluator, config: SelfPlayConfig) -> MCTS:
+    """Build an MCTS searcher configured from self-play settings."""
+    resign_threshold = -1.0 if config.disable_resign else config.resign_value
+    return MCTS(
+        evaluator,
+        c_puct=1.5 if config.generation < 200 else 1.0,
+        batch_size=config.batch_size,
+        simulations=config.simulations,
+        resign_threshold=resign_threshold,
+    )
+
 def play_game(
     mcts: MCTS,
     config: SelfPlayConfig | None = None,
     rng: random.Random | None = None,
 ) -> tuple[str, list[Experience], list[str], str, dict]:
+    """Play a full self-play game and return (result, experiences, SAN moves, reason, metadata)."""
     config = config or SelfPlayConfig()
     rng = rng or random.Random()
     board = Board()
     records: list[PositionRecord] = []
     sans: list[str] = []
     adjudication: list[float] = []
-    pending_panic = 0.0
     start_time = time.monotonic()
 
     for ply in range(config.max_plies):
@@ -116,7 +138,7 @@ def play_game(
                 root_value=root_value,
                 aggression_score=_aggression_score(board),
                 momentum_reward=_momentum_reward(board, move),
-                panic_penalty=pending_panic,
+                panic_penalty=_panic_penalty(board, move),
             )
         )
 
@@ -130,9 +152,8 @@ def play_game(
             return result, _finalize(records, result, "adjudication", rng), sans, "adjudication", meta
 
         sans.append(board.san(move))
-        pending_panic = _panic_penalty(board, move)
         board.push(move)
-        
+
         if config.reuse_tree:
             mcts.advance_to(move)
         else:
@@ -268,56 +289,19 @@ def _flip_experience_horizontal(exp: Experience) -> Experience:
         panic_penalty=exp.panic_penalty,
     )
 
-def _collect_eval_requests(request_queue, gpu_batch_size: int, wait_seconds: float, active_workers=None):
-    item = request_queue.get()
-    if item[0] == "stop":
-        return None
-    requests = [item]
-    positions = len(item[3])
-    deadline = time.monotonic() + wait_seconds
-    while True:
-        if positions >= gpu_batch_size:
-            break
-
-        search_is_finished = True
-        if active_workers is not None:
-            active_ids = {i for i, active in enumerate(active_workers) if active}
-            pending_ids = {req[1] for req in requests}
-            search_is_finished = active_ids.issubset(pending_ids)
-
-        now = time.monotonic()
-        if now >= deadline:
-            if positions >= 16 or search_is_finished:
-                break
-
-        timeout = max(0.001, deadline - now) if now < deadline else wait_seconds
-        try:
-            item = request_queue.get(timeout=timeout)
-        except queue.Empty:
-            continue
-        if item[0] == "stop":
-            break
-        requests.append(item)
-        positions += len(item[3])
-    return requests
-
 def generate_parallel_games(
     evaluator,
     games: int = 2,
     config: SelfPlayConfig | None = None,
     rng_seed: int | None = None,
 ) -> list[tuple[str, list[Experience], list[str], str, dict]]:
+    """Generate ``games`` self-play games in parallel threads using a single evaluator."""
     config = config or SelfPlayConfig()
     results: list[tuple[str, list[Experience], list[str], str, dict] | None] = [None] * games
 
     def worker(index: int) -> None:
         rng = random.Random(None if rng_seed is None else rng_seed + index)
-        mcts = MCTS(
-            evaluator,
-            c_puct=1.5 if config.generation < 200 else 1.0,
-            batch_size=config.batch_size,
-            simulations=config.simulations,
-        )
+        mcts = _make_mcts(evaluator, config)
         results[index] = play_game(mcts, config, rng)
         mcts.reset()
         del mcts
@@ -331,7 +315,7 @@ def generate_parallel_games(
     return [result for result in results if result is not None]
 
 class QueueEvaluatorProxy:
-    """Synchronous MCTS evaluator proxy backed by multiprocessing queues."""
+    """MCTS evaluator proxy: encodes boards to tensors (CPU) then sends to GPU evaluator."""
 
     def __init__(self, worker_id: int, request_queue, response_queue, stop_event=None) -> None:
         self.worker_id = worker_id
@@ -341,23 +325,35 @@ class QueueEvaluatorProxy:
         self._next_request_id = 0
 
     def evaluate_batch(self, boards: list[Board]):
+        legal_moves = [b.legal_moves() for b in boards]
+        fens = [b.fen() for b in boards]
+        legal_ucis = [[m.uci() for m in legal] for legal in legal_moves]
+
         self._next_request_id += 1
         request_id = self._next_request_id
-        self.request_queue.put(("eval", self.worker_id, request_id, boards))
+        # Send compact FEN + legal-move descriptors instead of full tensors to keep IPC tiny.
+        self.request_queue.put(("eval", self.worker_id, request_id, (fens, legal_ucis)))
         while True:
             if self.stop_event is not None and self.stop_event.is_set():
                 raise RuntimeError("Evaluation aborted: stop event is set")
             try:
-                response_id, results, error = self.response_queue.get(timeout=1.0)
+                response_id, data, error = self.response_queue.get(timeout=1.0)
             except queue.Empty:
-                import os
                 if os.getppid() == 1:
                     raise RuntimeError("Evaluation aborted: parent process died")
+                # On Windows, getppid() doesn't return 1 for orphans.
+                # The stop_event check above is the primary signal; this is a Unix fallback.
                 continue
             if response_id != request_id:
                 continue
             if error is not None:
                 raise RuntimeError(error)
+
+            raw_values, raw_uncertainties, legal_probs = data
+            results = []
+            for i, legal in enumerate(legal_moves):
+                probs = legal_probs[i]
+                results.append(({m: float(p) for m, p in zip(legal, probs)}, float(raw_values[i]), float(raw_uncertainties[i])))
             return results
 
 def generate_multiprocess_games(
@@ -367,11 +363,11 @@ def generate_multiprocess_games(
     config: SelfPlayConfig | None = None,
     rng_seed: int | None = None,
     gpu_batch_size: int = 64,
-    max_wait_ms: float = 2.0,
+    max_wait_ms: float = 20.0,
 ) -> list[tuple[str, list[Experience], list[str], str, dict]]:
     """Generate self-play with CPU worker processes feeding one CUDA evaluator process."""
     config = config or SelfPlayConfig()
-    ctx = mp.get_context("spawn")
+    ctx = multiprocessing.get_context("spawn")
     request_queue = ctx.Queue()
     response_queues = [ctx.Queue() for _ in range(games)]
     result_queue = ctx.Queue()
@@ -406,27 +402,57 @@ def generate_multiprocess_games(
         received += 1
         if error is None:
             results[idx] = payload
+        else:
+            print(f"[ERROR] Self-play worker {idx} failed:\n{error}", flush=True)
 
     for process in workers:
         if process.is_alive():
             process.terminate()
+            process.join(timeout=2.0)
+            if process.is_alive():
+                process.kill()
     request_queue.put(("stop",))
     evaluator.join(timeout=5.0)
+    if evaluator.is_alive():
+        evaluator.terminate()
+        evaluator.join(timeout=2.0)
+        if evaluator.is_alive():
+            evaluator.kill()
+    try:
+        request_queue.close()
+        result_queue.close()
+        for q in response_queues:
+            q.close()
+    except Exception:
+        pass
     return [result for result in results if result is not None]
 
 @dataclass(slots=True)
 class CudaTrainingRuntime:
+    """Handle for a persistent CUDA training runtime; use as a context manager or call stop()."""
     stop_event: object
     processes: list[object]
     resources: list[object]
+    generation_value: object
+    games_completed: object
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
+        return False
 
     def stop(self, timeout: float = 10.0) -> None:
         self.stop_event.set()
         for process in self.processes:
             process.join(timeout=timeout)
-        for process in self.processes:
             if process.is_alive():
                 process.terminate()
+                process.join(timeout=2.0)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=2.0)
 
 def start_persistent_cuda_training(
     model,
@@ -435,12 +461,12 @@ def start_persistent_cuda_training(
     games: int = 2,
     self_play_config: SelfPlayConfig | None = None,
     device: str = "cuda",
-    gpu_batch_size: int = 64,
-    eval_wait_ms: float = 10.0,
-    cuda_memory_fraction: float = 0.40,
+    gpu_batch_size: int = 2048,
+    eval_wait_ms: float = 5.0,
+    cuda_memory_fraction: float = 0.90,
     gpu_cooldown_ms: float = 0.0,
     compile_model: bool = False,
-    updates_per_game: float = 1.0,
+    updates_per_game: float = 8.0,
     iteration: int = 0,
     train_updates: int = 0,
     elo: float = DEFAULT_ELO,
@@ -450,12 +476,12 @@ def start_persistent_cuda_training(
     training_log_path: str = "logs/training.log",
     monitor_log_path: str = "logs/utilization.log",
 ) -> CudaTrainingRuntime:
-    """Start persistent self-play with strict 8GB RAM safety barriers."""
+    """Start persistent self-play optimized for Blackwell 24GB VRAM and 128GB RAM."""
     config = self_play_config or SelfPlayConfig()
-    ctx = mp.get_context("spawn")
+    ctx = multiprocessing.get_context("spawn")
     request_queue = ctx.Queue(maxsize=128)
     response_queues = [ctx.Queue(maxsize=16) for _ in range(games)]
-    game_queue = ctx.Queue(maxsize=32)
+    game_queue = ctx.Queue(maxsize=128)
     stop_event = ctx.Event()
     weights_updated = ctx.Event()
     state_lock = ctx.Lock()
@@ -572,7 +598,7 @@ def start_persistent_cuda_training(
         active_workers,
     ]
 
-    return CudaTrainingRuntime(stop_event, [*workers, evaluator, trainer, monitor], resources)
+    return CudaTrainingRuntime(stop_event, [*workers, evaluator, trainer, monitor], resources, generation_value, games_completed)
 
 def _persistent_self_play_process_main(
     worker_id: int,
@@ -586,6 +612,7 @@ def _persistent_self_play_process_main(
     rng_seed: int,
     active_workers,
 ) -> None:
+    _ensure_importable()
     active_workers[worker_id] = True
     try:
         rng = random.Random(rng_seed)
@@ -600,11 +627,7 @@ def _persistent_self_play_process_main(
 
             generation = int(generation_value.value)
             config = replace(base_config, generation=generation)
-            mcts = MCTS(
-                evaluator,
-                batch_size=config.batch_size,
-                simulations=config.simulations,
-            )
+            mcts = _make_mcts(evaluator, config)
             try:
                 game_result = play_game(mcts, config, rng)
                 game_queue.put((worker_id, game_result, None))
@@ -637,7 +660,8 @@ def _persistent_gpu_evaluator_process_main(
     batch_positions,
     active_workers,
 ) -> None:
-    from .encoding import INPUT_CHANNELS, POLICY_SIZE, encode_board_into, encode_move_mask_into, move_to_policy_index
+    _ensure_importable()
+    import torch
     from .model import ModelConfig, ZeroNet
 
     _configure_cuda_process(device, torch, cuda_memory_fraction)
@@ -645,12 +669,14 @@ def _persistent_gpu_evaluator_process_main(
     with state_lock:
         model.load_state_dict(shared_state)
     model.eval()
-    compiled_model = torch.compile(model, mode="reduce-overhead") if compile_model else model
-    pin = device == "cuda"
-    input_host = torch.empty((gpu_batch_size, INPUT_CHANNELS, 8, 8), dtype=torch.float32, pin_memory=pin)
-    mask_host = torch.empty((gpu_batch_size, POLICY_SIZE), dtype=torch.float32, pin_memory=pin)
-    input_device = torch.empty((gpu_batch_size, INPUT_CHANNELS, 8, 8), dtype=torch.float32, device=device)
-    mask_device = torch.empty((gpu_batch_size, POLICY_SIZE), dtype=torch.float32, device=device)
+    if compile_model:
+        try:
+            torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
+        except AttributeError:
+            pass
+        compiled_model = torch.compile(model, mode="reduce-overhead")
+    else:
+        compiled_model = model
     wait_seconds = eval_wait_ms / 1000.0
 
     while not stop_event.is_set():
@@ -660,138 +686,114 @@ def _persistent_gpu_evaluator_process_main(
                 weights_updated.clear()
             model.eval()
 
-        requests = _collect_eval_requests_nonblocking(request_queue, gpu_batch_size, wait_seconds, stop_event, active_workers)
+        requests = _collect_eval_requests_nonblocking(request_queue, gpu_batch_size, wait_seconds, stop_event)
         if requests is None:
             return  # Clean stop
         if not requests:
             continue  # Idle loop back
 
-        flat_boards = [board for _, _, _, boards in requests for board in boards]
-        
+        flat_fens = []
+        flat_legal_ucis = []
+        for _, _, _, data in requests:
+            fens, legal_ucis = data
+            flat_fens.extend(fens)
+            flat_legal_ucis.extend(legal_ucis)
+
+        total_positions = len(flat_fens)
+
         # Increment batch and evaluation stats counters
         with positions_evaluated.get_lock():
-            positions_evaluated.value += len(flat_boards)
+            positions_evaluated.value += total_positions
         with eval_batches.get_lock():
             eval_batches.value += 1
         with batch_positions.get_lock():
-            batch_positions.value += len(flat_boards)
+            batch_positions.value += total_positions
 
         try:
-            flat_results = _evaluate_preallocated_chunk(
-                compiled_model,
-                flat_boards,
-                device,
-                torch.float16,
-                input_host,
-                mask_host,
-                input_device,
-                mask_device,
-                encode_board_into,
-                encode_move_mask_into,
-                move_to_policy_index,
-            )
+            from .board import Board
+            from .encoding import encode_boards, move_to_policy_index
+            from .move import Move
+
+            boards = [Board.from_fen(fen) for fen in flat_fens]
+            tensors = encode_boards(boards, device="cpu").pin_memory().to(device, non_blocking=True)
+            masks = torch.stack([_encode_move_mask_from_ucis(b, legal, device="cpu") for b, legal in zip(boards, flat_legal_ucis)]).pin_memory().to(device, non_blocking=True)
+            amp_dtype = torch.bfloat16 if device == "cuda" and torch.cuda.is_bf16_supported() else torch.float16
+            with torch.autocast(device_type=device, dtype=amp_dtype, enabled=True):
+                out = compiled_model(tensors, masks, return_dict=True)
+            raw_values = out["value"].squeeze(-1).detach().cpu().tolist()
+            raw_uncertainties = out["uncertainty"].detach().cpu().tolist()
+            raw_policies = out["policy"].detach().cpu()
+            legal_probs = []
+            for batch_idx, (board, legal) in enumerate(zip(boards, flat_legal_ucis)):
+                indices = torch.tensor([move_to_policy_index(board, Move.from_uci(uci)) for uci in legal], dtype=torch.long)
+                legal_probs.append(raw_policies[batch_idx][indices].tolist())
             error = None
         except Exception:
-            flat_results = []
+            raw_values = raw_uncertainties = []
+            legal_probs = []
             error = traceback.format_exc()
 
         offset = 0
-        for _, worker_id, request_id, boards in requests:
-            end = offset + len(boards)
-            response_queues[worker_id].put((request_id, None if error else flat_results[offset:end], error))
-            offset = end
-            
+        for _, worker_id, request_id, data in requests:
+            batch_size = len(data[0])
+            if error:
+                response_queues[worker_id].put((request_id, (None,), error))
+            else:
+                response_queues[worker_id].put((
+                    request_id,
+                    (raw_values[offset:offset + batch_size],
+                     raw_uncertainties[offset:offset + batch_size],
+                     legal_probs[offset:offset + batch_size]),
+                    None,
+                ))
+            offset += batch_size
+
         # Fulfill defined GPU cooldown sleep parameter to avoid thermal limits
         if gpu_cooldown_ms > 0.0:
             time.sleep(gpu_cooldown_ms / 1000.0)
 
         gc.collect()
 
-def _evaluate_preallocated_chunk(
-    compiled_model,
-    boards,
-    device: str,
-    amp_dtype,
-    input_host,
-    mask_host,
-    input_device,
-    mask_device,
-    encode_board_into,
-    encode_move_mask_into,
-    move_to_policy_index,
-):
-    batch_size = len(boards)
-    capacity = int(input_host.shape[0])
-    if batch_size > capacity:
-        results = []
-        for start in range(0, batch_size, capacity):
-            results.extend(
-                _evaluate_preallocated_chunk(
-                    compiled_model,
-                    boards[start : start + capacity],
-                    device,
-                    amp_dtype,
-                    input_host,
-                    mask_host,
-                    input_device,
-                    mask_device,
-                    encode_board_into,
-                    encode_move_mask_into,
-                    move_to_policy_index,
-                )
-            )
-        return results
+def _encode_move_mask_from_ucis(board: Board, legal_ucis: list[str], device: str | None = None):
+    """Build a float legal-move mask from pre-computed UCI strings (no re-generation)."""
+    import torch
+    from .encoding import POLICY_SIZE, move_to_policy_index
+    from .move import Move
 
-    for row, board in enumerate(boards):
-        legal = board.legal_moves()
-        encode_board_into(input_host[row], board)
-        encode_move_mask_into(mask_host[row], legal, board)
+    mask = torch.zeros(POLICY_SIZE, dtype=torch.float32, device=device)
+    for uci in legal_ucis:
+        mask[move_to_policy_index(board, Move.from_uci(uci))] = 1.0
+    return mask
 
-    input_device[:batch_size].copy_(input_host[:batch_size], non_blocking=True)
-    mask_device[:batch_size].copy_(mask_host[:batch_size], non_blocking=True)
-    with torch.inference_mode(), torch.autocast(device_type=device, dtype=amp_dtype, enabled=device == "cuda"):
-        out = compiled_model(input_device[:batch_size], mask_device[:batch_size], return_dict=True)
-        
-    policy_cpu = out["policy"].detach().cpu()
-    values = out["value"].squeeze(-1).detach().cpu().tolist()
-    uncertainties = out["uncertainty"].detach().cpu().tolist()
-    results = []
-    for row, board in enumerate(boards):
-        legal = board.legal_moves()
-        indices = [move_to_policy_index(board, m) for m in legal]
-        priors = {m: float(policy_cpu[row, idx]) for m, idx in zip(legal, indices, strict=True)}
-        results.append((priors, float(values[row]), float(uncertainties[row])))
-    return results
-
-def _collect_eval_requests_nonblocking(request_queue, gpu_batch_size: int, wait_seconds: float, stop_event=None, active_workers=None):
+def _collect_eval_requests_nonblocking(request_queue, gpu_batch_size: int, wait_seconds: float, stop_event=None):
     try:
-        item = request_queue.get(timeout=0.01)
+        item = request_queue.get(timeout=wait_seconds)
     except queue.Empty:
         return []
     if item[0] == "stop":
         if stop_event is not None:
             stop_event.set()
-        return None # Return None to signal a clean, cooperative shutdown [2]
+        return None
     requests = [item]
-    positions = len(item[3])
+    positions = len(item[3][0])
     deadline = time.monotonic() + wait_seconds
     while (stop_event is None or not stop_event.is_set()) and positions < gpu_batch_size:
         now = time.monotonic()
         if now >= deadline:
             break
         try:
-            item = request_queue.get(timeout=max(0.001, deadline - now))
+            item = request_queue.get(timeout=max(0.0005, deadline - now))
         except queue.Empty:
             continue
         if item[0] == "stop":
             if stop_event is not None:
                 stop_event.set()
-            return None # Return None to signal a clean, cooperative shutdown [2]
+            return None
         requests.append(item)
-        positions += len(item[3])
+        positions += len(item[3][0])
     return requests
 
-def _configure_cuda_process(device: str, torch_module, memory_fraction: float = 0.40) -> None:
+def _configure_cuda_process(device: str, torch_module, memory_fraction: float = 0.90) -> None:
     try:
         torch_module.set_num_threads(1)
         torch_module.set_num_interop_threads(1)
@@ -801,7 +803,9 @@ def _configure_cuda_process(device: str, torch_module, memory_fraction: float = 
         return
     torch_module.cuda.set_per_process_memory_fraction(memory_fraction)
     torch_module.backends.cuda.matmul.allow_tf32 = True
+    torch_module.backends.cudnn.allow_tf32 = True
     torch_module.backends.cudnn.benchmark = True
+    torch_module.set_float32_matmul_precision("high")
 
 def _utilization_monitor_process_main(
     stop_event,
@@ -812,6 +816,7 @@ def _utilization_monitor_process_main(
     target_batch_size: int,
     log_path: str,
 ) -> None:
+    _ensure_importable()
     path = Path(log_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     start_time = time.monotonic()
@@ -856,21 +861,18 @@ def _query_gpu_utilization() -> tuple[float, int, int]:
         return 0.0, 0, 0
 
 def _query_memory_utilization() -> tuple[int, int, int, int, int]:
-    """Retrieve platform memory utilization, falling back gracefully to avoid freezes on non-Linux systems."""
+    """High-performance memory query using psutil for cross-platform support (Windows/Linux)."""
     try:
-        fields: dict[str, int] = {}
-        with Path("/proc/meminfo").open("r", encoding="utf-8") as fh:
-            for line in fh:
-                name, raw_value = line.split(":", 1)
-                fields[name] = int(raw_value.strip().split()[0]) // 1024
-        total = fields.get("MemTotal", 0)
-        available = fields.get("MemAvailable", 0)
-        swap_total = fields.get("SwapTotal", 0)
-        swap_free = fields.get("SwapFree", 0)
-        return total - available, total, available, swap_total - swap_free, swap_total
-    except Exception:
-        # Cross-platform fallback: return baseline values to prevent thread starvation/infinite pauses
-        return 0, 8192, 4096, 0, 0
+        import psutil
+        vm = psutil.virtual_memory()
+        sw = psutil.swap_memory()
+        return (int(vm.used / 1024 / 1024),
+                int(vm.total / 1024 / 1024),
+                int(vm.available / 1024 / 1024),
+                int(sw.used / 1024 / 1024),
+                int(sw.total / 1024 / 1024))
+    except ImportError:
+        return 0, 131072, 120000, 0, 0
 
 def _model_payload_for_process(model) -> tuple[dict, dict]:
     config = asdict(model.config) if hasattr(model, "config") else {}
@@ -893,15 +895,12 @@ def _self_play_process_main(
     rng_seed: int | None,
     active_workers,
 ) -> None:
+    _ensure_importable()
     active_workers[worker_id] = True
     try:
         rng = random.Random(rng_seed)
         evaluator = QueueEvaluatorProxy(worker_id, request_queue, response_queue)
-        mcts = MCTS(
-            evaluator,
-            batch_size=config.batch_size,
-            simulations=config.simulations,
-        )
+        mcts = _make_mcts(evaluator, config)
         # Play exactly one game, put results in queue, reset, and exit cleanly [2]
         game_result = play_game(mcts, config, rng)
         game_queue.put((worker_id, game_result, None))
@@ -923,9 +922,11 @@ def _gpu_evaluator_process_main(
     max_wait_ms: float,
     active_workers,
 ) -> None:
+    _ensure_importable()
     from .model import ModelConfig, ZeroNet
 
     import torch
+    _configure_cuda_process(device, torch, 0.95)
 
     model = ZeroNet(ModelConfig(**model_config)).to(device)
     model.load_state_dict(state_dict)
@@ -933,25 +934,55 @@ def _gpu_evaluator_process_main(
     wait_seconds = max_wait_ms / 1000.0
 
     while True:
-        requests = _collect_eval_requests_nonblocking(request_queue, gpu_batch_size, wait_seconds, None, active_workers) # Corrected target signature [2]
+        requests = _collect_eval_requests_nonblocking(request_queue, gpu_batch_size, wait_seconds)
         if requests is None:
-            return  # Clean stop signal received, terminate process [2]
+            return  # Clean stop signal received, terminate process
         if not requests:
-            continue  # Idle timeout, loop back safely without evaluating [2]
-            
-        flat_boards = [board for _, _, _, boards in requests for board in boards]
+            continue  # Idle timeout, loop back safely without evaluating
+
+        flat_fens = []
+        flat_legal_ucis = []
+        for _, _, _, data in requests:
+            fens, legal_ucis = data
+            flat_fens.extend(fens)
+            flat_legal_ucis.extend(legal_ucis)
         try:
-            flat_results = model.evaluate_batch(flat_boards, device)
+            from .board import Board
+            from .encoding import encode_boards, move_to_policy_index
+            from .move import Move
+
+            boards = [Board.from_fen(fen) for fen in flat_fens]
+            tensors = encode_boards(boards, device="cpu").pin_memory().to(device, non_blocking=True)
+            masks = torch.stack([_encode_move_mask_from_ucis(b, legal, device="cpu") for b, legal in zip(boards, flat_legal_ucis)]).pin_memory().to(device, non_blocking=True)
+            with torch.autocast(device_type=device, dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16, enabled=True):
+                out = model(tensors, masks, return_dict=True)
+            raw_values = out["value"].squeeze(-1).detach().cpu().tolist()
+            raw_uncertainties = out["uncertainty"].detach().cpu().tolist()
+            raw_policies = out["policy"].detach().cpu()
+            legal_probs = []
+            for batch_idx, (board, legal) in enumerate(zip(boards, flat_legal_ucis)):
+                indices = torch.tensor([move_to_policy_index(board, Move.from_uci(uci)) for uci in legal], dtype=torch.long)
+                legal_probs.append(raw_policies[batch_idx][indices].tolist())
             error = None
         except Exception:
-            flat_results = []
+            raw_values = raw_uncertainties = []
+            legal_probs = []
             error = traceback.format_exc()
 
         offset = 0
-        for _, worker_id, request_id, boards in requests:
-            end = offset + len(boards)
-            response_queues[worker_id].put((request_id, None if error else flat_results[offset:end], error))
-            offset = end
+        for _, worker_id, request_id, data in requests:
+            batch_size = len(data[0])
+            if error:
+                response_queues[worker_id].put((request_id, (None,), error))
+            else:
+                response_queues[worker_id].put((
+                    request_id,
+                    (raw_values[offset:offset + batch_size],
+                     raw_uncertainties[offset:offset + batch_size],
+                     legal_probs[offset:offset + batch_size]),
+                    None,
+                ))
+            offset += batch_size
 
 def _adjudicate(values: list[float]) -> bool:
     if len(values) < 20:
@@ -1007,6 +1038,8 @@ def _trainer_process_main(
     training_log_path: str,
     games_per_generation: int,
 ) -> None:
+    _ensure_importable()
+    import torch
     from .checkpoint import CheckpointManager
     from .ema import EMATeacher
     from .model import ModelConfig, ZeroNet
@@ -1021,8 +1054,12 @@ def _trainer_process_main(
     optimizer = make_optimizer(model, train_config)
     scheduler = ContinuousLRScheduler(optimizer, train_config.initial_lr, train_config.continuous_lr)
     logger = TrainingLogger(training_log_path)
-    scaler = torch.amp.GradScaler("cuda", enabled=device == "cuda")
+    use_bf16 = device == "cuda" and torch.cuda.is_bf16_supported()
+    needs_scaler = device == "cuda" and not use_bf16
+    scaler = torch.amp.GradScaler("cuda", enabled=needs_scaler)
     checkpoint_manager = CheckpointManager(checkpoint_dir)
+    from .ewc import ElasticWeightConsolidation
+    ewc = ElasticWeightConsolidation()
     replay_file = Path(replay_path)
     if replay_file.exists():
         replay = PrioritizedReplayBuffer.load(replay_file, cold_path=cold_replay_path)
@@ -1040,53 +1077,18 @@ def _trainer_process_main(
             try:
                 _, payload, error = game_queue.get(timeout=1.0)
             except queue.Empty:
-                # Run Arena Evaluation dynamically every 100 completed games
-                if completed_games > 0 and completed_games % 100 == 0:
-                    print("\n" + "="*20 + " [ARENA EVALUATION] " + "="*20, flush=True)
-                    print(f"Starting Arena Match: Student vs. EMA Teacher (Iteration {iteration})", flush=True)
-                    print("Games: 20 | MCTS Simulations: 160 | Device: " + str(device), flush=True)
-                    
-                    from .arena import play_arena
-                    from .mcts import NetworkEvaluator
-                    
-                    student_eval = NetworkEvaluator(model, device)
-                    teacher_eval = NetworkEvaluator(teacher.teacher, device)
-                    
-                    arena = play_arena(
-                        student_eval,
-                        teacher_eval,
-                        games=20,
-                        simulations=160,
-                        iteration=iteration,
-                        elo_a=elo,
-                        log_path="logs/arena.log",
-                    )
-                    
-                    elo = float(arena["elo_a"])
-                    print(f"Results: Student Score: {arena['student_score']} | Teacher Score: {arena['teacher_score']}", flush=True)
-                    print(f"Match Stats: Student Wins: {arena['wins_a']} | Teacher Wins: {arena['wins_b']} | Draws: {arena['draws']}", flush=True)
-                    
-                    if arena["promote"]:
-                        teacher.promote(model)
-                        print(f"Status: [PROMOTED] Student defeated Teacher (>60% score)! Student is now the new EMA Teacher.", flush=True)
-                    else:
-                        print(f"Status: [RETAINED] Teacher retained its title (Student score <=60%).", flush=True)
-                    print(f"New Running Elo: {elo:.1f}", flush=True)
-                    print("="*60 + "\n", flush=True)
-                    
-                    completed_games += 1  # Offset to prevent infinite evaluation triggers
                 continue
-                
+
             if error is not None:
                 print(f"\n[ERROR] Worker process encountered an exception:\n{error}", flush=True)
                 continue
-                
-            result, experiences, sans, reason, meta = payload # Unpack 5-tuple with metadata!
+
+            result, experiences, sans, reason, meta = payload  # Unpack 5-tuple with metadata!
             replay.extend(experiences)
             completed_games += 1
             rated_side = WHITE if completed_games % 2 else BLACK
-            elo, elo_delta = update_rating_with_reason(elo, result, rated_side, reason) # Use custom Elo rules!
-            
+            elo, elo_delta = update_rating_with_reason(elo, result, rated_side, reason)  # Use custom Elo rules!
+
             is_boundary = (completed_games % max(1, games_per_generation) == 0)
             if is_boundary:
                 iteration += 1
@@ -1146,17 +1148,18 @@ def _trainer_process_main(
             metrics = {}
             if len(replay) > 256:
                 train_updates += 1
-                metrics = train_step(
+                metrics, scaler = train_step(
                     model,
                     optimizer,
                     replay,
                     train_config,
+                    ewc=ewc,
                     iteration=train_updates,
                     scheduler=scheduler,
                     scaler=scaler,
                     logger=logger,
                 )
-                
+
                 # Print active gradient update metrics directly alongside game completion logs
                 print(
                     f"[TRAIN #{train_updates:05d}] Loss: {metrics.get('loss', 0.0):.4f} | "
@@ -1172,10 +1175,76 @@ def _trainer_process_main(
                 _copy_state_to_shared(teacher.teacher, shared_state, state_lock)
                 weights_updated.set()
 
+            if completed_games % 100 == 0:
+                # Drain pending games from the queue before arena to prevent worker backpressure
+                while not game_queue.empty():
+                    try:
+                        _, pending_payload, pending_error = game_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if pending_error is not None:
+                        print(f"\n[ERROR] Worker process encountered an exception:\n{pending_error}", flush=True)
+                        continue
+                    p_result, p_experiences, p_sans, p_reason, p_meta = pending_payload
+                    replay.extend(p_experiences)
+                    completed_games += 1
+                    p_rated_side = WHITE if completed_games % 2 else BLACK
+                    elo, p_elo_delta = update_rating_with_reason(elo, p_result, p_rated_side, p_reason)
+                    plies_window.append(len(p_sans))
+                    reasons_window.append(p_reason)
+                    durations_window.append(p_meta["duration"])
+                    _append_training_game_history(
+                        game_number=completed_games,
+                        generation=iteration,
+                        result=p_result,
+                        moves_san=p_sans,
+                        elo_after=elo,
+                        elo_delta=p_elo_delta,
+                        rated_side=p_rated_side,
+                        replay_size=len(replay),
+                        train_step=train_updates,
+                        metrics={},
+                    )
+
+                print("\n" + "="*20 + " [ARENA EVALUATION] " + "="*20, flush=True)
+                print(f"Starting Arena Match: Student vs. EMA Teacher (Iteration {iteration})", flush=True)
+                print("Games: 20 | MCTS Simulations: 160 | Device: " + str(device), flush=True)
+
+                from .arena import play_arena
+                from .mcts import NetworkEvaluator
+
+                student_eval = NetworkEvaluator(model, device)
+                teacher_eval = NetworkEvaluator(teacher.teacher, device)
+
+                arena = play_arena(
+                    student_eval,
+                    teacher_eval,
+                    games=20,
+                    simulations=160,
+                    iteration=iteration,
+                    elo_a=elo,
+                    log_path="logs/arena.log",
+                )
+
+                elo = float(arena["elo_a"])
+                print(f"Results: Student Score: {arena['student_score']} | Teacher Score: {arena['teacher_score']}", flush=True)
+                print(f"Match Stats: Student Wins: {arena['wins_a']} | Teacher Wins: {arena['wins_b']} | Draws: {arena['draws']}", flush=True)
+
+                if arena["promote"]:
+                    teacher.promote(model)
+                    print(f"Status: [PROMOTED] Student defeated Teacher (>60% score)! Student is now the new EMA Teacher.", flush=True)
+                else:
+                    print(f"Status: [RETAINED] Teacher retained its title (Student score <=60%).", flush=True)
+                print(f"New Running Elo: {elo:.1f}", flush=True)
+                print("\n", flush=True)
+
+            if completed_games % 50 == 0 and len(replay) > 0:
+                ewc.consolidate(model, replay, device=device)
+
             if is_boundary:
                 replay.save(replay_path)
                 checkpoint_manager.save(model, iteration, elo, optimizer.state_dict())
-            
+
             # Append completed self-play game history to PGN and JSONL files for the UI
             _append_training_game_history(
                 game_number=completed_games,
@@ -1260,6 +1329,7 @@ def _append_training_game_history(
         fh.write(pgn + "\n\n")
 
 def main(argv: list[str] | None = None) -> None:
+    """CLI entry point: generate self-play games and save PGN output."""
     parser = argparse.ArgumentParser(description="Generate self-play games using a ZERO checkpoint.")
     parser.add_argument("--checkpoint", help="Path to model checkpoint. If not specified, UniformEvaluator is used.")
     parser.add_argument("--games", type=int, default=2, help="Number of games to generate.")
@@ -1269,6 +1339,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--device", default="cpu", help="Device to run on ('cpu' or 'cuda').")
     parser.add_argument("--seed", type=int, help="Random seed.")
     parser.add_argument("--out-pgn", default="data/selfplay.pgn", help="File to write PGN output to.")
+    parser.add_argument("--gpu-batch-size", type=int, default=64, help="GPU evaluator batch size for multiprocess mode.")
+    parser.add_argument("--max-wait-ms", type=float, default=20.0, help="Max wait time in ms for GPU batch coalescing.")
     args = parser.parse_args(argv)
 
     if args.checkpoint:
@@ -1292,6 +1364,8 @@ def main(argv: list[str] | None = None) -> None:
             games=args.games,
             config=config,
             rng_seed=args.seed,
+            gpu_batch_size=args.gpu_batch_size,
+            max_wait_ms=args.max_wait_ms,
         )
     else:
         if model is not None:

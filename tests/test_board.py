@@ -24,6 +24,24 @@ def test_kiwipete_perft_depth_2() -> None:
     board = Board.from_fen("r3k2r/p1ppqpb1/bn2pnp1/2pPN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1")
     assert perft(board, 1) == 48
     assert perft(board, 2) == 1991
+    assert perft(board, 3) == 95321
+
+
+def test_perft_position_3() -> None:
+    """Endgame position with en passant and promotion edge cases."""
+    board = Board.from_fen("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1")
+    assert perft(board, 1) == 14
+    assert perft(board, 2) == 191
+    assert perft(board, 3) == 2812
+    assert perft(board, 4) == 43238
+
+
+def test_perft_position_5() -> None:
+    """Position with promotion, castling, and many tactical motifs."""
+    board = Board.from_fen("rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8")
+    assert perft(board, 1) == 44
+    assert perft(board, 2) == 1486
+    assert perft(board, 3) == 62379
 
 
 def test_en_passant_capture_removes_pawn() -> None:

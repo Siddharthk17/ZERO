@@ -6,7 +6,6 @@ import argparse
 import shlex
 import sys
 import threading
-import time
 from dataclasses import dataclass
 
 from .board import Board
@@ -15,6 +14,7 @@ from .move import Move
 
 @dataclass(slots=True)
 class UCIOptions:
+    """UCI engine options: simulations, CPuct, checkpoint path, and device."""
     simulations: int = 200
     cpuct: float = 1.5
     checkpoint: str | None = None
@@ -251,6 +251,7 @@ class UCIEngine:
         )
 
 def main(argv: list[str] | None = None) -> None:
+    """CLI entry point: start the UCI engine loop on stdin/stdout."""
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--checkpoint")
     parser.add_argument("--device", default="cpu")

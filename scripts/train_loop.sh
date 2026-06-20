@@ -16,16 +16,12 @@ while true; do
     fi
     
     # Run train.py and pass all CLI arguments through
-    if $CMD "$@"; then
-        echo "Training finished cleanly."
+    $CMD "$@"
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -eq 130 ] || [ $EXIT_CODE -eq 0 ]; then
+        echo "Training interrupted or completed cleanly (exit code $EXIT_CODE)."
         break
-    else
-        EXIT_CODE=$?
-        if [ $EXIT_CODE -eq 130 ] || [ $EXIT_CODE -eq 0 ]; then
-            echo "Training interrupted or completed cleanly (exit code $EXIT_CODE)."
-            break
-        fi
-        echo "Training process died with exit code $EXIT_CODE. Restarting in 5 seconds..."
-        sleep 5
     fi
+    echo "Training process died with exit code $EXIT_CODE. Restarting in 5 seconds..."
+    sleep 5
 done

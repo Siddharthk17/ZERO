@@ -70,6 +70,25 @@ def test_self_play_reward_shaping_helpers() -> None:
     assert exp.reward_bonus == pytest.approx(AGGRESSION_WEIGHT * 0.5 + MOMENTUM_REWARD + PANIC_PENALTY)
 
 
+def test_capture_record_includes_both_momentum_and_panic() -> None:
+    capture = Board.from_fen("4k3/8/8/8/3Q4/8/3p4/4K3 w - - 0 1")
+    move = next(m for m in capture.legal_moves() if m.uci() == "d4d2")
+    record = PositionRecord(
+        capture.fen(),
+        {move.uci(): 1.0},
+        capture.turn,
+        0.0,
+        _aggression_score(capture),
+        _momentum_reward(capture, move),
+        _panic_penalty(capture, move),
+    )
+    assert record.momentum_reward == MOMENTUM_REWARD
+    assert record.panic_penalty == PANIC_PENALTY
+    exp = _finalize([record], "1-0", __import__("random").Random(1), augment=False)[0]
+    assert exp.momentum_reward == MOMENTUM_REWARD
+    assert exp.panic_penalty == PANIC_PENALTY
+
+
 def test_uci_time_pressure_aggression() -> None:
     engine = UCIEngine()
     more_time = engine._time_to_use(["wtime", "80000", "btime", "40000", "winc", "1000", "binc", "1000"])

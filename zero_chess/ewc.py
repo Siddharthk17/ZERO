@@ -14,6 +14,7 @@ from .replay import PrioritizedReplayBuffer
 
 @dataclass(slots=True)
 class EWCConfig:
+    """Configuration for Elastic Weight Consolidation: penalty weight, sample and batch sizes."""
     lambda_: float = 0.1
     sample_size: int = 500
     batch_size: int = 32

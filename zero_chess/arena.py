@@ -9,14 +9,8 @@ from pathlib import Path
 
 from .board import Board
 from .constants import BLACK, WHITE
-from .elo import DEFAULT_ELO, update_rating, update_rating_from_result
+from .elo import DEFAULT_ELO, update_rating_from_result
 from .mcts import MCTS, NetworkEvaluator, UniformEvaluator
-
-def update_elo(elo_a: float, elo_b: float, score_a: float, games: int, k: float = 32.0) -> tuple[float, float]:
-    score = score_a / max(1, games)
-    new_elo_a, _ = update_rating(elo_a, elo_b, score, k * max(1, games))
-    new_elo_b, _ = update_rating(elo_b, elo_a, 1.0 - score, k * max(1, games))
-    return new_elo_a, new_elo_b
 
 def play_arena(
     evaluator_a,
@@ -29,6 +23,12 @@ def play_arena(
     elo_b: float = DEFAULT_ELO,
     log_path: str | None = "logs/arena.log",
 ) -> dict[str, float]:
+    """Play a series of games between two evaluators and return summary statistics.
+
+    Each evaluator plays half the games as White.  Results are logged as JSON lines
+    to ``log_path`` when provided.  Returns a dict with scores, win counts, draws,
+    a ``promote`` flag (>60% score), and updated Elo ratings.
+    """
     score_a = 0.0
     wins_a = wins_b = draws = 0
     current_elo_a = float(elo_a)
@@ -122,6 +122,7 @@ def _load_eval(path: str | None, device: str):
     return NetworkEvaluator(load_model(path, device), device)
 
 def main(argv: list[str] | None = None) -> None:
+    """CLI entry point: evaluate two checkpoints head-to-head."""
     parser = argparse.ArgumentParser(description="Evaluate two ZERO checkpoints.")
     parser.add_argument("--a", default="uniform")
     parser.add_argument("--b", default="uniform")

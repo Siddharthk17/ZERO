@@ -6,18 +6,19 @@ import math
 import random
 import time
 from dataclasses import dataclass, field
-from threading import Condition, Event, RLock, Thread
+from threading import Condition, Event, Thread
 from typing import Protocol
 
 from .board import Board
-from .constants import WHITE, BLACK
+from .constants import WHITE
 from .move import Move
-from .targets import DRAW_VALUE, apply_contempt, opponent_value
+from .targets import apply_contempt, opponent_value
 
 VIRTUAL_LOSS_VALUE = 3.0
 VIRTUAL_LOSS_VISITS = 3
 
 class Evaluator(Protocol):
+    """Protocol for batch position evaluators returning priors, value, and uncertainty."""
     def evaluate_batch(self, boards: list[Board]) -> list[tuple[dict[Move, float], float, float]]:
         """Return ``(legal_priors, value, uncertainty)`` for each board."""
 
@@ -39,18 +40,22 @@ class UniformEvaluator:
         return out
 
 class NetworkEvaluator:
-    """Synchronous model evaluator utilizing local thread locks."""
+    """Synchronous model evaluator with lock-free forward pass.
+    
+    In eval mode, concurrent model invocations are safe because:
+    - Parameters are read-only (no gradients)
+    - CUDA default stream serializes kernel launches
+    - Board encoding is stateless (no shared state)
+    """
 
     def __init__(self, model, device: str = "cpu") -> None:
         self.model = model
         self.device = device
-        self._lock = RLock()
         if hasattr(self.model, "eval"):
             self.model.eval()
 
     def evaluate_batch(self, boards: list[Board]) -> list[tuple[dict[Move, float], float, float]]:
-        with self._lock:
-            return self.model.evaluate_batch(boards, self.device)
+        return self.model.evaluate_batch(boards, self.device)
 
 @dataclass(slots=True)
 class _EvalRequest:
@@ -97,8 +102,13 @@ class SharedBatchEvaluator:
         return request.results or []
 
     def close(self) -> None:
+        """Signal shutdown and wake all pending requests to prevent threads from hanging."""
         with self._condition:
             self._closed = True
+            for request in self._queue:
+                request.error = RuntimeError("SharedBatchEvaluator closed")
+                request.done.set()
+            self._queue.clear()
             self._condition.notify_all()
 
     @property
@@ -162,6 +172,7 @@ class SharedBatchEvaluator:
 
 @dataclass(slots=True)
 class Node:
+    """A node in the MCTS search tree tracking visits, values, priors, and children."""
     prior_probability: float = 0.0
     visit_count: int = 0
     total_value: float = 0.0
@@ -208,6 +219,7 @@ class Node:
 
 @dataclass(slots=True)
 class SearchResult:
+    """Result of an MCTS search: selected move, visit counts, root node, and resignation flag."""
     move: Move | None
     visits: dict[Move, int]
     root: Node
@@ -398,8 +410,6 @@ class MCTS:
                 path.append(node)
             terminal = sim_board.result_value(sim_board.turn)
             if terminal is not None:
-                if terminal == DRAW_VALUE:
-                    terminal = DRAW_VALUE
                 terminals.append((path, terminal))
             else:
                 for n in path:

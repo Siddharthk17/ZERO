@@ -16,10 +16,10 @@ from zero_chess.elo import DEFAULT_ELO, update_rating_with_reason
 from zero_chess.mcts import NetworkEvaluator, UniformEvaluator
 from zero_chess.replay import PrioritizedReplayBuffer
 from zero_chess.self_play import (
-    SelfPlayConfig, 
-    generate_parallel_games, 
+    SelfPlayConfig,
+    _append_training_game_history,
+    generate_multiprocess_games,
     start_persistent_cuda_training,
-    _append_training_game_history
 )
 
 VERSION = "1.2.8.7"
@@ -28,17 +28,29 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume")
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
-    parser.add_argument("--games_per_iteration", type=int, default=2)  # Balanced CPU loading for 8GB RAM
-    parser.add_argument("--self_play_simulations", type=int)
-    parser.add_argument("--mcts_batch_size", type=int)
-    parser.add_argument("--gpu_eval_batch_size", type=int, default=64)  # Optimized batch size for GA107
-    parser.add_argument("--training_batch_size", type=int, default=128)  # Blazing fast gradient step size
-    parser.add_argument("--updates_per_game", type=float, default=1.0)
-    parser.add_argument("--max_plies", type=int, default=256)
-    parser.add_argument("--cuda_memory_fraction", type=float, default=0.40)  # Leaves 60% VRAM free for Hyprland
-    parser.add_argument("--gpu_cooldown_ms", type=float, default=0.0)  # Low temp threshold on Victus cooling
-    parser.add_argument("--compile_model", action="store_true")
-    parser.add_argument("--reuse_tree", action="store_true", default=True)  # Enabled by default for +80 ELO warm start
+    parser.add_argument("--games_per_iteration", type=int, default=16, help="Parallel game processes")
+    parser.add_argument("--self_play_simulations", type=int, default=200)
+    parser.add_argument("--mcts_batch_size", type=int, default=48)
+    parser.add_argument("--training_batch_size", type=int, default=1024)
+    parser.add_argument("--updates_per_game", type=float, default=20)
+    parser.add_argument("--max_plies", type=int, default=512)
+    parser.add_argument("--cuda_memory_fraction", type=float, default=0.90)
+    parser.add_argument("--compile_model", action="store_true", default=False)
+    parser.add_argument("--reuse_tree", action="store_true", default=True)
+    parser.add_argument("--gpu_batch_size", type=int, default=192)
+    parser.add_argument("--max_wait_ms", type=float, default=20.0)
+    parser.add_argument("--channels", type=int, default=384)
+    parser.add_argument("--blocks", type=int, default=20)
+    parser.add_argument("--attention_heads", type=int, default=8)
+    parser.add_argument("--policy_channels", type=int, default=64)
+    parser.add_argument("--resign_value", type=float, default=-0.99)
+    parser.add_argument("--enable-resign", action="store_true", default=False, help="Enable resignation during self-play (default: disabled for full-game learning)")
+    parser.add_argument("--temperature_moves", type=int, default=30)
+    parser.add_argument("--opening_random_plies", type=int, default=8)
+    parser.add_argument("--opening_random_prob", type=float, default=0.5)
+    parser.add_argument("--max_iterations", type=int, default=0, help="Stop after this many iterations (0 = unlimited).")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for self-play generation.")
+    parser.add_argument("--persistent", action="store_true", default=False, help="Use persistent multiprocess workers instead of spawning per iteration.")
     args = parser.parse_args()
 
     stop = {"value": False}
@@ -54,6 +66,9 @@ def main() -> None:
         import torch
     except ImportError:
         print("PyTorch not installed; running bootstrap self-play only. Install requirements for gradient training.", flush=True)
+        from zero_chess.self_play import _query_memory_utilization, play_game
+        from zero_chess.mcts import MCTS
+
         replay = PrioritizedReplayBuffer(cold_path="data/replay_cold.sqlite3")
         print("Device: CPU bootstrap")
         print("Model parameters: 0")
@@ -61,7 +76,6 @@ def main() -> None:
         iteration = 0
         while not stop["value"]:
             # Memory Guard: if ram_avail < 512MB, pause game generation, call gc.collect()
-            from zero_chess.self_play import _query_memory_utilization
             _, _, ram_avail, _, _ = _query_memory_utilization()
             if ram_avail < 512:
                 print(f"WARNING: Low memory detected ({ram_avail}MB available). Pausing game generation and clearing caches...", flush=True)
@@ -76,7 +90,13 @@ def main() -> None:
                     break
                 print(f"Memory recovered ({ram_avail}MB available). Resuming game generation.", flush=True)
 
-            games = generate_parallel_games(UniformEvaluator(), args.games_per_iteration, SelfPlayConfig(simulations=1, max_plies=128))
+            bootstrap_rng = __import__("random").Random()
+            bootstrap_games = []
+            for _ in range(args.games_per_iteration):
+                mcts = MCTS(UniformEvaluator(), batch_size=24, simulations=1)
+                bootstrap_games.append(play_game(mcts, SelfPlayConfig(simulations=1, max_plies=128), bootstrap_rng))
+                mcts.reset()
+            games = bootstrap_games
             for game_idx, (result, experiences, sans, reason, meta) in enumerate(games):
                 replay.extend(experiences)
                 _append_training_game_history(
@@ -111,16 +131,16 @@ def main() -> None:
     from zero_chess.ema import EMATeacher
     from zero_chess.ewc import ElasticWeightConsolidation
     from zero_chess.model import ModelConfig, ZeroNet, load_model
+    from zero_chess.self_play import _query_memory_utilization
     from zero_chess.training import ContinuousLRScheduler, TrainConfig, TrainingLogger, make_optimizer, train_step
 
     device = resolve_device(args.device, torch)
     configure_torch_for_speed(device, torch)
     print_device(device, torch)
-    replay = PrioritizedReplayBuffer(cold_path="data/replay_cold.sqlite3")
-    checkpoint_manager = CheckpointManager("checkpoints")
     iteration = 0
     train_updates = 0
     elo = DEFAULT_ELO
+    payload = {}
 
     if args.resume:
         payload = torch.load(args.resume, map_location=device)
@@ -130,82 +150,93 @@ def main() -> None:
         elo = float(payload.get("elo", DEFAULT_ELO))
         print(f"Loaded checkpoint: {args.resume}")
     else:
-        model = ZeroNet(ModelConfig()).to(device)
+        model = ZeroNet(ModelConfig(
+            channels=args.channels,
+            blocks=args.blocks,
+            attention_heads=args.attention_heads,
+            policy_channels=args.policy_channels,
+        )).to(device)
         print("Initialized fresh random weights")
 
     config = TrainConfig(batch_size=args.training_batch_size, device=device)
-    mcts_batch_size = args.mcts_batch_size or (4 if device == "cpu" else 24)
-    self_play_simulations = args.self_play_simulations or (8 if device == "cpu" else 96)
+    mcts_batch_size = args.mcts_batch_size
+    self_play_simulations = args.self_play_simulations
     print(f"Model parameters: {model.parameter_count():,}")
-    print(f"Replay buffer size: {len(replay)}")
     print(f"Generation: {iteration}")
     print(f"Self-play games/iteration: {args.games_per_iteration}")
     print(f"MCTS simulations/move: {self_play_simulations}")
     print(f"MCTS leaf batch size: {mcts_batch_size}")
     print(f"Optimizer updates/game: {args.updates_per_game:g}")
     if device == "cuda":
-        print(f"Multiprocessing CPU workers: {args.games_per_iteration}")
-        print("Dedicated trainer process: enabled")
-        print(f"GPU evaluator batch target: {args.gpu_eval_batch_size}")
-        print("GPU evaluator timeout: 50ms")
+        print(f"Multiprocess workers (worker-side encoding): {args.games_per_iteration}")
+        print(f"GPU evaluator batch size: {args.gpu_batch_size}")
         print(f"CUDA memory fraction: {args.cuda_memory_fraction:.2f}")
-        print(f"GPU cooldown per eval batch: {args.gpu_cooldown_ms:g}ms")
-        print(f"torch.compile evaluator: {'enabled' if args.compile_model else 'disabled'}")
         print(f"MCTS tree reuse: {'enabled' if args.reuse_tree else 'disabled'}")
     print(f"Estimated ELO: {elo:.1f}", flush=True)
 
-    if device == "cuda":
-        model.cpu()
+    if args.persistent:
+        self_play_config = SelfPlayConfig(
+            simulations=self_play_simulations,
+            batch_size=mcts_batch_size,
+            generation=iteration,
+            max_plies=args.max_plies,
+            reuse_tree=args.reuse_tree,
+            resign_value=args.resign_value,
+            disable_resign=not args.enable_resign,
+            temperature_moves=args.temperature_moves,
+            opening_random_plies=args.opening_random_plies,
+            opening_random_prob=args.opening_random_prob,
+        )
         runtime = start_persistent_cuda_training(
             model,
             config,
             games=args.games_per_iteration,
-            self_play_config=SelfPlayConfig(
-                simulations=self_play_simulations,
-                batch_size=mcts_batch_size,
-                generation=iteration,
-                max_plies=args.max_plies,
-                reuse_tree=args.reuse_tree,
-            ),
+            self_play_config=self_play_config,
             device=device,
-            gpu_batch_size=args.gpu_eval_batch_size,
-            eval_wait_ms=10.0,
+            gpu_batch_size=args.gpu_batch_size,
+            eval_wait_ms=args.max_wait_ms,
             cuda_memory_fraction=args.cuda_memory_fraction,
-            gpu_cooldown_ms=args.gpu_cooldown_ms,
             compile_model=args.compile_model,
             updates_per_game=args.updates_per_game,
             iteration=iteration,
             train_updates=train_updates,
             elo=elo,
         )
-        try:
+        print("Started persistent CUDA training runtime.", flush=True)
+        with runtime:
             while not stop["value"]:
-                time.sleep(1.0)
-                dead = [process for process in runtime.processes if process.exitcode not in (None, 0)]
-                if dead:
-                    for process in dead:
-                        print(f"runtime process exited: pid={process.pid} exitcode={process.exitcode}", flush=True)
-                    stop["value"] = True
-        finally:
-            runtime.stop()
-            print("Stopped CUDA multiprocessing runtime", flush=True)
+                if args.max_iterations > 0 and runtime.generation_value.value >= args.max_iterations:
+                    print(f"Reached max_iterations={args.max_iterations}; stopping persistent runtime.", flush=True)
+                    break
+                time.sleep(2.0)
         return
+
+    replay = PrioritizedReplayBuffer(cold_path="data/replay_cold.sqlite3")
+    checkpoint_manager = CheckpointManager("checkpoints")
+    print(f"Replay buffer size: {len(replay)}")
 
     teacher = EMATeacher(model)
     optimizer = make_optimizer(model, config)
-    scheduler = ContinuousLRScheduler(optimizer)
+    if "optimizer" in payload:
+        try:
+            optimizer.load_state_dict(payload["optimizer"])
+            print("Loaded optimizer state")
+        except Exception as opt_exc:
+            print(f"Could not load optimizer state: {opt_exc}", flush=True)
+    scheduler = ContinuousLRScheduler(optimizer, config.initial_lr, config.continuous_lr)
     ewc = ElasticWeightConsolidation()
     logger = TrainingLogger("logs/training.log")
-    scaler = torch.amp.GradScaler("cuda", enabled=device == "cuda")
-    self_play_evaluator = NetworkEvaluator(teacher.teacher, device)
+    use_bf16 = device == "cuda" and torch.cuda.is_bf16_supported()
+    needs_scaler = device == "cuda" and not use_bf16
+    scaler = torch.amp.GradScaler("cuda", enabled=needs_scaler)
 
+    last_checkpoint_iter = -1
     try:
         while not stop["value"]:
             # Memory Guard: if ram_avail < 512MB, pause game generation, call gc.collect()
-            from zero_chess.self_play import _query_memory_utilization
             _, _, ram_avail, _, _ = _query_memory_utilization()
             if ram_avail < 512:
-                print(f"WARNING: Low memory detected ({ram_avail}MB available). Pausing game generation and clearing caches...", flush=True)
+                print(f"WARNING: Low memory detected ({ram_avail}MB available). Pausing game generation...", flush=True)
                 import gc
                 gc.collect()
                 try:
@@ -220,7 +251,7 @@ def main() -> None:
                     time.sleep(5.0)
                 if stop["value"]:
                     break
-                print(f"Memory recovered ({ram_avail}MB available). Resuming game generation.", flush=True)
+                print(f"Memory recovered ({ram_avail}MB available). Resuming.", flush=True)
 
             iteration += 1
             self_play_config = SelfPlayConfig(
@@ -229,11 +260,22 @@ def main() -> None:
                 generation=iteration,
                 max_plies=args.max_plies,
                 reuse_tree=args.reuse_tree,
+                resign_value=args.resign_value,
+                disable_resign=not args.enable_resign,
+                temperature_moves=args.temperature_moves,
+                opening_random_plies=args.opening_random_plies,
+                opening_random_prob=args.opening_random_prob,
             )
-            games = generate_parallel_games(
-                self_play_evaluator,
-                args.games_per_iteration,
-                self_play_config,
+
+            eval_model = teacher.teacher
+            games = generate_multiprocess_games(
+                eval_model,
+                device=device,
+                games=args.games_per_iteration,
+                config=self_play_config,
+                rng_seed=args.seed,
+                gpu_batch_size=args.gpu_batch_size,
+                max_wait_ms=args.max_wait_ms,
             )
             
             metrics = {"loss": 0.0, "replay_size": float(len(replay)), "lr": optimizer.param_groups[0]["lr"]}
@@ -243,7 +285,7 @@ def main() -> None:
                 for _ in range(update_count):
                     train_updates += 1
                     updates_this_iteration += 1
-                    metrics = train_step(
+                    metrics, scaler = train_step(
                         model,
                         optimizer,
                         replay,
@@ -262,8 +304,8 @@ def main() -> None:
                 rated_side = WHITE if (iteration + game_idx) % 2 else BLACK
                 elo, elo_delta = update_rating_with_reason(elo, result, rated_side, reason)
                 print(
-                    f"rated game result={result} side={'white' if rated_side == WHITE else 'black'} "
-                    f"elo={elo:.1f} elo_delta={elo_delta:+.1f}",
+                    f"[GAME #{iteration:05d}-{game_idx}] result={result} side={'white' if rated_side == WHITE else 'black'} "
+                    f"elo={elo:.1f} ({elo_delta:+.1f}) plies={len(sans)} reason={reason} duration={meta['duration']:.1f}s",
                     flush=True,
                 )
                 _append_training_game_history(
@@ -284,41 +326,49 @@ def main() -> None:
                     NetworkEvaluator(model, device),
                     NetworkEvaluator(teacher.teacher, device),
                     games=40,
-                    simulations=8 if device == "cpu" else 800,
+                    simulations=800,
                     iteration=iteration,
                     elo_a=elo,
                 )
                 elo = float(arena["elo_a"])
                 if arena["promote"]:
                     teacher.promote(model)
-                    print(f"promoted teacher at iteration {iteration}", flush=True)
+                    print(f"[ARENA] promoted teacher at iteration {iteration}", flush=True)
 
             if iteration % 50 == 0 and len(replay) > 0:
                 ewc.consolidate(model, replay, device=device)
 
-            metrics["elo"] = float(elo)
-            checkpoint_manager.save(model, iteration, elo, optimizer.state_dict(), metrics)
+            if iteration != last_checkpoint_iter:
+                metrics["elo"] = float(elo)
+                checkpoint_manager.save(model, iteration, elo, optimizer.state_dict(), metrics)
+                last_checkpoint_iter = iteration
 
-            batch_stats = ""
             print(
-                f"iteration={iteration} replay={len(replay)} loss={metrics.get('loss', 0.0):.4f} "
-                f"updates={updates_this_iteration} lr={metrics.get('lr', 0.0):.6g}{batch_stats}",
+                f"[ITER {iteration}] replay={len(replay):,} loss={metrics.get('loss', 0.0):.4f} "
+                f"updates={updates_this_iteration} lr={metrics.get('lr', 0.0):.6g}",
                 flush=True,
             )
 
-            # Explicitly clear variables from the current game/iteration to prevent leaks
+            if args.max_iterations > 0 and iteration >= args.max_iterations:
+                print(f"Reached max_iterations={args.max_iterations}; stopping gracefully.", flush=True)
+                break
+
             try:
-                del games
-                del metrics
+                del games, metrics
             except NameError:
                 pass
             import gc
             gc.collect()
+            if device == "cuda":
+                torch.cuda.empty_cache()
     finally:
-        Path("data").mkdir(exist_ok=True)
-        replay.save("data/replay.pkl")
-        checkpoint_manager.save(model, iteration, elo, optimizer.state_dict(), {"interrupted": 1.0, "elo": float(elo)})
-        print(f"Saved checkpoint at iteration {iteration}", flush=True)
+        try:
+            Path("data").mkdir(exist_ok=True)
+            replay.save("data/replay.pkl")
+            checkpoint_manager.save(model, iteration, elo, optimizer.state_dict(), {"interrupted": 1.0, "elo": float(elo)})
+            print(f"[SAVE] Checkpoint at iteration {iteration}", flush=True)
+        except Exception as save_exc:
+            print(f"[SAVE] Error during emergency save: {save_exc}", flush=True)
 
 def resolve_device(requested: str, torch_module) -> str:
     if requested == "cuda" and torch_module.cuda.is_available():
@@ -344,10 +394,16 @@ def configure_torch_for_speed(device: str, torch_module) -> None:
         torch_module.backends.cuda.enable_flash_sdp(True)
         torch_module.backends.cuda.enable_mem_efficient_sdp(True)
         torch_module.backends.cuda.enable_math_sdp(True)
+    if torch_module.cuda.get_device_capability() >= (8, 0):
+        try:
+            torch_module._inductor.config.conv_benchmark = True
+        except AttributeError:
+            pass
 
 def print_header() -> None:
-    print(
-        r"""
+    try:
+        print(
+            r"""
 ███████╗███████╗██████╗  ██████╗ 
 ╚══███╔╝██╔════╝██╔══██╗██╔═══██╗
   ███╔╝ █████╗  ██████╔╝██║   ██║
@@ -355,7 +411,9 @@ def print_header() -> None:
 ███████╗███████╗██║  ██║╚██████╔╝
 ╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝
 """.strip()
-    )
+        )
+    except UnicodeEncodeError:
+        print("")
     print(f"ZERO {VERSION}", flush=True)
 
 if __name__ == "__main__":

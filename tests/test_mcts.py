@@ -94,19 +94,20 @@ def test_collect_eval_requests_batch_constraints() -> None:
     import queue
     import threading
     import time
-    from zero_chess.self_play import _collect_eval_requests
+    import torch
+    from zero_chess.self_play import _collect_eval_requests_nonblocking
 
-    # Mock queue and active_workers
     req_queue = queue.Queue()
-    active_workers = [True, True]
+    board = Board()
+    tensor = torch.zeros(1, 119, 8, 8)
+    mask = torch.zeros(1, 4672)
 
     # Worker 0 submits a request immediately
-    board = Board()
-    req_queue.put(("eval", 0, 100, [board]))
+    req_queue.put(("eval", 0, 100, (tensor, mask)))
 
     collected = []
     def run_collector():
-        res = _collect_eval_requests(req_queue, gpu_batch_size=32, wait_seconds=0.05, active_workers=active_workers)
+        res = _collect_eval_requests_nonblocking(req_queue, gpu_batch_size=32, wait_seconds=0.05)
         collected.append(res)
 
     t = threading.Thread(target=run_collector)
@@ -116,21 +117,13 @@ def test_collect_eval_requests_batch_constraints() -> None:
     time.sleep(0.02)
     assert len(collected) == 0
 
-    # Wait another 40ms (total 60ms, > 50ms deadline).
-    # Since worker 1 hasn't submitted, collector should still be waiting.
+    # Wait until after the deadline; collector should return the one request it has
     time.sleep(0.04)
-    assert len(collected) == 0
-
-    # Now worker 1 submits a request
-    req_queue.put(("eval", 1, 101, [board]))
-
-    # Now the collector should finish and return both requests
     t.join(timeout=1.0)
     assert len(collected) == 1
     res = collected[0]
-    assert len(res) == 2
+    assert len(res) == 1
     assert res[0][1] == 0
-    assert res[1][1] == 1
 
 
 def test_reset_large_tree_does_not_overflow_recursion_limit() -> None:
@@ -149,4 +142,16 @@ def test_reset_large_tree_does_not_overflow_recursion_limit() -> None:
     # This should clear successfully without RecursionError
     mcts.reset()
     assert len(mcts.root.children) == 0
+
+
+def test_mcts_resign_threshold_is_respected() -> None:
+    from zero_chess.self_play import SelfPlayConfig, _make_mcts
+
+    config = SelfPlayConfig(disable_resign=False, resign_value=-0.5, simulations=1)
+    mcts = _make_mcts(UniformEvaluator(), config)
+    assert mcts.resign_threshold == -0.5
+
+    config_disabled = SelfPlayConfig(disable_resign=True, resign_value=-0.5, simulations=1)
+    mcts_disabled = _make_mcts(UniformEvaluator(), config_disabled)
+    assert mcts_disabled.resign_threshold == -1.0
 

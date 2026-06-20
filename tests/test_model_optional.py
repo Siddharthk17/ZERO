@@ -39,3 +39,16 @@ def test_tower_block_pattern() -> None:
     assert isinstance(model.tower[2], TransformerBlock)
     assert isinstance(model.tower[5], TransformerBlock)
     assert model.parameter_count() > 0
+
+
+def test_model_evaluate_batch_on_cuda_if_available() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    model = ZeroNet(ModelConfig(channels=32, blocks=2, attention_heads=2, policy_channels=8)).cuda()
+    boards = [Board.starting_position(), Board.from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1")]
+    out = model.evaluate_batch(boards, device="cuda")
+    assert len(out) == 2
+    for priors, value, uncertainty in out:
+        assert priors
+        assert -31.0 <= value <= 1.0
+        assert uncertainty >= 0.0

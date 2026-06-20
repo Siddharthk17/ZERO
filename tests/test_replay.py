@@ -35,3 +35,16 @@ def test_hot_overflow_writes_cold_tier(tmp_path) -> None:
     assert len(replay) == 3
     batch = replay.sample_with_weights(4)
     assert batch.experiences
+
+
+def test_sampling_is_detinistic_with_seed() -> None:
+    import random
+    replay = PrioritizedReplayBuffer(hot_capacity=32, rng=random.Random(12345))
+    for _ in range(32):
+        replay.add(make_exp())
+    a = [e.fen for e in replay.sample(8)]
+    replay2 = PrioritizedReplayBuffer(hot_capacity=32, rng=random.Random(12345))
+    for _ in range(32):
+        replay2.add(make_exp())
+    b = [e.fen for e in replay2.sample(8)]
+    assert a == b

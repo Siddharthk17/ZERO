@@ -14,8 +14,7 @@ from torch.nn import functional as F
 
 from .board import Board
 from .constants import WHITE, BLACK
-from .encoding import POLICY_SIZE, encode_board, encode_move_mask, move_to_policy_index
-from .ema import update_ema_teacher
+from .encoding import POLICY_SIZE, encode_board, encode_boards, encode_move_mask, move_to_policy_index
 from .ewc import ElasticWeightConsolidation
 from .model import ModelConfig, ZeroNet, load_model, parameter_count, save_model
 from .move import Move
@@ -23,16 +22,17 @@ from .replay import Experience, PrioritizedReplayBuffer
 
 @dataclass(slots=True)
 class TrainConfig:
-    batch_size: int = 128  # Highly stable, memory-safe batch size for 8GB system RAM
-    initial_lr: float = 1e-3
-    continuous_lr: float = 3e-5
+    """Hyperparameters for the training loop: batch size, learning rates, loss weights, and device."""
+    batch_size: int = 2048  # 128GB RAM + Blackwell: massive batches
+    initial_lr: float = 2e-3  # Higher LR for larger batches
+    continuous_lr: float = 1e-4
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
     td_lambda: float = 0.7
     value_weight: float = 1.0
     wdl_weight: float = 1.0
     ewc_weight: float = 1.0
-    aux_weight: float = 0.1
+    aux_weight: float = 0.3  # Increased auxiliary focus
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     mixed_precision: bool = True
     log_path: str = "logs/training.log"
@@ -44,18 +44,18 @@ class ContinuousLRScheduler:
         self.optimizer = optimizer
         self.initial_lr = initial_lr
         self.final_lr = final_lr
-        self.cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500, eta_min=final_lr)
 
     def step(self, iteration: int) -> float:
+        """Set the optimizer learning rate for the given iteration and return it."""
         lr = self.lr_at(iteration)
         for group in self.optimizer.param_groups:
             group["lr"] = lr
         return lr
 
     def lr_at(self, iteration: int) -> float:
+        """Return the learning rate at the given iteration using cosine annealing."""
         if iteration >= 500:
             return self.final_lr
-        import math
         return self.final_lr + 0.5 * (self.initial_lr - self.final_lr) * (1.0 + math.cos(math.pi * iteration / 500.0))
 
 class TrainingLogger:
@@ -84,14 +84,22 @@ class TrainingLogger:
         return payload
 
 def make_optimizer(model: torch.nn.Module, config: TrainConfig) -> torch.optim.Optimizer:
-    """Instantiate a fused or regular AdamW optimizer based on hardware capabilities."""
-    kwargs = {}
-    if str(config.device).startswith("cuda"):
-        kwargs["fused"] = True
+    """Instantiate a fused AdamW optimizer for Blackwell maximum throughput."""
     try:
-        return torch.optim.AdamW(model.parameters(), lr=config.initial_lr, weight_decay=config.weight_decay, **kwargs)
+        return torch.optim.AdamW(
+            model.parameters(),
+            lr=config.initial_lr,
+            weight_decay=config.weight_decay,
+            fused=True,
+            betas=(0.9, 0.95),
+        )
     except (RuntimeError, TypeError):
-        return torch.optim.AdamW(model.parameters(), lr=config.initial_lr, weight_decay=config.weight_decay)
+        return torch.optim.AdamW(
+            model.parameters(),
+            lr=config.initial_lr,
+            weight_decay=config.weight_decay,
+            betas=(0.9, 0.95),
+        )
 
 def train_step(
     model: ZeroNet,
@@ -103,67 +111,77 @@ def train_step(
     scheduler: ContinuousLRScheduler | None = None,
     scaler: torch.amp.GradScaler | None = None,
     logger: TrainingLogger | None = None,
-) -> dict[str, float]:
-    """Execute a single, high-speed gradient backpropagation step."""
+) -> tuple[dict[str, float], torch.amp.GradScaler]:
+    """Execute a single, high-speed gradient backpropagation step.
+
+    Returns the metrics dictionary and the ``GradScaler`` used (creating one if
+    none was supplied so callers can reuse it across iterations).
+    """
     model.train()
     beta = replay.anneal_beta(iteration)
     batch = replay.sample_with_weights(config.batch_size, beta=beta)
-    
-    tensors = []
-    masks = []
-    policy_targets = []
+
+    device_type = "cuda" if str(config.device).startswith("cuda") else "cpu"
+    use_pinned = device_type == "cuda"
+
+    boards = [Board.from_fen(exp.fen) for exp in batch.experiences]
+    legal_moves = [board.legal_moves() for board in boards]
+
+    x = encode_boards(boards, device="cpu")
+    mask = torch.stack([encode_move_mask(legal, board, device="cpu") for board, legal in zip(boards, legal_moves, strict=True)])
+    policy_target = torch.stack([_policy_from_exp(board, exp, legal) for board, exp, legal in zip(boards, batch.experiences, legal_moves, strict=True)])
+
     value_targets = []
     wdl_targets = []
     material_targets = []
     mobility_targets = []
     king_targets = []
-
-    for exp in batch.experiences:
-        board = Board.from_fen(exp.fen)
-        legal = board.legal_moves()
-        tensors.append(encode_board(board, device=config.device))
-        masks.append(encode_move_mask(legal, board, device=config.device))
-        policy_targets.append(_policy_from_exp(board, exp, config.device))
-        
-        # Clamp value targets to [-31.0, 1.0] matching the custom aggressive RL bounds
+    for exp, board, legal in zip(batch.experiences, boards, legal_moves, strict=True):
         raw_target = td_blended_target(exp.value, exp.td_value, config.td_lambda) + exp.reward_bonus
         value_targets.append(max(-31.0, min(1.0, raw_target)))
-        
         wdl_targets.append(exp.wdl)
-        
-        material, mobility, king_safety = _auxiliary_targets(board)
+        material, mobility, king_safety = _auxiliary_targets(board, legal)
         material_targets.append(material)
         mobility_targets.append(mobility)
         king_targets.append(king_safety)
 
-    x = torch.stack(tensors)
-    mask = torch.stack(masks)
-    policy_target = torch.stack(policy_targets)
-    value_target = torch.tensor(value_targets, dtype=torch.float32, device=config.device)
-    wdl_target = torch.tensor(wdl_targets, dtype=torch.float32, device=config.device)
-    sample_weights = torch.tensor(batch.weights, dtype=torch.float32, device=config.device)
-    material_target = torch.tensor(material_targets, dtype=torch.float32, device=config.device)
-    mobility_target = torch.tensor(mobility_targets, dtype=torch.float32, device=config.device)
-    king_target = torch.tensor(king_targets, dtype=torch.float32, device=config.device)
+    value_target = torch.tensor(value_targets, dtype=torch.float32)
+    wdl_target = torch.tensor(wdl_targets, dtype=torch.float32)
+    sample_weights = torch.tensor(batch.weights, dtype=torch.float32)
+    material_target = torch.tensor(material_targets, dtype=torch.float32)
+    mobility_target = torch.tensor(mobility_targets, dtype=torch.float32)
+    king_target = torch.tensor(king_targets, dtype=torch.float32)
+
+    if use_pinned:
+        x = x.pin_memory().to(config.device, non_blocking=True)
+        mask = mask.pin_memory().to(config.device, non_blocking=True)
+        policy_target = policy_target.pin_memory().to(config.device, non_blocking=True)
+        scalar_transfer = [t.pin_memory().to(config.device, non_blocking=True) for t in
+                           (value_target, wdl_target, sample_weights, material_target, mobility_target, king_target)]
+        value_target, wdl_target, sample_weights, material_target, mobility_target, king_target = scalar_transfer
+    else:
+        x, mask, policy_target = x.to(config.device), mask.to(config.device), policy_target.to(config.device)
+        value_target = value_target.to(config.device)
+        wdl_target = wdl_target.to(config.device)
+        sample_weights = sample_weights.to(config.device)
+        material_target = material_target.to(config.device)
+        mobility_target = mobility_target.to(config.device)
+        king_target = king_target.to(config.device)
 
     optimizer.zero_grad(set_to_none=True)
     device_type = "cuda" if str(config.device).startswith("cuda") else "cpu"
     use_amp = config.mixed_precision and device_type == "cuda"
     
-    is_bf16 = False
-    if device_type == "cuda":
-        try:
-            is_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-        except Exception:
-            pass
-            
+    is_bf16 = device_type == "cuda" and torch.cuda.is_bf16_supported()
     amp_dtype = torch.bfloat16 if (is_bf16 or device_type == "cpu") else torch.float16
     
     if scaler is None:
+        # Only fp16 autocast requires gradient scaling; bf16 has fp32 exponent range.
+        needs_scaler = use_amp and amp_dtype == torch.float16
         if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
-            scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+            scaler = torch.amp.GradScaler("cuda", enabled=needs_scaler)
         else:
-            scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+            scaler = torch.cuda.amp.GradScaler(enabled=needs_scaler)
 
     with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
         out = model(x, mask, return_dict=True)
@@ -205,9 +223,13 @@ def train_step(
     loss_val = float(loss.detach().cpu())
     grad_norm_before = torch.zeros((), device=config.device)
 
-    if loss_val > 2000.0:
+    if not math.isfinite(loss_val) or loss_val > 2000.0:
         import warnings
-        warnings.warn(f"Loss sanity check failed: loss = {loss_val:.4f} > 2000.0. Skipping optimizer step and replay buffer priority update to prevent weight corruption.")
+        warnings.warn(
+            f"Loss sanity check failed: loss = {loss_val:.4f}. Skipping optimizer step and replay buffer priority update to prevent weight corruption.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         optimizer.zero_grad(set_to_none=True)
     else:
         scaler.scale(loss).backward()
@@ -242,18 +264,19 @@ def train_step(
     }
     if logger is not None:
         metrics = logger.log(metrics)
-    return metrics
+    return metrics, scaler
 
 def td_blended_target(outcome: float, bootstrap: float, lambda_td: float = 0.7) -> float:
     """Weight the terminal result and the bootstrapped TD reward prediction."""
     return lambda_td * outcome + (1.0 - lambda_td) * bootstrap
 
-def _policy_from_exp(board: Board, exp: Experience, device: str) -> torch.Tensor:
-    """Format experience probabilities into the target policy vector shape."""
-    target = torch.zeros(POLICY_SIZE, dtype=torch.float32, device=device)
+def _policy_from_exp(board: Board, exp: Experience, legal: list[Move] | None = None) -> torch.Tensor:
+    """Format experience probabilities into the target policy vector shape (CPU tensor)."""
+    target = torch.zeros(POLICY_SIZE, dtype=torch.float32)
     total = sum(exp.policy.values())
     if total <= 0:
-        legal = board.legal_moves()
+        if legal is None:
+            legal = board.legal_moves()
         if legal:
             prob = 1.0 / len(legal)
             for move in legal:
@@ -264,28 +287,33 @@ def _policy_from_exp(board: Board, exp: Experience, device: str) -> torch.Tensor
         target[move_to_policy_index(board, move)] = float(prob) / total
     return target
 
-def _auxiliary_targets(board: Board) -> tuple[float, float, float]:
+_PIECE_VALUES = {"P": 1, "N": 3, "B": 3, "R": 5, "Q": 9, "p": -1, "n": -3, "b": -3, "r": -5, "q": -9}
+_MAX_MATERIAL = 39.0
+_MAX_MOBILITY = 218.0
+
+def _auxiliary_targets(board: Board, legal: list[Move] | None = None) -> tuple[float, float, float]:
     """Calculate material balance, move mobility, and king safety auxiliary targets."""
-    values = {"P": 1, "N": 3, "B": 3, "R": 5, "Q": 9, "p": -1, "n": -3, "b": -3, "r": -5, "q": -9}
     own = opp = 0
     squares = board.squares
     turn = board.turn
-    
+
     for piece in squares:
         if piece == "." or piece == "K" or piece == "k":
             continue
-        val = values[piece.upper()]
+        val = _PIECE_VALUES[piece.upper()]
         if (piece.isupper() and turn == WHITE) or (piece.islower() and turn == BLACK):
             own += val
         else:
             opp += val
-            
-    material = (own - opp) / 39.0
-    mobility = len(board.legal_moves()) / 218.0
+
+    material = (own - opp) / _MAX_MATERIAL
+    move_count = len(legal) if legal is not None else len(board.legal_moves())
+    mobility = move_count / _MAX_MOBILITY
     king_safety = 0.0 if board.is_check(board.turn) else 1.0
     return material, mobility, king_safety
 
 def main(argv: list[str] | None = None) -> None:
+    """CLI entry point: run one training step from a saved replay buffer."""
     parser = argparse.ArgumentParser(description="Run one ZERO training step from a replay buffer.")
     parser.add_argument("--replay", required=True)
     parser.add_argument("--checkpoint")
@@ -299,7 +327,7 @@ def main(argv: list[str] | None = None) -> None:
     config = TrainConfig(batch_size=args.batch_size, device=args.device)
     optimizer = make_optimizer(model, config)
     scheduler = ContinuousLRScheduler(optimizer, config.initial_lr, config.continuous_lr)
-    metrics = train_step(model, optimizer, replay, config, iteration=0, scheduler=scheduler, logger=TrainingLogger(config.log_path))
+    metrics, _ = train_step(model, optimizer, replay, config, iteration=0, scheduler=scheduler, logger=TrainingLogger(config.log_path))
     save_model(args.out, model, optimizer=optimizer.state_dict(), metrics=metrics)
     print({"params": parameter_count(model), **metrics})
 

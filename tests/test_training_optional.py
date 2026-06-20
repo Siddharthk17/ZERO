@@ -40,7 +40,8 @@ def test_training_step_runs_and_clips() -> None:
     opt = make_optimizer(model, config)
     ewc = ElasticWeightConsolidation()
     ewc.consolidate(model, replay, device="cpu")
-    metrics = train_step(model, opt, replay, config, ewc=ewc, iteration=1)
+    metrics, scaler = train_step(model, opt, replay, config, ewc=ewc, iteration=1)
+    assert scaler is not None
     for key in ["policy_loss", "value_loss", "wdl_loss", "ewc_loss", "aux_loss", "loss"]:
         assert key in metrics
     assert metrics["grad_norm"] <= 1.0
@@ -58,3 +59,15 @@ def test_ema_and_checkpoint_round_trip(tmp_path) -> None:
         a = model(x)["policy_logits"]
         b = loaded(x)["policy_logits"]
     assert torch.allclose(a, b)
+
+
+def test_load_model_detects_transformer_every(tmp_path) -> None:
+    for te in (3, 4, 5):
+        cfg = ModelConfig(channels=16, blocks=8, attention_heads=4, transformer_every=te)
+        model = ZeroNet(cfg)
+        model.eval()
+        path = tmp_path / f"model_te{te}.pt"
+        save_model(path, model)
+        loaded = load_model(path)
+        assert loaded.config.transformer_every == te, f"te={te} not detected"
+        assert loaded.config.blocks == 8

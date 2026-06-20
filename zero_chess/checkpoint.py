@@ -14,6 +14,7 @@ from .model import ZeroNet, save_model
 
 @dataclass(slots=True)
 class CheckpointMeta:
+    """Metadata for a single checkpoint: iteration, Elo, path, timestamp, and metrics."""
     iteration: int
     elo: float
     path: str
@@ -60,11 +61,15 @@ class CheckpointManager:
             )
             
             index = self._read_index()
+            # Remove any existing entry for this iteration to prevent duplicates
+            # (reconstruction may have already added it from the file we just wrote)
+            index = [item for item in index if item["iteration"] != iteration]
             index.append(asdict(meta))
             index.sort(key=lambda item: item["iteration"])
             
             self._write_index(index)
             self._prune(index)
+            self._cleanup_index(index)
             return meta
 
     def latest(self) -> CheckpointMeta | None:
@@ -127,9 +132,9 @@ class CheckpointManager:
     def _prune(self, index: list[dict]) -> None:
         with self._lock:
             # Mark newest checkpoints and permanent multiples as protected
-            protected = {item["path"] for item in index[-self.keep_last :]}
+            protected = {item["path"] for item in index[-self.keep_last:]}
             protected.update(item["path"] for item in index if item["iteration"] % self.permanent_every == 0)
-            
+
             for item in index:
                 path = Path(item["path"])
                 if str(path) not in protected and path.exists():
@@ -137,3 +142,14 @@ class CheckpointManager:
                         path.unlink()
                     except OSError:
                         pass
+
+    def _cleanup_index(self, index: list[dict]) -> list[dict]:
+        """Remove index entries whose checkpoint files no longer exist on disk."""
+        with self._lock:
+            cleaned = [item for item in index if Path(item["path"]).exists()]
+            if len(cleaned) != len(index):
+                try:
+                    self._write_index(cleaned)
+                except OSError:
+                    pass
+            return cleaned

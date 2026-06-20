@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .board import Board
-from .constants import BLACK, BK, BQ, WHITE, WK, WQ, color_of, file_of, piece_type, rank_of, square
+from .constants import BLACK, BK, BQ, WHITE, WK, WQ
 from .move import Move
 
 HISTORY = 8
@@ -97,6 +97,19 @@ def encode_board(board: Board, history: list[Board] | None = None, device: str |
     planes = torch.zeros((INPUT_CHANNELS, 8, 8), dtype=torch.float32, device=device)
     return encode_board_into(planes, board, history)
 
+def encode_boards(boards: list[Board], histories: list[list[Board]] | None = None, device: str | None = None):
+    """Batch-encode a list of boards into a tensor of shape ``(N, 119, 8, 8)``."""
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError("encode_boards requires PyTorch; install zero-chess[train]") from exc
+
+    histories = histories or [None] * len(boards)
+    batch = torch.zeros((len(boards), INPUT_CHANNELS, 8, 8), dtype=torch.float32, device=device)
+    for idx, (board, history) in enumerate(zip(boards, histories, strict=True)):
+        encode_board_into(batch[idx], board, history)
+    return batch
+
 def encode_board_into(planes, board: Board, history: list[Board] | None = None):
     """Fill pre-allocated ``planes`` tensor with the board representation."""
     planes.zero_()
@@ -128,7 +141,7 @@ def encode_board_into(planes, board: Board, history: list[Board] | None = None):
     if board.turn == WHITE:
         planes[extra].fill_(1.0)
         
-    own_ks, own_qs, opp_ks, opp_qs = (WK, WQ, BK, BQ) if perspective == WHITE else (BQ, BK, WQ, WK)
+    own_ks, own_qs, opp_ks, opp_qs = (WK, WQ, BK, BQ) if perspective == WHITE else (BK, BQ, WK, WQ)
     if board.castling_rights & own_ks:
         planes[extra + 1].fill_(1.0)
     if board.castling_rights & own_qs:

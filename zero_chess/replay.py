@@ -11,14 +11,11 @@ from pathlib import Path
 
 def _get_available_ram_bytes() -> int:
     try:
-        with open("/proc/meminfo", "r", encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    parts = line.split()
-                    return int(parts[1]) * 1024
-    except Exception:
+        import psutil
+        return int(psutil.virtual_memory().available)
+    except ImportError:
         pass
-    return 8 * 1024 * 1024 * 1024
+    return 128 * 1024 * 1024 * 1024
 
 @dataclass(slots=True)
 class Experience:
@@ -58,6 +55,7 @@ class Experience:
 
 @dataclass(slots=True)
 class SampleBatch:
+    """A batch of sampled experiences with their indices and importance weights."""
     experiences: list[Experience]
     indices: list[int | None]
     weights: list[float]
@@ -126,6 +124,7 @@ class PrioritizedReplayBuffer:
         # High speed id-to-index mapping for true O(1) priority updates
         self._id_to_index: dict[int, int] = {}
         self._sqlite_conn: sqlite3.Connection | None = None
+        self._cold_count: int = 0
         
         if self.cold_path is not None:
             self._init_cold()
@@ -286,6 +285,7 @@ class PrioritizedReplayBuffer:
         )
         self._sqlite_conn.execute("CREATE INDEX IF NOT EXISTS idx_experiences_id ON experiences(id)")
         self._sqlite_conn.commit()
+        self._cold_count = int(self._sqlite_conn.execute("SELECT COUNT(*) FROM experiences").fetchone()[0])
 
     def _append_cold_unlocked(self, exp: Experience) -> None:
         if self._sqlite_conn is None:
@@ -295,26 +295,46 @@ class PrioritizedReplayBuffer:
             (pickle.dumps(exp, protocol=pickle.HIGHEST_PROTOCOL),)
         )
         self._sqlite_conn.commit()
-        
+        self._cold_count += 1
+
         # Enforce maximum sqlite buffer limits
-        count = self._sqlite_conn.execute("SELECT COUNT(*) FROM experiences").fetchone()[0]
-        overflow = max(0, count - self.cold_capacity)
+        overflow = self._cold_count - self.cold_capacity
         if overflow > 0:
             self._sqlite_conn.execute(
                 "DELETE FROM experiences WHERE id IN (SELECT id FROM experiences ORDER BY id LIMIT ?)",
                 (overflow,),
             )
             self._sqlite_conn.commit()
+            self._cold_count -= overflow
 
     def _sample_cold_unlocked(self, count: int) -> list[Experience]:
-        if count <= 0 or self._sqlite_conn is None:
+        if count <= 0 or self._sqlite_conn is None or self._cold_count <= 0:
             return []
-        rows = self._sqlite_conn.execute(
-            "SELECT payload FROM experiences ORDER BY RANDOM() LIMIT ?", (count,)
-        ).fetchall()
-        return [pickle.loads(row[0]) for row in rows]
+        # For small tables, ORDER BY RANDOM() is fast enough
+        if self._cold_count <= 10_000:
+            rows = self._sqlite_conn.execute(
+                "SELECT payload FROM experiences ORDER BY RANDOM() LIMIT ?", (count,)
+            ).fetchall()
+            return [pickle.loads(row[0]) for row in rows]
+        # For large tables, random-ID probing is O(count*log n) vs O(n) for ORDER BY RANDOM()
+        max_id = self._sqlite_conn.execute("SELECT MAX(id) FROM experiences").fetchone()[0]
+        if max_id is None or max_id <= 0:
+            return []
+        results: list[Experience] = []
+        seen: set[int] = set()
+        attempts = 0
+        max_attempts = count * 4
+        while len(results) < count and attempts < max_attempts:
+            rid = self.rng.randint(1, max_id)
+            if rid in seen:
+                attempts += 1
+                continue
+            seen.add(rid)
+            row = self._sqlite_conn.execute("SELECT payload FROM experiences WHERE id = ?", (rid,)).fetchone()
+            if row is not None:
+                results.append(pickle.loads(row[0]))
+            attempts += 1
+        return results
 
     def _cold_count_unlocked(self) -> int:
-        if self._sqlite_conn is None:
-            return 0
-        return int(self._sqlite_conn.execute("SELECT COUNT(*) FROM experiences").fetchone()[0])
+        return self._cold_count

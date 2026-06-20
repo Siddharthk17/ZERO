@@ -13,15 +13,16 @@ from .encoding import INPUT_CHANNELS, POLICY_SIZE
 
 @dataclass(slots=True)
 class ModelConfig:
+    """Architecture hyperparameters for the ZeroNet policy/value network."""
     input_channels: int = INPUT_CHANNELS
-    channels: int = 256         # Workstation-class convolution scale (Up from 128) [2]
-    blocks: int = 12             # Workstation-class depth (Up from 6) [2]
-    transformer_every: int = 3   # Every 3rd block is a spatial attention layer
-    attention_heads: int = 4
+    channels: int = 384          # Blackwell-scale: 24GB VRAM allows 50% wider filters
+    blocks: int = 20             # Deeper tower for higher ELO ceiling
+    transformer_every: int = 3   # Every 3rd block is spatial attention (2 convs + 1 transformer)
+    attention_heads: int = 8     # 384/8 = 48 dims per head
     policy_size: int = POLICY_SIZE
     dropout: float = 0.0
-    se_reduction: int = 16       # Optimized reduction factor for 256 channels (Up from 8) [2]
-    policy_channels: int = 32   # Optimized intermediate policy head scale (Up from 16) [2]
+    se_reduction: int = 16
+    policy_channels: int = 64    # Wider policy head for better move discrimination
 
 class SqueezeExcitation(nn.Module):
     """Squeeze-and-Excitation block for adaptive channel-wise feature recalibration."""
@@ -174,31 +175,25 @@ class ZeroNet(nn.Module):
     @torch.inference_mode()
     def evaluate_batch(self, boards, device: str | torch.device | None = None) -> list[tuple[dict, float, float]]:
         """Evaluate boards and return legal policy priors plus value/uncertainty."""
-        from .encoding import encode_board, encode_move_mask, move_to_policy_index
+        from .encoding import encode_boards, encode_move_mask, move_to_policy_index
 
         if device is None:
             device = next(self.parameters()).device
         self.eval()
         legal_moves = [board.legal_moves() for board in boards]
         if str(device).startswith("cuda"):
-            tensors = torch.stack([encode_board(board, device="cpu") for board in boards]).pin_memory().to(device, non_blocking=True)
+            tensors = encode_boards(boards, device="cpu").pin_memory().to(device, non_blocking=True)
             masks = torch.stack(
                 [encode_move_mask(legal, board, device="cpu") for board, legal in zip(boards, legal_moves, strict=True)]
             ).pin_memory().to(device, non_blocking=True)
         else:
-            tensors = torch.stack([encode_board(board, device=str(device)) for board in boards])
+            tensors = encode_boards(boards, device=str(device))
             masks = torch.stack(
                 [encode_move_mask(legal, board, device=str(device)) for board, legal in zip(boards, legal_moves, strict=True)]
             )
         device_type = "cuda" if str(device).startswith("cuda") else "cpu"
-        
-        is_bf16 = False
-        if device_type == "cuda":
-            try:
-                is_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-            except Exception:
-                pass
-                
+
+        is_bf16 = device_type == "cuda" and torch.cuda.is_bf16_supported()
         amp_dtype = torch.bfloat16 if is_bf16 else torch.float16
         with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=device_type == "cuda"):
             out = self(tensors, masks, return_dict=True)
@@ -226,13 +221,20 @@ def load_model(path: str | Path, device: str | torch.device = "cpu") -> ZeroNet:
         config_dict["channels"] = state["stem.0.weight"].shape[0]
 
     tower_indices = set()
+    transformer_indices = set()
     for key in state.keys():
         if key.startswith("tower."):
             parts = key.split(".")
             if parts[1].isdigit():
-                tower_indices.add(int(parts[1]))
+                idx = int(parts[1])
+                tower_indices.add(idx)
+                if ".pos" in key or ".attn" in key:
+                    transformer_indices.add(idx)
     if tower_indices:
         config_dict["blocks"] = max(tower_indices) + 1
+    if transformer_indices:
+        sorted_trans = sorted(transformer_indices)
+        config_dict["transformer_every"] = sorted_trans[0] + 1
 
     if "tower.0.se.fc1.weight" in state:
         hidden, channels = state["tower.0.se.fc1.weight"].shape

@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 @dataclass(slots=True)
 class UCIResult:
+    """Result from a UCI best-move query: move string, evaluation, and node count."""
     move: str
     evaluation: float = 0.0
     nodes: int = 0
@@ -114,6 +115,7 @@ class UCIProcess:
                 return
 
 def parse_info(line: str) -> tuple[float | None, int | None]:
+    """Parse a UCI 'info' line and return (evaluation, nodes) or (None, None) if absent."""
     parts = line.split()
     evaluation = None
     nodes = None
@@ -188,6 +190,7 @@ def _tail_file_lines(path: Path, max_lines: int = 500) -> list[str]:
 
 @app.get("/history")
 def training_history(limit: int = 50) -> dict[str, list[dict]]:
+    """Return recent training game records from the JSONL log, without PGN payloads."""
     path = Path("data/training_games.jsonl")
     if not path.exists():
         return {"games": []}
@@ -207,6 +210,7 @@ def training_history(limit: int = 50) -> dict[str, list[dict]]:
 @app.websocket("/")
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
+    """WebSocket endpoint: receive FEN positions, return best moves from the UCI engine."""
     await websocket.accept()
     try:
         while True:
@@ -222,6 +226,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         return
 
 def main(argv: list[str] | None = None) -> None:
+    """CLI entry point: start the FastAPI WebSocket server bridging to the UCI engine."""
     parser = argparse.ArgumentParser(description="Run ZERO WebSocket engine bridge.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
