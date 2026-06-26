@@ -715,10 +715,17 @@ def _persistent_gpu_evaluator_process_main(
             from .move import Move
 
             boards = [Board.from_fen(fen) for fen in flat_fens]
-            tensors = encode_boards(boards, device="cpu").pin_memory().to(device, non_blocking=True)
-            masks = torch.stack([_encode_move_mask_from_ucis(b, legal, device="cpu") for b, legal in zip(boards, flat_legal_ucis)]).pin_memory().to(device, non_blocking=True)
-            amp_dtype = torch.bfloat16 if device == "cuda" and torch.cuda.is_bf16_supported() else torch.float16
-            with torch.autocast(device_type=device, dtype=amp_dtype, enabled=True):
+            tensors = encode_boards(boards, device="cpu")
+            masks = torch.stack([_encode_move_mask_from_ucis(b, legal, device="cpu") for b, legal in zip(boards, flat_legal_ucis)])
+            is_cuda = device == "cuda" and torch.cuda.is_available()
+            if is_cuda:
+                tensors = tensors.pin_memory().to(device, non_blocking=True)
+                masks = masks.pin_memory().to(device, non_blocking=True)
+            else:
+                tensors = tensors.to(device)
+                masks = masks.to(device)
+            amp_dtype = torch.bfloat16 if is_cuda and torch.cuda.is_bf16_supported() else torch.float16
+            with torch.autocast(device_type=device, dtype=amp_dtype, enabled=is_cuda):
                 out = compiled_model(tensors, masks, return_dict=True)
             raw_values = out["value"].squeeze(-1).detach().cpu().tolist()
             raw_uncertainties = out["uncertainty"].detach().cpu().tolist()
@@ -952,9 +959,17 @@ def _gpu_evaluator_process_main(
             from .move import Move
 
             boards = [Board.from_fen(fen) for fen in flat_fens]
-            tensors = encode_boards(boards, device="cpu").pin_memory().to(device, non_blocking=True)
-            masks = torch.stack([_encode_move_mask_from_ucis(b, legal, device="cpu") for b, legal in zip(boards, flat_legal_ucis)]).pin_memory().to(device, non_blocking=True)
-            with torch.autocast(device_type=device, dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16, enabled=True):
+            tensors = encode_boards(boards, device="cpu")
+            masks = torch.stack([_encode_move_mask_from_ucis(b, legal, device="cpu") for b, legal in zip(boards, flat_legal_ucis)])
+            is_cuda = device == "cuda" and torch.cuda.is_available()
+            if is_cuda:
+                tensors = tensors.pin_memory().to(device, non_blocking=True)
+                masks = masks.pin_memory().to(device, non_blocking=True)
+            else:
+                tensors = tensors.to(device)
+                masks = masks.to(device)
+            amp_dtype = torch.bfloat16 if is_cuda and torch.cuda.is_bf16_supported() else torch.float16
+            with torch.autocast(device_type=device, dtype=amp_dtype, enabled=is_cuda):
                 out = model(tensors, masks, return_dict=True)
             raw_values = out["value"].squeeze(-1).detach().cpu().tolist()
             raw_uncertainties = out["uncertainty"].detach().cpu().tolist()
