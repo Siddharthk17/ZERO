@@ -121,8 +121,8 @@ class PrioritizedReplayBuffer:
         self._max_priority = 1.0
         self._lock = threading.Lock()
         
-        # High speed id-to-index mapping for true O(1) priority updates
-        self._id_to_index: dict[int, int] = {}
+        # FEN-based index mapping for collision-resistant priority updates
+        self._fen_to_index: dict[str, int] = {}
         self._sqlite_conn: sqlite3.Connection | None = None
         self._cold_count: int = 0
         
@@ -153,12 +153,12 @@ class PrioritizedReplayBuffer:
                 index = self._cursor
                 # Evict oldest hot experience to SQL cold storage
                 old_exp = self.hot[index]
-                self._id_to_index.pop(id(old_exp), None)
+                self._fen_to_index.pop(old_exp.fen, None)
                 self._append_cold_unlocked(old_exp)
                 self.hot[index] = exp
                 self._cursor = (self._cursor + 1) % self.hot_capacity
                 
-            self._id_to_index[id(exp)] = index
+            self._fen_to_index[exp.fen] = index
             self._tree.update(index, exp.priority)
 
     def extend(self, experiences: list[Experience]) -> None:
@@ -220,8 +220,7 @@ class PrioritizedReplayBuffer:
                         self._tree.update(item, priority)
                 elif isinstance(item, Experience):
                     item.priority = priority
-                    # Real O(1) hash mapping lookup
-                    index = self._id_to_index.get(id(item))
+                    index = self._fen_to_index.get(item.fen)
                     if index is not None and 0 <= index < len(self.hot):
                         self._tree.update(index, priority)
 
@@ -263,9 +262,9 @@ class PrioritizedReplayBuffer:
             replay._cursor = replay._cursor % replay.hot_capacity
             
         replay._tree = SumTree(replay.hot_capacity)
-        replay._id_to_index.clear()
+        replay._fen_to_index.clear()
         for idx, exp in enumerate(replay.hot):
-            replay._id_to_index[id(exp)] = idx
+            replay._fen_to_index[exp.fen] = idx
             replay._tree.update(idx, exp.priority or replay._max_priority)
         return replay
 
@@ -317,15 +316,15 @@ class PrioritizedReplayBuffer:
             ).fetchall()
             return [pickle.loads(row[0]) for row in rows]
         # For large tables, random-ID probing is O(count*log n) vs O(n) for ORDER BY RANDOM()
-        max_id = self._sqlite_conn.execute("SELECT MAX(id) FROM experiences").fetchone()[0]
-        if max_id is None or max_id <= 0:
+        min_id, max_id = self._sqlite_conn.execute("SELECT MIN(id), MAX(id) FROM experiences").fetchone()
+        if min_id is None or max_id is None or max_id <= 0:
             return []
         results: list[Experience] = []
         seen: set[int] = set()
         attempts = 0
         max_attempts = count * 4
         while len(results) < count and attempts < max_attempts:
-            rid = self.rng.randint(1, max_id)
+            rid = self.rng.randint(min_id, max_id)
             if rid in seen:
                 attempts += 1
                 continue

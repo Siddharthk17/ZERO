@@ -96,15 +96,15 @@ def test_uci_time_pressure_aggression() -> None:
     assert more_time == int(equal_standard * 1.2)
 
     less_time = engine._time_to_use(["wtime", "1000", "btime", "80000", "winc", "0", "binc", "0"])
-    assert less_time >= 500
+    assert less_time == 150
 
 
 def test_arena_draws_are_student_losses_and_promotion_needs_sixty_percent(monkeypatch) -> None:
     monkeypatch.setattr(Board, "outcome", lambda self: "1/2-1/2")
     result = play_arena(UniformEvaluator(), UniformEvaluator(), games=40, simulations=1, max_plies=0, log_path=None)
     assert result["student_score"] == 0.0
-    assert result["elo_a"] < 0.0
-    assert result["elo_b"] < 0.0
+    assert result["elo_a"] == 0.0
+    assert result["elo_b"] == 0.0
     assert not result["promote"]
 
     wins = iter(["1-0"] * 20 + ["0-1"] * 4 + ["1-0"] * 16)

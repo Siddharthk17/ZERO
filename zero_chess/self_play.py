@@ -19,12 +19,14 @@ from pathlib import Path
 
 import multiprocessing
 
+# CONFIGURATION & DATA STRUCTURES
+
 from .board import Board
 from .constants import (
     BLACK, BK, BQ, WHITE, WK, WQ,
     file_of, parse_square, rank_of, square, square_name
 )
-from .elo import DEFAULT_ELO, update_rating_with_reason
+from .elo import DEFAULT_ELO, update_rating_from_result
 from .encoding import terminal_wdl
 from .mcts import MCTS, NetworkEvaluator, UniformEvaluator
 from .move import Move
@@ -79,6 +81,8 @@ def _make_mcts(evaluator, config: SelfPlayConfig) -> MCTS:
         simulations=config.simulations,
         resign_threshold=resign_threshold,
     )
+
+# CORE GAME LOOP & EXPERIENCE GENERATION 
 
 def play_game(
     mcts: MCTS,
@@ -297,18 +301,34 @@ def generate_parallel_games(
     config = config or SelfPlayConfig()
     results: list[tuple[str, list[Experience], list[str], str, dict] | None] = [None] * games
 
+    wrapped_evaluator = evaluator
+    shared_evaluator = None
+    if games > 1 and isinstance(evaluator, NetworkEvaluator):
+        from .mcts import SharedBatchEvaluator
+        shared_evaluator = SharedBatchEvaluator(
+            evaluator.model,
+            device=evaluator.device,
+            max_batch_size=max(128, config.batch_size * games),
+        )
+        wrapped_evaluator = shared_evaluator
+
     def worker(index: int) -> None:
         rng = random.Random(None if rng_seed is None else rng_seed + index)
-        mcts = _make_mcts(evaluator, config)
+        mcts = _make_mcts(wrapped_evaluator, config)
         results[index] = play_game(mcts, config, rng)
         mcts.reset()
         del mcts
 
-    threads = [threading.Thread(target=worker, args=(idx,), daemon=True) for idx in range(games)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    try:
+        threads = [threading.Thread(target=worker, args=(idx,), daemon=True) for idx in range(games)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        if shared_evaluator is not None:
+            shared_evaluator.close()
+
     return [result for result in results if result is not None]
 
 class QueueEvaluatorProxy:
@@ -395,6 +415,18 @@ def generate_multiprocess_games(
         try:
             idx, payload, error = result_queue.get(timeout=1.0)
         except queue.Empty:
+            # Check worker process health and re-spawn if dead
+            for i, process in enumerate(workers):
+                if not process.is_alive() and results[i] is None:
+                    print(f"[WARNING] Self-play worker process {i} died silently. Re-spawning.", flush=True)
+                    seed = None if rng_seed is None else rng_seed + i
+                    new_process = ctx.Process(
+                        target=_self_play_process_main,
+                        args=(i, request_queue, response_queues[i], result_queue, config, seed, active_workers),
+                        daemon=True,
+                    )
+                    new_process.start()
+                    workers[i] = new_process
             continue
         received += 1
         if error is None:
@@ -442,14 +474,42 @@ class CudaTrainingRuntime:
 
     def stop(self, timeout: float = 10.0) -> None:
         self.stop_event.set()
+        _terminate_delay = 1.0
+        
+        # Terminate processes FIRST to break any blocked Queue.put() calls.
         for process in self.processes:
-            process.join(timeout=timeout)
             if process.is_alive():
                 process.terminate()
-                process.join(timeout=2.0)
-                if process.is_alive():
-                    process.kill()
-                    process.join(timeout=2.0)
+        
+        for process in self.processes:
+            process.join(timeout=_terminate_delay)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=_terminate_delay)
+        
+        # Safely close and drain all multiprocessing queues after process termination.
+        def _close_and_drain(q) -> None:
+            if hasattr(q, "close") and hasattr(q, "join_thread"):
+                try:
+                    q.close()
+                except Exception:
+                    pass
+                while True:
+                    try:
+                        q.get_nowait()
+                    except Exception:
+                        break
+                try:
+                    q.join_thread()
+                except Exception:
+                    pass
+
+        for res in self.resources:
+            if isinstance(res, list):
+                for item in res:
+                    _close_and_drain(item)
+            else:
+                _close_and_drain(res)
 
 def start_persistent_cuda_training(
     model,
@@ -549,6 +609,7 @@ def start_persistent_cuda_training(
     )
     trainer.start()
 
+    respawn_counters = [0] * games
     workers = []
     for worker_id in range(games):
         process = ctx.Process(
@@ -601,7 +662,58 @@ def start_persistent_cuda_training(
         active_workers,
     ]
 
-    return CudaTrainingRuntime(stop_event, [*workers, evaluator, trainer, monitor], resources, generation_value, games_completed)
+    runtime = CudaTrainingRuntime(stop_event, [*workers, evaluator, trainer, monitor], resources, generation_value, games_completed)
+
+    def monitor_workers():
+        while not stop_event.is_set():
+            time.sleep(2.0)
+            for i in range(games):
+                if stop_event.is_set():
+                    break
+                process = workers[i]
+                if not process.is_alive():
+                    print(f"[WARNING] Persistent worker process {i} died silently. Re-spawning.", flush=True)
+                    respawn_counters[i] += 1
+                    seed = int(generation_value.value) * 100_000 + i + (respawn_counters[i] * 10_000)
+                    new_process = ctx.Process(
+                        target=_persistent_self_play_process_main,
+                        args=(
+                            i,
+                            request_queue,
+                            response_queues[i],
+                            game_queue,
+                            stop_event,
+                            generation_value,
+                            games_completed,
+                            config,
+                            seed,
+                            active_workers,
+                        ),
+                        daemon=False,
+                    )
+                    new_process.start()
+                    workers[i] = new_process
+                    try:
+                        idx = runtime.processes.index(process)
+                        runtime.processes[idx] = new_process
+                    except ValueError:
+                        runtime.processes.append(new_process)
+            
+            # Check evaluator and trainer health
+            if not stop_event.is_set():
+                if not evaluator.is_alive():
+                    print("[WARNING] Evaluator process died silently! Shutting down training session.", flush=True)
+                    stop_event.set()
+                elif not trainer.is_alive():
+                    print("[WARNING] Trainer process died silently! Shutting down training session.", flush=True)
+                    stop_event.set()
+
+    monitor_thread = threading.Thread(target=monitor_workers, name="zero-runtime-monitor", daemon=True)
+    monitor_thread.start()
+
+    return runtime
+
+# WORKER PROCESS ENTRYPOINTS
 
 def _persistent_self_play_process_main(
     worker_id: int,
@@ -673,6 +785,7 @@ def _persistent_gpu_evaluator_process_main(
 ) -> None:
     _ensure_importable()
     import torch
+    from .encoding import INPUT_CHANNELS, POLICY_SIZE
     from .model import ModelConfig, ZeroNet
 
     _configure_cuda_process(device, torch, cuda_memory_fraction)
@@ -688,6 +801,10 @@ def _persistent_gpu_evaluator_process_main(
         compiled_model = torch.compile(model, mode="reduce-overhead")
     else:
         compiled_model = model
+
+    # Pre-allocate static padding tensors to eliminate repeated allocations on every eval step.
+    static_tensor_pad = torch.zeros((gpu_batch_size - 1, INPUT_CHANNELS, 8, 8), dtype=torch.float32)
+    static_mask_pad = torch.zeros((gpu_batch_size - 1, POLICY_SIZE), dtype=torch.float32)
     wait_seconds = eval_wait_ms / 1000.0
 
     while not stop_event.is_set():
@@ -723,24 +840,20 @@ def _persistent_gpu_evaluator_process_main(
 
         try:
             from .board import Board
-            from .encoding import encode_boards, move_to_policy_index
+            from .encoding import INPUT_CHANNELS, POLICY_SIZE, encode_boards, move_to_policy_index
             from .move import Move
 
             boards = [Board.from_fen(fen) for fen in flat_fens]
             tensors = encode_boards(boards, device="cpu")
             masks = torch.stack([_encode_move_mask_from_ucis(b, legal, device="cpu") for b, legal in zip(boards, flat_legal_ucis)])
 
-            # --- STATIC BATCH PADDING FIX ---
-            # Pad tensors and masks to the exact gpu_batch_size to prevent compile recompilation
+            # STATIC BATCH PADDING FIX
+            # Use pre-allocated static padding tensors to eliminate repeated allocations.
             actual_size = tensors.shape[0]
             if actual_size < gpu_batch_size:
                 padding_size = gpu_batch_size - actual_size
-                # Allocate zeros directly on CPU to match shape (padding_size, channels, 8, 8)
-                tensor_padding = torch.zeros((padding_size, tensors.shape[1], 8, 8), dtype=tensors.dtype)
-                mask_padding = torch.zeros((padding_size, masks.shape[1]), dtype=masks.dtype)
-
-                tensors = torch.cat([tensors, tensor_padding], dim=0)
-                masks = torch.cat([masks, mask_padding], dim=0)
+                tensors = torch.cat([tensors, static_tensor_pad[:padding_size]], dim=0)
+                masks = torch.cat([masks, static_mask_pad[:padding_size]], dim=0)
 
             is_cuda = device == "cuda" and torch.cuda.is_available()
             if is_cuda:
@@ -764,10 +877,27 @@ def _persistent_gpu_evaluator_process_main(
                 indices = torch.tensor([move_to_policy_index(board, Move.from_uci(uci)) for uci in legal], dtype=torch.long)
                 legal_probs.append(raw_policies[batch_idx][indices].tolist())
             error = None
-        except Exception:
-            raw_values = raw_uncertainties = []
-            legal_probs = []
-            error = traceback.format_exc()
+        except Exception as exc:
+            if "out of memory" in str(exc).lower() or "cuda" in str(exc).lower() or "timeout" in str(exc).lower():
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                print(f"[WARNING] Persistent GPU evaluator forward pass failed: {exc}. Flushing CUDA cache and falling back to uniform evaluation.", flush=True)
+                raw_values = [0.0] * len(flat_fens)
+                raw_uncertainties = [1.0] * len(flat_fens)
+                legal_probs = []
+                for legal in flat_legal_ucis:
+                    if not legal:
+                        legal_probs.append([])
+                    else:
+                        prob = 1.0 / len(legal)
+                        legal_probs.append([prob] * len(legal))
+                error = None
+            else:
+                raw_values = raw_uncertainties = []
+                legal_probs = []
+                error = traceback.format_exc()
 
         offset = 0
         for _, worker_id, request_id, data in requests:
@@ -1006,10 +1136,27 @@ def _gpu_evaluator_process_main(
                 indices = torch.tensor([move_to_policy_index(board, Move.from_uci(uci)) for uci in legal], dtype=torch.long)
                 legal_probs.append(raw_policies[batch_idx][indices].tolist())
             error = None
-        except Exception:
-            raw_values = raw_uncertainties = []
-            legal_probs = []
-            error = traceback.format_exc()
+        except Exception as exc:
+            if "out of memory" in str(exc).lower() or "cuda" in str(exc).lower() or "timeout" in str(exc).lower():
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                print(f"[WARNING] GPU evaluator process forward pass failed: {exc}. Flushing CUDA cache and falling back to uniform evaluation.", flush=True)
+                raw_values = [0.0] * len(flat_fens)
+                raw_uncertainties = [1.0] * len(flat_fens)
+                legal_probs = []
+                for legal in flat_legal_ucis:
+                    if not legal:
+                        legal_probs.append([])
+                    else:
+                        prob = 1.0 / len(legal)
+                        legal_probs.append([prob] * len(legal))
+                error = None
+            else:
+                raw_values = raw_uncertainties = []
+                legal_probs = []
+                error = traceback.format_exc()
 
         offset = 0
         for _, worker_id, request_id, data in requests:
@@ -1035,6 +1182,8 @@ def _adjudicate(values: list[float]) -> bool:
     is_crushing = (avg > 0.70) or (avg < -2.70)
     return is_stable and is_crushing
 
+# CUSTOM REWARD CALCULATIONS
+
 def _aggression_score(board: Board) -> float:
     opponent = board.turn ^ 1
     squares = board.squares
@@ -1058,6 +1207,8 @@ def _panic_penalty(board: Board, move: Move) -> float:
     if move.is_capture:
         return PANIC_PENALTY
     return 0.0
+
+# PERSISTENT TRAINING LOOP (MAIN)
 
 def _trainer_process_main(
     model_config: dict,
@@ -1125,11 +1276,15 @@ def _trainer_process_main(
                 print(f"\n[ERROR] Worker process encountered an exception:\n{error}", flush=True)
                 continue
 
-            result, experiences, sans, reason, meta = payload  # Unpack 5-tuple with metadata!
+            try:
+                result, experiences, sans, reason, meta = payload
+            except (ValueError, TypeError) as exc:
+                print(f"[WARNING] Corrupted game payload from worker. Skipping. Error: {exc}", flush=True)
+                continue
             replay.extend(experiences)
             completed_games += 1
             rated_side = WHITE if completed_games % 2 else BLACK
-            elo, elo_delta = update_rating_with_reason(elo, result, rated_side, reason)  # Use custom Elo rules!
+            elo, elo_delta = update_rating_from_result(elo, elo, result, rated_side)
 
             is_boundary = (completed_games % max(1, games_per_generation) == 0)
             if is_boundary:
@@ -1231,7 +1386,7 @@ def _trainer_process_main(
                     replay.extend(p_experiences)
                     completed_games += 1
                     p_rated_side = WHITE if completed_games % 2 else BLACK
-                    elo, p_elo_delta = update_rating_with_reason(elo, p_result, p_rated_side, p_reason)
+                    elo, p_elo_delta = update_rating_from_result(elo, elo, p_result, p_rated_side)
                     plies_window.append(len(p_sans))
                     reasons_window.append(p_reason)
                     durations_window.append(p_meta["duration"])
@@ -1248,7 +1403,7 @@ def _trainer_process_main(
                         metrics={},
                     )
 
-                print("\n" + "="*20 + " [ARENA EVALUATION] " + "="*20, flush=True)
+                print("\n" + " "*20 + " [ARENA EVALUATION] " + " "*20, flush=True)
                 print(f"Starting Arena Match: Student vs. EMA Teacher (Iteration {iteration})", flush=True)
                 print("Games: 20 | MCTS Simulations: 160 | Device: " + str(device), flush=True)
 

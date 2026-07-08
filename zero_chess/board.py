@@ -445,6 +445,7 @@ class Board:
     def _can_castle(self, right: int, empty_squares: list[str], safe_squares: list[str], rook_sq: str) -> bool:
         if not (self.castling_rights & right):
             return False
+        # C5: Explicitly verify that the rook on rook_sq matches the moving side's rook type
         rook = "R" if self.turn == WHITE else "r"
         if self.squares[parse_square(rook_sq)] != rook:
             return False
@@ -629,15 +630,44 @@ class Board:
 
     def has_insufficient_material(self) -> bool:
         """Return True if the position is a forced draw by insufficient material."""
-        pieces = [(sq, piece) for sq, piece in enumerate(self.squares) if piece != EMPTY and piece_type(piece) != "K"]
-        if not pieces:
+        white_bishops = []
+        black_bishops = []
+        white_knights = 0
+        black_knights = 0
+        
+        for sq, piece in enumerate(self.squares):
+            if piece == EMPTY:
+                continue
+            kind = piece_type(piece)
+            if kind in {"P", "R", "Q"}:
+                return False
+            elif kind == "B":
+                if color_of(piece) == WHITE:
+                    white_bishops.append(square_color(sq))
+                else:
+                    black_bishops.append(square_color(sq))
+            elif kind == "N":
+                if color_of(piece) == WHITE:
+                    white_knights += 1
+                else:
+                    black_knights += 1
+                    
+        total_minors = len(white_bishops) + len(black_bishops) + white_knights + black_knights
+        
+        # K vs K
+        if total_minors == 0:
             return True
-        if len(pieces) == 1 and piece_type(pieces[0][1]) in {"B", "N"}:
+            
+        # K+B vs K or K+N vs K
+        if total_minors == 1:
             return True
-        if len(pieces) == 2 and all(piece_type(piece) == "B" for _, piece in pieces):
-            colors = {color_of(piece) for _, piece in pieces}
-            bishop_square_colors = {square_color(sq) for sq, _ in pieces}
-            return colors == {WHITE, BLACK} and len(bishop_square_colors) == 1
+            
+        # Bishop draws (all bishops on same square color, e.g. K+B vs K+B same-color or K+B+B vs K same-color)
+        if white_knights == 0 and black_knights == 0:
+            all_bishops = white_bishops + black_bishops
+            if len(set(all_bishops)) == 1:
+                return True
+                
         return False
 
     def is_fifty_move_draw(self) -> bool:
@@ -670,6 +700,9 @@ class Board:
         ``'1-0'`` if White wins, ``'0-1'`` if Black wins, ``'1/2-1/2'`` for a draw,
         or ``None`` if the game is still in progress.
         """
+        # M2: Immediate check for 50-move rule draw
+        if self.halfmove_clock >= 100:
+            return "1/2-1/2"
         if self.has_insufficient_material():
             return "1/2-1/2"
         if claim_draws and (self.is_fifty_move_draw() or self.is_threefold_repetition()):

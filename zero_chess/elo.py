@@ -42,12 +42,9 @@ def update_rating_from_result(
     k: float = DEFAULT_K,
     floor: float = ELO_FLOOR,
 ) -> tuple[float, float]:
-    """Update ratings based on game results, penalizing both players by half of win gain on draws."""
-    if result == "1/2-1/2":
-        win_gain = k * (1.0 - expected_score(rating, opponent_rating))
-        new_rating = max(floor, rating - 0.5 * win_gain)
-        return new_rating, new_rating - rating
-    return update_rating(rating, opponent_rating, result_score(result, perspective), k, floor)
+    """Standard, mathematically balanced Elo rating update."""
+    score = result_score(result, perspective)
+    return update_rating(rating, opponent_rating, score, k, floor)
 
 def update_rating_with_reason(
     rating: float,

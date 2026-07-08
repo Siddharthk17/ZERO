@@ -33,13 +33,13 @@ def test_elo_gain_loss_and_floor() -> None:
     assert delta == 0.0
 
 
-def test_draw_penalizes_both_players_by_half_of_win_gain() -> None:
+def test_draw_does_not_penalize_players_with_standard_elo() -> None:
     white_rating, white_delta = update_rating_from_result(0.0, 0.0, "1/2-1/2", WHITE)
     black_rating, black_delta = update_rating_from_result(0.0, 0.0, "1/2-1/2", BLACK)
-    assert white_rating == pytest.approx(-8.0)
-    assert black_rating == pytest.approx(-8.0)
-    assert white_delta == pytest.approx(-8.0)
-    assert black_delta == pytest.approx(-8.0)
+    assert white_rating == pytest.approx(0.0)
+    assert black_rating == pytest.approx(0.0)
+    assert white_delta == pytest.approx(0.0)
+    assert black_delta == pytest.approx(0.0)
 
 
 def test_expected_score_favors_higher_rating() -> None:

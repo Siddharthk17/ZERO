@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from .board import Board
 from .mcts import MCTS, NetworkEvaluator, SearchResult, UniformEvaluator
 from .move import Move
+from .constants import WHITE
 
 @dataclass(slots=True)
 class UCIOptions:
@@ -168,6 +169,9 @@ class UCIEngine:
         if "movetime" in args:
             ms = int(args[args.index("movetime") + 1])
             result = self.mcts.search_time(self.board, ms, temperature=0.0, add_noise=False)
+        elif "wtime" in args or "btime" in args:
+            ms = self._time_to_use(args)
+            result = self.mcts.search_time(self.board, ms, temperature=0.0, add_noise=False)
         else:
             simulations = self._simulations_for_go(args)
             result = self.mcts.search(self.board, num_simulations=simulations, temperature=0.0, add_noise=False)
@@ -218,20 +222,23 @@ class UCIEngine:
         return self.options.simulations
 
     def _time_to_use(self, args: list[str]) -> int:
-        remaining_key = "wtime" if self.board.turn == 0 else "btime"
-        inc_key = "winc" if self.board.turn == 0 else "binc"
-        opponent_key = "btime" if self.board.turn == 0 else "wtime"
+        remaining_key = "wtime" if self.board.turn == WHITE else "btime"
+        inc_key = "winc" if self.board.turn == WHITE else "binc"
+        opponent_key = "btime" if self.board.turn == WHITE else "wtime"
         remaining = int(args[args.index(remaining_key) + 1]) if remaining_key in args else 1000
         increment = int(args[args.index(inc_key) + 1]) if inc_key in args else 0
         opponent_remaining = int(args[args.index(opponent_key) + 1]) if opponent_key in args else remaining
         use = int(remaining / 40 + increment * 0.8)
         if remaining > opponent_remaining:
             use = int(use * 1.2)
-        cap = max(1, int(remaining * 0.10))
-        use = min(use, cap)
         if remaining < opponent_remaining:
-            return max(500, use)
-        return max(100, use)
+            use = max(50, int(remaining * 0.15))
+        else:
+            use = max(100, use)
+        safety_margin = max(50, int(remaining * 0.10))
+        max_alloc = max(1, remaining - safety_margin)
+        use = min(use, max_alloc)
+        return max(50, use)
 
     def _load_checkpoint(self) -> None:
         if not self.options.checkpoint:

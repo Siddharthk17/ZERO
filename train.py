@@ -12,7 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from zero_chess.constants import BLACK, WHITE
-from zero_chess.elo import DEFAULT_ELO, update_rating_with_reason
+from zero_chess.elo import DEFAULT_ELO, update_rating_from_result
 from zero_chess.mcts import NetworkEvaluator, UniformEvaluator
 from zero_chess.replay import PrioritizedReplayBuffer
 from zero_chess.self_play import (
@@ -302,7 +302,7 @@ def main() -> None:
             for game_idx, (result, experiences, sans, reason, meta) in enumerate(games):
                 replay.extend(experiences)
                 rated_side = WHITE if (iteration + game_idx) % 2 else BLACK
-                elo, elo_delta = update_rating_with_reason(elo, result, rated_side, reason)
+                elo, elo_delta = update_rating_from_result(elo, elo, result, rated_side)
                 print(
                     f"[GAME #{iteration:05d}-{game_idx}] result={result} side={'white' if rated_side == WHITE else 'black'} "
                     f"elo={elo:.1f} ({elo_delta:+.1f}) plies={len(sans)} reason={reason} duration={meta['duration']:.1f}s",

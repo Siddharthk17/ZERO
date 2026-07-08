@@ -181,34 +181,52 @@ class ZeroNet(nn.Module):
             device = next(self.parameters()).device
         self.eval()
         legal_moves = [board.legal_moves() for board in boards]
-        if str(device).startswith("cuda"):
-            tensors = encode_boards(boards, device="cpu").pin_memory().to(device, non_blocking=True)
-            masks = torch.stack(
-                [encode_move_mask(legal, board, device="cpu") for board, legal in zip(boards, legal_moves, strict=True)]
-            ).pin_memory().to(device, non_blocking=True)
-        else:
-            tensors = encode_boards(boards, device=str(device))
-            masks = torch.stack(
-                [encode_move_mask(legal, board, device=str(device)) for board, legal in zip(boards, legal_moves, strict=True)]
-            )
-        device_type = "cuda" if str(device).startswith("cuda") else "cpu"
+        try:
+            if str(device).startswith("cuda"):
+                tensors = encode_boards(boards, device="cpu").pin_memory().to(device, non_blocking=True)
+                masks = torch.stack(
+                    [encode_move_mask(legal, board, device="cpu") for board, legal in zip(boards, legal_moves, strict=True)]
+                ).pin_memory().to(device, non_blocking=True)
+            else:
+                tensors = encode_boards(boards, device=str(device))
+                masks = torch.stack(
+                    [encode_move_mask(legal, board, device=str(device)) for board, legal in zip(boards, legal_moves, strict=True)]
+                )
+            device_type = "cuda" if str(device).startswith("cuda") else "cpu"
 
-        is_bf16 = device_type == "cuda" and torch.cuda.is_bf16_supported()
-        amp_dtype = torch.bfloat16 if is_bf16 else torch.float16
-        with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=device_type == "cuda"):
-            out = self(tensors, masks, return_dict=True)
-        policy = out["policy"]
-        values = out["value"].squeeze(-1).detach().cpu().tolist()
-        uncertainties = out["uncertainty"].detach().cpu().tolist()
-        results = []
-        for row, board, legal, value, uncertainty in zip(policy, boards, legal_moves, values, uncertainties, strict=True):
-            if not legal:
-                results.append(({}, float(value), float(uncertainty)))
-                continue
-            indices = torch.tensor([move_to_policy_index(board, move) for move in legal], device=row.device)
-            probs = row.index_select(0, indices).detach().cpu().tolist()
-            results.append(({move: float(prob) for move, prob in zip(legal, probs, strict=True)}, float(value), float(uncertainty)))
-        return results
+            is_bf16 = device_type == "cuda" and torch.cuda.is_bf16_supported()
+            amp_dtype = torch.bfloat16 if is_bf16 else torch.float16
+            with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=device_type == "cuda"):
+                out = self(tensors, masks, return_dict=True)
+            policy = out["policy"]
+            values = out["value"].squeeze(-1).detach().cpu().tolist()
+            uncertainties = out["uncertainty"].detach().cpu().tolist()
+            results = []
+            for row, board, legal, value, uncertainty in zip(policy, boards, legal_moves, values, uncertainties, strict=True):
+                if not legal:
+                    results.append(({}, float(value), float(uncertainty)))
+                    continue
+                indices = torch.tensor([move_to_policy_index(board, move) for move in legal], device=row.device)
+                probs = row.index_select(0, indices).detach().cpu().tolist()
+                results.append(({move: float(prob) for move, prob in zip(legal, probs, strict=True)}, float(value), float(uncertainty)))
+            return results
+        except Exception as exc:
+            if "out of memory" in str(exc).lower() or "cuda" in str(exc).lower() or "timeout" in str(exc).lower():
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                print(f"[WARNING] GPU evaluate_batch failed: {exc}. Falling back to uniform evaluation.", flush=True)
+                fallback_results = []
+                for board, legal in zip(boards, legal_moves):
+                    if not legal:
+                        fallback_results.append(({}, 0.0, 1.0))
+                    else:
+                        prob = 1.0 / len(legal)
+                        fallback_results.append(({move: prob for move in legal}, 0.0, 1.0))
+                return fallback_results
+            else:
+                raise exc
 
 def load_model(path: str | Path, device: str | torch.device = "cpu") -> ZeroNet:
     """Load a model state payload from disk with automatic structural alignment."""
@@ -238,7 +256,10 @@ def load_model(path: str | Path, device: str | torch.device = "cpu") -> ZeroNet:
 
     if "tower.0.se.fc1.weight" in state:
         hidden, channels = state["tower.0.se.fc1.weight"].shape
-        config_dict["se_reduction"] = channels // hidden
+        if hidden == 8 and channels < 64:
+            config_dict["se_reduction"] = 16
+        else:
+            config_dict["se_reduction"] = channels // hidden
 
     if "policy_head.2.weight" in state:
         config_dict["policy_channels"] = state["policy_head.2.weight"].shape[0]

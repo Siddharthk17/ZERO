@@ -10,12 +10,9 @@ from threading import Condition, Event, Thread
 from typing import Protocol
 
 from .board import Board
-from .constants import WHITE
+from .constants import WHITE, VIRTUAL_LOSS_VALUE, VIRTUAL_LOSS_VISITS, opposite
 from .move import Move
-from .targets import apply_contempt, opponent_value
-
-VIRTUAL_LOSS_VALUE = 3.0
-VIRTUAL_LOSS_VISITS = 3
+from .targets import apply_contempt, opponent_value, DRAW_VALUE
 
 class Evaluator(Protocol):
     """Protocol for batch position evaluators returning priors, value, and uncertainty."""
@@ -344,8 +341,8 @@ class MCTS:
             leaves, terminals = self._collect_batch(board, root, budget - simulations_done)
             if not leaves and not terminals:
                 break
-            for path, value in terminals:
-                self._backpropagate(path, value)
+            for path, value, leaf_turn in terminals:
+                self._backpropagate(path, value, leaf_turn)
             if leaves:
                 self._expand_batch(leaves)
                 batch_sizes.append(len(leaves))
@@ -396,25 +393,32 @@ class MCTS:
 
     def _collect_batch(
         self, board: Board, root: Node, remaining: int
-    ) -> tuple[list[_Leaf], list[tuple[list[Node], float]]]:
+    ) -> tuple[list[_Leaf], list[tuple[list[Node], float, int]]]:
         leaves: list[_Leaf] = []
-        terminals: list[tuple[list[Node], float]] = []
+        terminals: list[tuple[list[Node], float, int]] = []
         target = min(self.batch_size, remaining)
         for _ in range(target):
             sim_board = board.copy()
             node = root
             path = [node]
+            is_repetition = False
             while node.is_expanded and node.children:
                 move, node = self._select_child(node)
                 sim_board.push(move)
                 path.append(node)
-            terminal = sim_board.result_value(sim_board.turn)
-            if terminal is not None:
-                terminals.append((path, terminal))
+                if sim_board.is_threefold_repetition():
+                    is_repetition = True
+                    break
+            if is_repetition:
+                terminals.append((path, DRAW_VALUE, sim_board.turn))
             else:
-                for n in path:
-                    n.apply_virtual_loss()
-                leaves.append(_Leaf(node, sim_board, path))
+                terminal = sim_board.result_value(sim_board.turn)
+                if terminal is not None:
+                    terminals.append((path, terminal, sim_board.turn))
+                else:
+                    for n in path:
+                        n.apply_virtual_loss()
+                    leaves.append(_Leaf(node, sim_board, path))
         return leaves, terminals
 
     def _expand_batch(self, leaves: list[_Leaf]) -> None:
@@ -425,7 +429,7 @@ class MCTS:
             for n in leaf.path:
                 n.undo_virtual_loss()
             self._expand_with_priors(leaf.node, leaf.board, priors, uncertainty)
-            self._backpropagate(leaf.path, value)
+            self._backpropagate(leaf.path, value, leaf.board.turn)
 
     def _expand_with_priors(
         self, node: Node, board: Board, priors: dict[Move, float], uncertainty: float
@@ -451,7 +455,7 @@ class MCTS:
             node.children[move] = child
         node.is_expanded = True
 
-    def _select_child(self, node: Node) -> tuple[Move, Node]:
+    def _select_child(self, node: Node, unvisited_default: float = -1.0) -> tuple[Move, Node]:
         c_puct = self.c_puct
         parent_visit = node.visit_count
         # Precompute square root once per parent selection step to reduce CPU overhead [2]
@@ -462,7 +466,7 @@ class MCTS:
         
         for move, child in node.children.items():
             # Corrected: unvisited nodes default to -1.0 (standard draw) instead of opponent_value(0.0) (-30.0) [2]
-            q_from_parent = opponent_value(child.total_value / child.visit_count) if child.visit_count > 0 else opponent_value(-1.0)
+            q_from_parent = opponent_value(child.total_value / child.visit_count) if child.visit_count > 0 else opponent_value(unvisited_default)
             
             exploration = c_puct * child.prior_probability * sqrt_parent_visit / (1 + child.visit_count)
             score = q_from_parent + exploration
@@ -475,18 +479,27 @@ class MCTS:
             raise RuntimeError("cannot select from a node without children")
         return best
 
-    def _puct_score(self, parent: Node, child: Node) -> float:
+    def _puct_score(self, parent: Node, child: Node, unvisited_default: float = -1.0) -> float:
         parent_visit = parent.visit_count
         sqrt_parent_visit = math.sqrt(max(1, parent_visit))
-        q_from_parent = opponent_value(child.total_value / child.visit_count) if child.visit_count > 0 else opponent_value(-1.0)
+        q_from_parent = opponent_value(child.total_value / child.visit_count) if child.visit_count > 0 else opponent_value(unvisited_default)
         exploration = self.c_puct * child.prior_probability * sqrt_parent_visit / (1 + child.visit_count)
         return q_from_parent + exploration
 
-    def _backpropagate(self, path: list[Node], value: float) -> None:
+    def _backpropagate(self, path: list[Node], value: float, leaf_turn: int) -> None:
+        """Propagate asymmetric rewards up the tree, completely bypassing the involution bug."""
+        if leaf_turn == WHITE:
+            value_white = value
+            value_black = opponent_value(value)
+        else:
+            value_white = opponent_value(value)
+            value_black = value
+
+        curr_turn = leaf_turn
         for node in reversed(path):
             node.visit_count += 1
-            node.total_value += value
-            value = opponent_value(value)
+            node.total_value += value_white if curr_turn == WHITE else value_black
+            curr_turn = opposite(curr_turn)
 
     def _select_move(self, visits: dict[Move, int], temperature: float) -> Move | None:
         if not visits:
