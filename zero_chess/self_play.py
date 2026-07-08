@@ -158,8 +158,6 @@ def play_game(
             mcts.advance_to(move)
         else:
             mcts.reset()
-            if ply % 16 == 15:
-                gc.collect()
 
     meta = _compile_game_metadata(board, sans, start_time)
     return "1/2-1/2", _finalize(records, "1/2-1/2", "max_plies", rng), sans, "max_plies", meta
@@ -305,7 +303,6 @@ def generate_parallel_games(
         results[index] = play_game(mcts, config, rng)
         mcts.reset()
         del mcts
-        gc.collect()
 
     threads = [threading.Thread(target=worker, args=(idx,), daemon=True) for idx in range(games)]
     for thread in threads:
@@ -494,6 +491,12 @@ def start_persistent_cuda_training(
     model_config, shared_state = _model_payload_for_process(model)
     train_config_dict = asdict(train_config)
 
+    # Split VRAM budget safely between processes (e.g., if input is 0.90):
+    # Evaluator: 0.90 * 0.25 = 22.5% VRAM (~5.4 GB) -> Plenty for batch size 256
+    # Trainer:   0.90 * 0.70 = 63.0% VRAM (~15.0 GB) -> Remaining for heavy backpropagation
+    eval_memory_fraction = cuda_memory_fraction * 0.25
+    train_memory_fraction = cuda_memory_fraction * 0.70
+
     evaluator = ctx.Process(
         target=_persistent_gpu_evaluator_process_main,
         args=(
@@ -507,7 +510,7 @@ def start_persistent_cuda_training(
             response_queues,
             gpu_batch_size,
             eval_wait_ms,
-            cuda_memory_fraction,
+            eval_memory_fraction,  # <-- Passes optimized 22.5%
             gpu_cooldown_ms,
             compile_model,
             positions_evaluated,
@@ -531,7 +534,7 @@ def start_persistent_cuda_training(
             generation_value,
             train_config_dict,
             device,
-            cuda_memory_fraction,
+            train_memory_fraction,  # <-- Passes optimized 63%
             updates_per_game,
             iteration,
             train_updates,
@@ -613,6 +616,15 @@ def _persistent_self_play_process_main(
     active_workers,
 ) -> None:
     _ensure_importable()
+
+    # Win32 Process Priority Optimization
+    try:
+        import psutil
+        p = psutil.Process()
+        p.nice(psutil.HIGH_PRIORITY_CLASS)
+    except Exception:
+        pass
+
     active_workers[worker_id] = True
     try:
         rng = random.Random(rng_seed)
@@ -633,7 +645,6 @@ def _persistent_self_play_process_main(
                 game_queue.put((worker_id, game_result, None))
                 mcts.reset()
                 del mcts
-                gc.collect()
                 with games_completed.get_lock():
                     games_completed.value += 1
             except Exception:
@@ -700,8 +711,9 @@ def _persistent_gpu_evaluator_process_main(
             flat_legal_ucis.extend(legal_ucis)
 
         total_positions = len(flat_fens)
+        if total_positions == 0:
+            continue
 
-        # Increment batch and evaluation stats counters
         with positions_evaluated.get_lock():
             positions_evaluated.value += total_positions
         with eval_batches.get_lock():
@@ -717,6 +729,19 @@ def _persistent_gpu_evaluator_process_main(
             boards = [Board.from_fen(fen) for fen in flat_fens]
             tensors = encode_boards(boards, device="cpu")
             masks = torch.stack([_encode_move_mask_from_ucis(b, legal, device="cpu") for b, legal in zip(boards, flat_legal_ucis)])
+
+            # --- STATIC BATCH PADDING FIX ---
+            # Pad tensors and masks to the exact gpu_batch_size to prevent compile recompilation
+            actual_size = tensors.shape[0]
+            if actual_size < gpu_batch_size:
+                padding_size = gpu_batch_size - actual_size
+                # Allocate zeros directly on CPU to match shape (padding_size, channels, 8, 8)
+                tensor_padding = torch.zeros((padding_size, tensors.shape[1], 8, 8), dtype=tensors.dtype)
+                mask_padding = torch.zeros((padding_size, masks.shape[1]), dtype=masks.dtype)
+
+                tensors = torch.cat([tensors, tensor_padding], dim=0)
+                masks = torch.cat([masks, mask_padding], dim=0)
+
             is_cuda = device == "cuda" and torch.cuda.is_available()
             if is_cuda:
                 tensors = tensors.pin_memory().to(device, non_blocking=True)
@@ -725,11 +750,15 @@ def _persistent_gpu_evaluator_process_main(
                 tensors = tensors.to(device)
                 masks = masks.to(device)
             amp_dtype = torch.bfloat16 if is_cuda and torch.cuda.is_bf16_supported() else torch.float16
-            with torch.autocast(device_type=device, dtype=amp_dtype, enabled=is_cuda):
-                out = compiled_model(tensors, masks, return_dict=True)
-            raw_values = out["value"].squeeze(-1).detach().cpu().tolist()
-            raw_uncertainties = out["uncertainty"].detach().cpu().tolist()
-            raw_policies = out["policy"].detach().cpu()
+            with torch.no_grad():
+                with torch.autocast(device_type=device, dtype=amp_dtype, enabled=is_cuda):
+                    out = compiled_model(tensors, masks, return_dict=True)
+
+            # Slice the outputs back to their actual unpadded sizes
+            raw_values = out["value"][:actual_size].squeeze(-1).detach().cpu().tolist()
+            raw_uncertainties = out["uncertainty"][:actual_size].detach().cpu().tolist()
+            raw_policies = out["policy"][:actual_size].detach().cpu()
+
             legal_probs = []
             for batch_idx, (board, legal) in enumerate(zip(boards, flat_legal_ucis)):
                 indices = torch.tensor([move_to_policy_index(board, Move.from_uci(uci)) for uci in legal], dtype=torch.long)
@@ -758,8 +787,6 @@ def _persistent_gpu_evaluator_process_main(
         # Fulfill defined GPU cooldown sleep parameter to avoid thermal limits
         if gpu_cooldown_ms > 0.0:
             time.sleep(gpu_cooldown_ms / 1000.0)
-
-        gc.collect()
 
 def _encode_move_mask_from_ucis(board: Board, legal_ucis: list[str], device: str | None = None):
     """Build a float legal-move mask from pre-computed UCI strings (no re-generation)."""
@@ -913,7 +940,6 @@ def _self_play_process_main(
         game_queue.put((worker_id, game_result, None))
         mcts.reset()
         del mcts
-        gc.collect()
     except Exception:
         game_queue.put((worker_id, None, traceback.format_exc()))
     finally:
@@ -969,8 +995,9 @@ def _gpu_evaluator_process_main(
                 tensors = tensors.to(device)
                 masks = masks.to(device)
             amp_dtype = torch.bfloat16 if is_cuda and torch.cuda.is_bf16_supported() else torch.float16
-            with torch.autocast(device_type=device, dtype=amp_dtype, enabled=is_cuda):
-                out = model(tensors, masks, return_dict=True)
+            with torch.no_grad():
+                with torch.autocast(device_type=device, dtype=amp_dtype, enabled=is_cuda):
+                    out = model(tensors, masks, return_dict=True)
             raw_values = out["value"].squeeze(-1).detach().cpu().tolist()
             raw_uncertainties = out["uncertainty"].detach().cpu().tolist()
             raw_policies = out["policy"].detach().cpu()
@@ -1274,7 +1301,6 @@ def _trainer_process_main(
                 metrics=metrics,
             )
 
-            gc.collect()
             if device == "cuda":
                 torch.cuda.empty_cache()
     finally:
