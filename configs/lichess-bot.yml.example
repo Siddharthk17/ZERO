@@ -5,7 +5,7 @@ engine:
   name: "ZERO"
   protocol: "uci"
   working_dir: "."
-  command: "python -m zero_chess.uci --checkpoint checkpoints/zero.pt --device cuda --simulations 800"
+  command: "python -m zero_chess.uci --checkpoint checkpoints/zero_x/accepted.pt --device cuda --simulations 800"
   ponder: false
   polyglot:
     enabled: false

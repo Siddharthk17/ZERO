@@ -86,12 +86,13 @@ export default function PlayPage() {
 
   // Synchronize board UI state
   function syncGame() {
-    setFen(game.fen());
-    setHistory(game.history({ verbose: true }) as Move[]);
+    const currentGame = gameRef.current;
+    setFen(currentGame.fen());
+    setHistory(currentGame.history({ verbose: true }) as Move[]);
     setSelected(null);
     
-    if (game.isGameOver()) {
-      setResult(gameResultLabel(game));
+    if (currentGame.isGameOver()) {
+      setResult(gameResultLabel(currentGame));
       if (soundEnabled) chessAudio.playGameOver();
     }
   }
@@ -104,22 +105,25 @@ export default function PlayPage() {
 
   // Trigger engine calculation
   function maybeEngineMove() {
-    if (!online || game.isGameOver()) return;
+    const requestedGame = gameRef.current;
+    const requestedFen = requestedGame.fen();
+    if (!online || requestedGame.isGameOver()) return;
     setThinking(true);
     engine
-      .requestBestMove({ fen: game.fen(), move_time: 1000 })
+      .requestBestMove({ fen: requestedFen, move_time: 1000 })
       .then((response) => {
+        if (gameRef.current !== requestedGame || requestedGame.fen() !== requestedFen) return;
         if (response.move && response.move !== "0000") {
           const from = response.move.slice(0, 2) as Square;
           const to = response.move.slice(2, 4) as Square;
           const promo = response.move[4] as PieceSymbol | undefined;
           
-          const move = game.move({ from, to, promotion: promo ?? "q" });
+          const move = requestedGame.move({ from, to, promotion: promo ?? "q" });
           if (move) {
             if (soundEnabled) {
               if (move.captured) chessAudio.playCapture();
               else chessAudio.playMove();
-              if (game.isCheck()) chessAudio.playCheck();
+              if (requestedGame.isCheck()) chessAudio.playCheck();
             }
             syncGame();
           }

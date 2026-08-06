@@ -3,14 +3,20 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from zero_chess import Board
-from zero_chess.constants import parse_square
-from zero_chess.encoding import INPUT_CHANNELS, POLICY_SIZE, encode_board, encode_boards, encode_move_mask, move_to_policy_index
+from zero_chess.encoding import (
+    INPUT_CHANNELS,
+    POLICY_SIZE,
+    encode_board,
+    encode_boards,
+    encode_move_mask,
+    move_to_policy_index,
+)
 
 
 def test_starting_position_encoding_shape_and_planes() -> None:
     board = Board()
     tensor = encode_board(board)
-    assert tensor.shape == (119, 8, 8)
+    assert tensor.shape == (121, 8, 8)
     assert tensor[0, 1].sum().item() == 8
     assert tensor[3, 0, 0].item() == 1
     assert tensor[3, 0, 7].item() == 1
@@ -23,6 +29,8 @@ def test_starting_position_encoding_shape_and_planes() -> None:
     assert all(tensor[idx].min().item() == 1 for idx in range(113, 117))
     assert tensor[117].sum().item() == 0
     assert torch.allclose(tensor[118], torch.full((8, 8), 1 / 512))
+    assert torch.allclose(tensor[119], torch.full((8, 8), 0.0))
+    assert torch.allclose(tensor[120], torch.full((8, 8), 0.0))
 
 
 def test_black_to_move_is_rotated_to_own_pieces() -> None:

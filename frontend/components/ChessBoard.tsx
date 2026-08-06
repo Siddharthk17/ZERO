@@ -1,6 +1,7 @@
 "use client";
 
 import type { CSSProperties } from "react";
+import Image from "next/image";
 import { Chessboard } from "react-chessboard";
 import type { BoardOrientation } from "react-chessboard/dist/chessboard/types";
 import type { Move, PieceSymbol, Square } from "chess.js";
@@ -42,12 +43,14 @@ export function ZeroChessBoard({
     pieces.map((piece) => [
       piece,
       ({ squareWidth }: { squareWidth: number }) => (
-        <img
-          className="piece-img"
-          src={`/pieces/cburnett/${piece}.svg?v=${pieceAssetVersion}`}
-          alt={piece}
-          style={{ width: squareWidth, height: squareWidth }}
-        />
+        <Image
+            className="piece-img"
+            src={`/pieces/cburnett/${piece}.svg?v=${pieceAssetVersion}`}
+            alt={piece}
+            width={squareWidth}
+            height={squareWidth}
+            unoptimized
+          />
       )
     ])
   );

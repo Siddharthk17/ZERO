@@ -1,144 +1,170 @@
-"""High-performance, memory-safe Arena evaluation between checkpoints."""
+"""Deterministic checkpoint gating for the ZERO-X training loop."""
 
 from __future__ import annotations
 
-import argparse
-import gc
 import json
+import math
+import random
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .board import Board
-from .constants import BLACK, WHITE
-from .elo import DEFAULT_ELO, update_rating_from_result
-from .mcts import MCTS, NetworkEvaluator, UniformEvaluator
+from .constants import WHITE
+from .mcts import MCTS, NetworkEvaluator
+from .model import load_model
 
-def play_arena(
+
+@dataclass(slots=True)
+class MatchResult:
+    games: int
+    wins_a: int
+    wins_b: int
+    draws: int
+    score_a: float
+    score_fraction: float
+    elo_difference: float
+    score_low: float
+    score_high: float
+    simulations: int
+    opening_random_plies: int
+    seed: int
+
+    def as_dict(self) -> dict[str, float]:
+        return {key: float(value) for key, value in asdict(self).items()}
+
+
+def play_match(
     evaluator_a,
     evaluator_b,
+    *,
     games: int = 40,
-    simulations: int = 800,
+    simulations: int = 64,
     max_plies: int = 512,
-    iteration: int = 0,
-    elo_a: float = DEFAULT_ELO,
-    elo_b: float = DEFAULT_ELO,
-    log_path: str | None = "logs/arena.log",
-) -> dict[str, float]:
-    """Play a series of games between two evaluators and return summary statistics.
+    opening_random_plies: int = 4,
+    seed: int = 0,
+) -> MatchResult:
+    """Play a color-balanced, no-noise match between two evaluators."""
+    if games <= 0 or games % 2 != 0:
+        raise ValueError("gating games must be a positive even number")
+    if simulations <= 0 or max_plies <= 0 or opening_random_plies < 0:
+        raise ValueError("gating simulations and max_plies must be positive")
 
-    Each evaluator plays half the games as White.  Results are logged as JSON lines
-    to ``log_path`` when provided.  Returns a dict with scores, win counts, draws,
-    a ``promote`` flag (>60% score), and updated Elo ratings.
-    """
-    score_a = 0.0
     wins_a = wins_b = draws = 0
-    current_elo_a = float(elo_a)
-    current_elo_b = float(elo_b)
-
-    for game_idx in range(games):
+    rng = random.Random(seed)
+    for game_index in range(games):
         board = Board.starting_position()
-        a_is_white = game_idx < games // 2
-        
-        # Instantiate persistent MCTS objects for the game to leverage transposition table & subtree reuse
-        mcts_a = MCTS(evaluator_a, simulations=simulations, resign_threshold=-1.0, batch_size=32)
-        mcts_b = MCTS(evaluator_b, simulations=simulations, resign_threshold=-1.0, batch_size=32)
+        history: list[Board] = []
+        mcts_a = MCTS(evaluator_a, simulations=simulations, batch_size=32, add_noise=False, resign_threshold=-1.0)
+        mcts_b = MCTS(evaluator_b, simulations=simulations, batch_size=32, add_noise=False, resign_threshold=-1.0)
+        a_is_white = game_index < games // 2
 
-        for _ in range(max_plies):
+        opening_count = min(opening_random_plies, max_plies)
+        for _ in range(opening_count):
+            if board.outcome() is not None:
+                break
+            legal = board.legal_moves()
+            if not legal:
+                break
+            played = rng.choice(legal)
+            previous = board.copy()
+            board.push(played)
+            history.insert(0, previous)
+            del history[7:]
+
+        for _ply in range(max_plies - opening_count):
             result = board.outcome()
             if result is not None:
                 break
-            
-            use_a = (board.turn == WHITE and a_is_white) or (board.turn == BLACK and not a_is_white)
-            active_mcts = mcts_a if use_a else mcts_b
-            
-            # Non-Zero-Sum aggressive search
-            search = active_mcts.search(board, temperature=0.0)
-            move = search.move
-            if move is None:
+            active = mcts_a if (board.turn == WHITE) == a_is_white else mcts_b
+            search = active.search(
+                board,
+                num_simulations=simulations,
+                temperature=0.0,
+                add_noise=False,
+                history=history,
+            )
+            if search.move is None:
                 break
-                
-            board.push(move)
-            
-            # Advance tree roots for both players to reuse evaluated subtrees
-            mcts_a.advance_to(move)
-            mcts_b.advance_to(move)
+            played = search.move
+            previous = board.copy()
+            board.push(played)
+            history.insert(0, previous)
+            del history[7:]
+            mcts_a.advance_to(played)
+            mcts_b.advance_to(played)
 
         result = board.outcome() or "1/2-1/2"
         if result == "1/2-1/2":
             draws += 1
         elif (result == "1-0") == a_is_white:
-            score_a += 1.0
             wins_a += 1
         else:
             wins_b += 1
 
-        a_perspective = WHITE if a_is_white else BLACK
-        b_perspective = BLACK if a_is_white else WHITE
-        previous_elo_a = current_elo_a
-        previous_elo_b = current_elo_b
-        
-        current_elo_a, _ = update_rating_from_result(previous_elo_a, previous_elo_b, result, a_perspective)
-        current_elo_b, _ = update_rating_from_result(previous_elo_b, previous_elo_a, result, b_perspective)
+        # Keep the random stream advancing even when the game is deterministic
+        # so future opening/match extensions remain seed-stable.
+        rng.random()
 
-        # Clear MCTS trees and garbage collect to prevent RAM build-up on tight systems (8GB)
-        mcts_a.reset()
-        mcts_b.reset()
-        del mcts_a
-        del mcts_b
-        gc.collect()
-        
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except ImportError:
-            pass
+    score_a = wins_a + 0.5 * draws
+    score_fraction = score_a / games
+    elo_difference = _elo_difference(score_fraction)
+    score_low, score_high = _wilson_interval(score_fraction, games)
+    return MatchResult(
+        games=games,
+        wins_a=wins_a,
+        wins_b=wins_b,
+        draws=draws,
+        score_a=score_a,
+        score_fraction=score_fraction,
+        elo_difference=elo_difference,
+        score_low=score_low,
+        score_high=score_high,
+        simulations=simulations,
+        opening_random_plies=opening_random_plies,
+        seed=seed,
+    )
 
-    result_summary = {
-        "iteration": iteration,
-        "games": games,
-        "student_score": score_a,
-        "teacher_score": games - score_a,
-        "wins_a": wins_a,
-        "wins_b": wins_b,
-        "draws": draws,
-        "promote": score_a > games * 0.60,
-        "elo_a": current_elo_a,
-        "elo_b": current_elo_b,
-    }
 
-    if log_path:
+def gate_checkpoints(
+    candidate_path: str | Path,
+    incumbent_path: str | Path,
+    *,
+    games: int = 40,
+    simulations: int = 64,
+    device: str = "cpu",
+    opening_random_plies: int = 4,
+    seed: int = 0,
+    log_path: str | Path | None = None,
+) -> MatchResult:
+    """Evaluate candidate A against incumbent B without changing either file."""
+    candidate = load_model(candidate_path, device)
+    incumbent = load_model(incumbent_path, device)
+    result = play_match(
+        NetworkEvaluator(candidate, device),
+        NetworkEvaluator(incumbent, device),
+        games=games,
+        simulations=simulations,
+        opening_random_plies=opening_random_plies,
+        seed=seed,
+    )
+    if log_path is not None:
         path = Path(log_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(result_summary, sort_keys=True) + "\n")
-            
-    return result_summary
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(result.as_dict(), sort_keys=True) + "\n")
+    return result
 
-def _load_eval(path: str | None, device: str):
-    if not path or path == "uniform":
-        return UniformEvaluator()
-    from .model import load_model
 
-    return NetworkEvaluator(load_model(path, device), device)
+def _elo_difference(score_fraction: float) -> float:
+    score_fraction = min(1.0 - 1e-6, max(1e-6, float(score_fraction)))
+    return 400.0 * math.log10(score_fraction / (1.0 - score_fraction))
 
-def main(argv: list[str] | None = None) -> None:
-    """CLI entry point: evaluate two checkpoints head-to-head."""
-    parser = argparse.ArgumentParser(description="Evaluate two ZERO checkpoints.")
-    parser.add_argument("--a", default="uniform")
-    parser.add_argument("--b", default="uniform")
-    parser.add_argument("--games", type=int, default=40)
-    parser.add_argument("--simulations", type=int, default=800)
-    parser.add_argument("--device", default="cpu")
-    args = parser.parse_args(argv)
-    
-    result = play_arena(
-        _load_eval(args.a, args.device), 
-        _load_eval(args.b, args.device), 
-        args.games, 
-        args.simulations
-    )
-    result["win_rate_a"] = result["student_score"] / max(1, result["games"])
-    print(result)
 
-if __name__ == "__main__":  # pragma: no cover
-    main()
+def _wilson_interval(score_fraction: float, games: int) -> tuple[float, float]:
+    z = 1.959963984540054
+    n = float(games)
+    p = float(score_fraction)
+    denominator = 1.0 + z * z / n
+    center = (p + z * z / (2.0 * n)) / denominator
+    radius = z * math.sqrt((p * (1.0 - p) + z * z / (4.0 * n)) / n) / denominator
+    return max(0.0, center - radius), min(1.0, center + radius)

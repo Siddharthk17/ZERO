@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import threading
@@ -11,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .model import ZeroNet, save_model
+
 
 @dataclass(slots=True)
 class CheckpointMeta:
@@ -43,15 +45,15 @@ class CheckpointManager:
             self.directory.mkdir(parents=True, exist_ok=True)
             name = f"zero_iter_{iteration:07d}.pt"
             path = self.directory / name
-            
+
             # Atomic weight write using the robust tmp-replace design
             save_model(path, model, iteration=iteration, elo=elo, optimizer=optimizer_state, metrics=metrics or {})
-            
+
             latest_path = self.directory / "latest.pt"
             latest_tmp = latest_path.with_suffix(latest_path.suffix + ".tmp")
             shutil.copy2(path, latest_tmp)
             latest_tmp.replace(latest_path)
-            
+
             meta = CheckpointMeta(
                 iteration=iteration,
                 elo=elo,
@@ -59,14 +61,14 @@ class CheckpointManager:
                 created_at=datetime.now(timezone.utc).isoformat(),
                 metrics=metrics or {},
             )
-            
+
             index = self._read_index()
             # Remove any existing entry for this iteration to prevent duplicates
             # (reconstruction may have already added it from the file we just wrote)
             index = [item for item in index if item["iteration"] != iteration]
             index.append(asdict(meta))
             index.sort(key=lambda item: item["iteration"])
-            
+
             self._write_index(index)
             self._prune(index)
             self._cleanup_index(index)
@@ -77,7 +79,7 @@ class CheckpointManager:
             index = self._read_index()
             if not index:
                 return None
-            
+
             # Ensure the latest returned checkpoint file actually exists on disk
             for item in reversed(index):
                 if Path(item["path"]).exists():
@@ -100,7 +102,7 @@ class CheckpointManager:
             index = []
             if not self.directory.exists():
                 return index
-                
+
             pattern = re.compile(r"zero_iter_(\d+)\.pt")
             for p in self.directory.glob("zero_iter_*.pt"):
                 match = pattern.match(p.name)
@@ -114,7 +116,7 @@ class CheckpointManager:
                         metrics={},
                     )
                     index.append(asdict(meta))
-                    
+
             index.sort(key=lambda item: item["iteration"])
             if index:
                 try:
@@ -126,7 +128,10 @@ class CheckpointManager:
     def _write_index(self, index: list[dict]) -> None:
         with self._lock:
             tmp_path = self.index_path.with_suffix(self.index_path.suffix + ".tmp")
-            tmp_path.write_text(json.dumps(index, indent=2), encoding="utf-8")
+            with tmp_path.open("w", encoding="utf-8") as stream:
+                stream.write(json.dumps(index, indent=2))
+                stream.flush()
+                os.fsync(stream.fileno())
             tmp_path.replace(self.index_path)
 
     def _prune(self, index: list[dict]) -> None:

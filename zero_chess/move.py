@@ -28,7 +28,7 @@ class Move:
     def __post_init__(self) -> None:
         if not (0 <= self.from_sq < 64 and 0 <= self.to_sq < 64):
             raise ValueError(f"move squares out of range: {self.from_sq}->{self.to_sq}")
-            
+
         promo = self.promotion
         if promo is not None:
             # Fast-path check for pre-validated uppercase symbols (99% of internal moves)

@@ -8,8 +8,8 @@ from typing import Iterable
 
 from .constants import (
     BISHOP_DIRS,
-    BLACK,
     BK,
+    BLACK,
     BQ,
     EMPTY,
     KING_DELTAS,
@@ -38,8 +38,9 @@ from .move import (
     QUEEN_CASTLE,
     Move,
 )
-from .zobrist import CASTLING_KEYS, EP_FILE_KEYS, PIECE_INDEX, PIECE_KEYS, TURN_KEY, mask64
 from .targets import game_result_to_values
+from .zobrist import CASTLING_KEYS, EP_FILE_KEYS, PIECE_INDEX, PIECE_KEYS, TURN_KEY, mask64
+
 
 @dataclass(slots=True)
 class _State:
@@ -116,7 +117,11 @@ class Board:
 
         rights = 0
         if castling != "-":
+            seen_rights = set()
             for ch in castling:
+                if ch in seen_rights:
+                    raise ValueError(f"duplicate castling right: {ch!r}")
+                seen_rights.add(ch)
                 if ch == "K":
                     rights |= WK
                 elif ch == "Q":
@@ -129,7 +134,18 @@ class Board:
                     raise ValueError(f"invalid castling right: {ch!r}")
 
         ep_square = None if ep == "-" else parse_square(ep)
-        return cls(board, turn, rights, ep_square, int(halfmove), int(fullmove))
+        if ep_square is not None:
+            expected_rank = 5 if turn == WHITE else 2
+            if ep_square >> 3 != expected_rank:
+                raise ValueError(f"invalid en-passant rank for active color: {ep!r}")
+        try:
+            halfmove_clock = int(halfmove)
+            fullmove_number = int(fullmove)
+        except ValueError as exc:
+            raise ValueError(f"invalid FEN move counters: {halfmove!r} {fullmove!r}") from exc
+        if halfmove_clock < 0 or fullmove_number < 1:
+            raise ValueError("FEN move counters must be non-negative and fullmove_number >= 1")
+        return cls(board, turn, rights, ep_square, halfmove_clock, fullmove_number)
 
     @staticmethod
     def _parse_placement(placement: str) -> list[str]:
@@ -141,8 +157,10 @@ class Board:
             rank = 7 - fen_rank
             file_ = 0
             for ch in text:
-                if ch.isdigit():
-                    file_ += int(ch)
+                if "1" <= ch <= "8":
+                    file_ += ord(ch) - ord("0")
+                    if file_ > 8:
+                        raise ValueError(f"too many squares in FEN rank: {text!r}")
                 elif ch in "PNBRQKpnbrqk":
                     if file_ >= 8:
                         raise ValueError(f"too many squares in FEN rank: {text!r}")
@@ -156,7 +174,7 @@ class Board:
 
     def copy(self) -> "Board":
         """Return a deep copy of the board including move stack and hash history."""
-        return Board(
+        clone = Board(
             self.squares,
             self.turn,
             self.castling_rights,
@@ -165,6 +183,8 @@ class Board:
             self.fullmove_number,
             self.hash_history,
         )
+        clone._stack = self._stack.copy()
+        return clone
 
     def fen(self) -> str:
         """Return the standard FEN string for the current position."""
@@ -211,27 +231,51 @@ class Board:
         if self.turn == BLACK:
             value ^= TURN_KEY
         value ^= CASTLING_KEYS[self.castling_rights]
-        if self.ep_square is not None:
-            value ^= EP_FILE_KEYS[self.ep_square & 7]
+        ep_file = self._effective_ep_file()
+        if ep_file is not None:
+            value ^= EP_FILE_KEYS[ep_file]
         return mask64(value)
 
-    def piece_bitboards(self) -> dict[str, int]:
-        """Return a dict mapping each piece symbol to its occupancy bitboard (64-bit int)."""
-        bitboards = {piece: 0 for piece in "PNBRQKpnbrqk"}
-        for sq, piece in enumerate(self.squares):
-            if piece != EMPTY:
-                bitboards[piece] |= 1 << sq
-        return bitboards
+    def _effective_ep_file(self) -> int | None:
+        """Return the en-passant file only when a legal capture is available.
 
-    def occupancy_bitboards(self) -> tuple[int, int, int]:
-        """Return ``(white_occ, black_occ, total_occ)`` as 64-bit bitboard integers."""
-        white = black = 0
-        for sq, piece in enumerate(self.squares):
-            if piece in "PNBRQK":
-                white |= 1 << sq
-            elif piece in "pnbrqk":
-                black |= 1 << sq
-        return white, black, white | black
+        FIDE repetition identity ignores a stale en-passant target.  This helper
+        performs the small, direct board mutation needed to account for king
+        safety without changing the move stack or incremental hash state.
+        """
+        if self.ep_square is None:
+            return None
+        ep_file = self.ep_square & 7
+        ep_rank = self.ep_square >> 3
+        expected_rank = 5 if self.turn == WHITE else 2
+        if ep_rank != expected_rank or self.squares[self.ep_square] != EMPTY:
+            return None
+
+        step = 1 if self.turn == WHITE else -1
+        captured_sq = self.ep_square - 8 if self.turn == WHITE else self.ep_square + 8
+        expected_pawn = "p" if self.turn == WHITE else "P"
+        if not (0 <= captured_sq < 64) or self.squares[captured_sq] != expected_pawn:
+            return None
+
+        rank = self.ep_square >> 3
+        for file_ in (ep_file - 1, ep_file + 1):
+            if not 0 <= file_ < 8:
+                continue
+            from_sq = (rank - step) * 8 + file_
+            pawn = self.squares[from_sq]
+            expected_moving_pawn = "P" if self.turn == WHITE else "p"
+            if pawn != expected_moving_pawn:
+                continue
+            self.squares[from_sq] = EMPTY
+            self.squares[captured_sq] = EMPTY
+            self.squares[self.ep_square] = pawn
+            legal = not self.is_check(self.turn)
+            self.squares[from_sq] = pawn
+            self.squares[captured_sq] = expected_pawn
+            self.squares[self.ep_square] = EMPTY
+            if legal:
+                return ep_file
+        return None
 
     def king_square(self, color: int) -> int:
         """Return the 0-63 square index of the king for the given color.
@@ -476,7 +520,6 @@ class Board:
             raise ValueError(f"cannot move from empty square: {move}")
         color = self.turn
         old_castling = self.castling_rights
-        old_ep = self.ep_square
         captured_sq = move.to_sq
         captured = self.squares[move.to_sq]
         if move.flags & EN_PASSANT:
@@ -497,8 +540,9 @@ class Board:
 
         new_hash = self.zobrist_hash
         new_hash ^= CASTLING_KEYS[old_castling]
-        if old_ep is not None:
-            new_hash ^= EP_FILE_KEYS[old_ep & 7]
+        old_ep_file = self._effective_ep_file()
+        if old_ep_file is not None:
+            new_hash ^= EP_FILE_KEYS[old_ep_file]
         new_hash ^= PIECE_KEYS[PIECE_INDEX[piece]][move.from_sq]
         if captured != EMPTY:
             new_hash ^= PIECE_KEYS[PIECE_INDEX[captured]][captured_sq]
@@ -543,8 +587,6 @@ class Board:
         else:
             self.ep_square = None
         new_hash ^= CASTLING_KEYS[self.castling_rights]
-        if self.ep_square is not None:
-            new_hash ^= EP_FILE_KEYS[self.ep_square & 7]
 
         if piece_type(piece) == "P" or captured != EMPTY:
             self.halfmove_clock = 0
@@ -555,6 +597,9 @@ class Board:
             self.fullmove_number += 1
         self.turn = opposite(self.turn)
         new_hash ^= TURN_KEY
+        new_ep_file = self._effective_ep_file()
+        if new_ep_file is not None:
+            new_hash ^= EP_FILE_KEYS[new_ep_file]
         self.zobrist_hash = mask64(new_hash)
         self.hash_history.append(self.zobrist_hash)
 
@@ -634,7 +679,7 @@ class Board:
         black_bishops = []
         white_knights = 0
         black_knights = 0
-        
+
         for sq, piece in enumerate(self.squares):
             if piece == EMPTY:
                 continue
@@ -651,23 +696,23 @@ class Board:
                     white_knights += 1
                 else:
                     black_knights += 1
-                    
+
         total_minors = len(white_bishops) + len(black_bishops) + white_knights + black_knights
-        
+
         # K vs K
         if total_minors == 0:
             return True
-            
+
         # K+B vs K or K+N vs K
         if total_minors == 1:
             return True
-            
+
         # Bishop draws (all bishops on same square color, e.g. K+B vs K+B same-color or K+B+B vs K same-color)
         if white_knights == 0 and black_knights == 0:
             all_bishops = white_bishops + black_bishops
             if len(set(all_bishops)) == 1:
                 return True
-                
+
         return False
 
     def is_fifty_move_draw(self) -> bool:
@@ -700,28 +745,29 @@ class Board:
         ``'1-0'`` if White wins, ``'0-1'`` if Black wins, ``'1/2-1/2'`` for a draw,
         or ``None`` if the game is still in progress.
         """
-        # M2: Immediate check for 50-move rule draw
-        if self.halfmove_clock >= 100:
+        # Checkmate and stalemate take precedence over claimable draw rules.
+        if not self.has_legal_moves():
+            if self.is_check(self.turn):
+                return "0-1" if self.turn == WHITE else "1-0"
             return "1/2-1/2"
         if self.has_insufficient_material():
             return "1/2-1/2"
+        # The 75-move rule is automatic; the 50-move rule is claimable.
+        if self.halfmove_clock >= 150:
+            return "1/2-1/2"
         if claim_draws and (self.is_fifty_move_draw() or self.is_threefold_repetition()):
             return "1/2-1/2"
-        if self.has_legal_moves():
-            return None
-        if self.is_check(self.turn):
-            return "0-1" if self.turn == WHITE else "1-0"
-        return "1/2-1/2"
+        return None
 
     def result_values(self) -> tuple[float, float] | None:
-        """Return (white_reward, black_reward) supporting the asymmetric draw-as-loss penalty."""
+        """Return pure zero-sum ``(white_value, black_value)`` terminal targets."""
         result = self.outcome()
         if result is None:
             return None
         return game_result_to_values(result)
 
     def result_value(self, perspective: int) -> float | None:
-        """Backward compatibility for zero-sum value evaluation paths."""
+        """Return the terminal target from the requested player's perspective."""
         res = self.result_values()
         if res is None:
             return None

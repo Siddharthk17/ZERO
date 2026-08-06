@@ -69,22 +69,6 @@ def piece_for(color: int, kind: str) -> str:
     """Format piece symbol representation according to color."""
     return kind.upper() if color == WHITE else kind.lower()
 
-def on_board(file_: int, rank: int) -> bool:
-    """Verify if file and rank indices lie inside the 8x8 boundaries."""
-    return 0 <= file_ < 8 and 0 <= rank < 8
-
-def square(file_: int, rank: int) -> int:
-    """Convert file and rank indices into a 0-63 square using fast bitwise shifts."""
-    return (rank << 3) | file_
-
-def file_of(sq: int) -> int:
-    """Extract the file (column) index of a square [0-7]."""
-    return sq & 7
-
-def rank_of(sq: int) -> int:
-    """Extract the rank (row) index of a square [0-7]."""
-    return sq >> 3
-
 def square_name(sq: int) -> str:
     """Return standard algebraic notation (e.g. 'e4') for a square index."""
     return f"{chr(97 + (sq & 7))}{(sq >> 3) + 1}"

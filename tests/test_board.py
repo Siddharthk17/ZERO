@@ -1,3 +1,5 @@
+import pytest
+
 from zero_chess import Board
 from zero_chess.constants import parse_square
 
@@ -92,8 +94,10 @@ def test_board_default_is_starting_position() -> None:
 
 
 def test_piece_move_generation_smoke() -> None:
-    assert {"d4d5", "d4c5", "d4e5"} <= {m.uci() for m in Board.from_fen("4k3/8/8/2p1p3/3P4/8/8/4K3 w - - 0 1").legal_moves()}
-    assert {"d4b5", "d4f5", "d4b3", "d4f3"} <= {m.uci() for m in Board.from_fen("4k3/8/8/8/3N4/8/8/4K3 w - - 0 1").legal_moves()}
+    pawn_moves = {m.uci() for m in Board.from_fen("4k3/8/8/2p1p3/3P4/8/8/4K3 w - - 0 1").legal_moves()}
+    knight_moves = {m.uci() for m in Board.from_fen("4k3/8/8/8/3N4/8/8/4K3 w - - 0 1").legal_moves()}
+    assert {"d4d5", "d4c5", "d4e5"} <= pawn_moves
+    assert {"d4b5", "d4f5", "d4b3", "d4f3"} <= knight_moves
     assert "d4h8" in {m.uci() for m in Board.from_fen("7k/8/8/8/3B4/8/8/4K3 w - - 0 1").legal_moves()}
     assert "d4d8" in {m.uci() for m in Board.from_fen("3k4/8/8/8/3R4/8/8/4K3 w - - 0 1").legal_moves()}
     assert {"d4d8", "d4h8"} <= {m.uci() for m in Board.from_fen("3k3k/8/8/8/3Q4/8/8/4K3 w - - 0 1").legal_moves()}
@@ -214,6 +218,37 @@ def test_zobrist_includes_castling_and_en_passant() -> None:
     with_ep = Board.from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1")
     without_ep = Board.from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - - 0 1")
     assert with_ep.zobrist_hash != without_ep.zobrist_hash
+
+
+def test_zobrist_ignores_stale_en_passant_targets() -> None:
+    stale = Board.from_fen("4k3/8/8/8/8/8/4P3/4K3 b - e3 0 1")
+    no_ep = Board.from_fen("4k3/8/8/8/8/8/4P3/4K3 b - - 0 1")
+    assert stale.zobrist_hash == no_ep.zobrist_hash
+
+
+def test_copy_preserves_undo_stack() -> None:
+    board = Board()
+    board.push_uci("e2e4")
+    clone = board.copy()
+    clone.pop()
+    assert clone.fen() == Board().fen()
+    assert board.fen() != clone.fen()
+
+
+def test_outcome_prioritizes_checkmate_and_honors_claim_flag() -> None:
+    mate = Board.from_fen("7k/6Q1/6K1/8/8/8/8/8 b - - 100 1")
+    assert mate.outcome() == "1-0"
+    ongoing = Board.from_fen("4k2r/8/8/8/8/8/8/R3K3 w Qk - 100 1")
+    assert ongoing.outcome(claim_draws=False) is None
+
+
+def test_fen_rejects_invalid_zero_and_negative_counters() -> None:
+    with pytest.raises(ValueError):
+        Board.from_fen("8/8/8/8/8/8/8/K6k w - - -1 1")
+    with pytest.raises(ValueError):
+        Board.from_fen("8/8/8/8/8/8/8/K6k w - - 0 0")
+    with pytest.raises(ValueError):
+        Board.from_fen("8/8/8/8/8/8/8/K6k w - 0a 0 1")
 
 
 def test_san_disambiguation_check_mate_and_castling() -> None:

@@ -1,0 +1,47 @@
+[package]
+name = "zero-rust-engine"
+version = "1.7.2+8"
+edition = "2021"
+rust-version = "1.83"
+description = "Zero-allocation AlphaZero chess search core for ZERO-X"
+license = "MIT"
+
+[lib]
+name = "zero_rust_engine"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "zero-rust-engine"
+path = "src/main.rs"
+
+[features]
+# The Python bridge is available by default; LibTorch remains opt-in so core
+# builds and tests do not require a local CUDA/LibTorch installation.
+default = ["python-extension"]
+python-extension = ["dep:pyo3"]
+libtorch = ["dep:tch"]
+
+[dependencies]
+arrayvec = "0.7"
+cozy-chess = "0.3.4"
+crossbeam-channel = "0.5"
+rand = "0.8"
+rayon = "1.10"
+
+# Keep Python and LibTorch optional so `cargo test` exercises the chess/search
+# core without linking CUDA.  A production wheel is built with
+# `--features libtorch,python-extension` and LIBTORCH_USE_PYTORCH=1.
+pyo3 = { version = "0.29", optional = true, features = ["extension-module"] }
+tch = { version = "0.18", optional = true }
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+# The evaluator catches backend panics and converts them into ticket errors so
+# a transient TorchScript failure cannot abort a 31-day training process.
+panic = "unwind"
+strip = "symbols"
+
+[profile.bench]
+codegen-units = 1
+lto = "fat"

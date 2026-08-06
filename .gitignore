@@ -8,6 +8,7 @@ checkpoints/
 *.egg-info/
 logs/
 *.tsbuildinfo
+.ruff_cache/
 
 # Node / Next.js
 node_modules/
@@ -20,8 +21,22 @@ yarn-debug.log*
 yarn-error.log*
 .eslintcache
 
+# Rust build cache (can include a local LibTorch build and is never source).
+target/
+*.so
+*.dll
+*.dylib
+*.pyd
+.cargo/*
+!.cargo/config.toml
+.cargo/
+
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+
+#Others
+UPGRADE.md
+FIXES.md

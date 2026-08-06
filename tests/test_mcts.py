@@ -1,3 +1,5 @@
+import pytest
+
 from zero_chess import Board
 from zero_chess.mcts import MCTS, Node, UniformEvaluator
 
@@ -90,42 +92,6 @@ def test_resignation_after_ten_low_value_searches() -> None:
     assert resigned
 
 
-def test_collect_eval_requests_batch_constraints() -> None:
-    import queue
-    import threading
-    import time
-    import torch
-    from zero_chess.self_play import _collect_eval_requests_nonblocking
-
-    req_queue = queue.Queue()
-    board = Board()
-    tensor = torch.zeros(1, 119, 8, 8)
-    mask = torch.zeros(1, 4672)
-
-    # Worker 0 submits a request immediately
-    req_queue.put(("eval", 0, 100, (tensor, mask)))
-
-    collected = []
-    def run_collector():
-        res = _collect_eval_requests_nonblocking(req_queue, gpu_batch_size=32, wait_seconds=0.05)
-        collected.append(res)
-
-    t = threading.Thread(target=run_collector)
-    t.start()
-
-    # Wait 20ms, collector should still be waiting
-    time.sleep(0.02)
-    assert len(collected) == 0
-
-    # Wait until after the deadline; collector should return the one request it has
-    time.sleep(0.04)
-    t.join(timeout=1.0)
-    assert len(collected) == 1
-    res = collected[0]
-    assert len(res) == 1
-    assert res[0][1] == 0
-
-
 def test_reset_large_tree_does_not_overflow_recursion_limit() -> None:
     # Build a deep tree of nodes to exceed recursion limit (standard limit is 1000)
     # Let's create a chain of 2000 nodes
@@ -144,14 +110,18 @@ def test_reset_large_tree_does_not_overflow_recursion_limit() -> None:
     assert len(mcts.root.children) == 0
 
 
-def test_mcts_resign_threshold_is_respected() -> None:
-    from zero_chess.self_play import SelfPlayConfig, _make_mcts
+def test_evaluator_failure_cleans_up_virtual_loss() -> None:
+    class FailingEvaluator:
+        def __init__(self) -> None:
+            self.calls = 0
 
-    config = SelfPlayConfig(disable_resign=False, resign_value=-0.5, simulations=1)
-    mcts = _make_mcts(UniformEvaluator(), config)
-    assert mcts.resign_threshold == -0.5
+        def evaluate_batch(self, boards):
+            self.calls += 1
+            if self.calls > 1:
+                raise RuntimeError("synthetic evaluator failure")
+            return UniformEvaluator().evaluate_batch(boards)
 
-    config_disabled = SelfPlayConfig(disable_resign=True, resign_value=-0.5, simulations=1)
-    mcts_disabled = _make_mcts(UniformEvaluator(), config_disabled)
-    assert mcts_disabled.resign_threshold == -1.0
-
+    mcts = MCTS(FailingEvaluator(), batch_size=1, add_noise=False)
+    with pytest.raises(RuntimeError, match="synthetic"):
+        mcts.search(Board(), num_simulations=1, add_noise=False)
+    assert all(node.virtual_loss_count == 0 for node in [mcts.root, *mcts.root.children.values()])

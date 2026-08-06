@@ -1,64 +1,50 @@
-"""Pure-Python asymmetric training target helpers with aggressive checkmate-focused rewards."""
+"""Pure zero-sum training targets and Win-Draw-Loss (WDL) mappings.
+
+All learned quantities in ZERO-X live in the closed interval ``[-1, 1]``.
+Search-only contempt is deliberately kept out of these targets so it cannot
+change the game-theoretic objective used by self-play or optimisation.
+"""
 
 from __future__ import annotations
 
-# Custom Aggressive RL Anchor Values
-CHECKMATE_WIN = 1.0
-CHECKMATE_LOSS = -3.0
-RESIGNATION_WIN = 0.0
-RESIGNATION_LOSS = -30.0
-STALEMATE_DRAW = -10.0
-MAX_PLIES_DRAW = -20.0
-STANDARD_DRAW = -1.0
+WIN_VALUE = 1.0
+DRAW_VALUE = 0.0
+LOSS_VALUE = -1.0
 
-# Critical Reinforcement Learning & Search Anchors [1]
-DRAW_VALUE = -1.0
-DRAW_BAND = 0.1
-CONTEMPT_BONUS = 0.3
-AGGRESSION_WEIGHT = 0.05
-MOMENTUM_REWARD = 0.1
-PANIC_PENALTY = -0.2
-
-# Sorted anchor points (x, f(x)) where x is active player's payoff, f(x) is opponent's payoff
-ANCHORS = [
-    (-30.0, 0.0),       # I resign
-    (-20.0, -20.0),     # Max plies draw
-    (-10.0, -10.0),     # Stalemate
-    (-3.0, 1.0),        # I lose by checkmate
-    (-1.0, -1.0),       # Standard draw
-    (0.0, -30.0),       # Opponent resigns
-    (1.0, -3.0),        # I win by checkmate
-]
 
 def opponent_value(value: float) -> float:
-    """Convert a value from one side's perspective to the opponent's using symmetric piecewise linear interpolation."""
-    val = float(value)
-    
-    # Clip input value to the supported domain
-    if val <= -30.0:
-        return 0.0
-    if val >= 1.0:
-        return -3.0
-        
-    # Piecewise linear interpolation
-    for i in range(len(ANCHORS) - 1):
-        x0, y0 = ANCHORS[i]
-        x1, y1 = ANCHORS[i + 1]
-        if x0 <= val <= x1:
-            return y0 if (x1 - x0) == 0 else y0 + (val - x0) * (y1 - y0) / (x1 - x0)
-            
-    return -29.0 - val  # Safe continuous fallback
+    """Return the exact zero-sum value from the opponent's perspective."""
+    return -float(value)
 
-def apply_contempt(value: float) -> float:
-    """Apply the contempt factor to prevent settling for draws in even positions."""
-    if -0.1 <= value <= 0.1:
-        return value + 0.3
+
+def apply_contempt(value: float, contempt: float = 0.10) -> float:
+    """Apply a search-only draw bias without modifying network targets.
+
+    This is for move selection and reporting only.  The result is clipped to
+    the legal value domain, so callers never feed an invalid value back into a
+    minimax backup.
+    """
+    value = float(value)
+    if -0.15 <= value <= 0.15:
+        return max(LOSS_VALUE, min(WIN_VALUE, value + float(contempt)))
     return value
 
+
 def game_result_to_values(result: str) -> tuple[float, float]:
-    """Convert a game result string into an asymmetric (white_reward, black_reward) tuple."""
-    if result == "1/2-1/2":
-        return (-1.0, -1.0)
+    """Map a PGN result to symmetric ``(white_value, black_value)`` targets."""
     if result == "1-0":
-        return (1.0, -3.0)
-    return (-3.0, 1.0)
+        return (WIN_VALUE, LOSS_VALUE)
+    if result == "0-1":
+        return (LOSS_VALUE, WIN_VALUE)
+    if result == "1/2-1/2":
+        return (DRAW_VALUE, DRAW_VALUE)
+    raise ValueError(f"unsupported game result: {result!r}")
+
+
+def terminal_wdl_target(value: float) -> tuple[float, float, float]:
+    """Return a one-hot ``[win, draw, loss]`` terminal target."""
+    if value > 0.5:
+        return (1.0, 0.0, 0.0)
+    if value < -0.5:
+        return (0.0, 0.0, 1.0)
+    return (0.0, 1.0, 0.0)

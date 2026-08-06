@@ -13,6 +13,9 @@ from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+from .board import Board
+
+
 @dataclass(slots=True)
 class UCIResult:
     """Result from a UCI best-move query: move string, evaluation, and node count."""
@@ -29,7 +32,7 @@ class UCIProcess:
             "-m",
             "zero_chess.uci",
             "--checkpoint",
-            "checkpoints/latest.pt",
+            "checkpoints/zero_x/accepted.pt",
             "--device",
             "cuda",
         ]
@@ -40,7 +43,7 @@ class UCIProcess:
         """Verify the subprocess status, spinning up a fresh handle if dead."""
         if self.process and self.process.returncode is None:
             return self.process
-        
+
         await self.close()
         self.process = await asyncio.create_subprocess_exec(
             *self.command,
@@ -49,21 +52,27 @@ class UCIProcess:
             stderr=asyncio.subprocess.DEVNULL,
         )
         await self._send("uci")
-        await self._read_until("uciok")
+        await self._read_until("uciok", timeout=5.0)
         await self._send("isready")
-        await self._read_until("readyok")
+        await self._read_until("readyok", timeout=5.0)
         return self.process
 
     async def best_move(self, fen: str, move_time: int) -> UCIResult:
         """Acquire the best move from the engine, executing a transaction under lock."""
+        if not isinstance(fen, str) or len(fen) > 256 or "\n" in fen or "\r" in fen:
+            raise ValueError("invalid FEN payload")
+        Board.from_fen(fen)
+        move_time = max(100, int(move_time))
         async with self.lock:
             await self.ensure()
             await self._send(f"position fen {fen}")
-            await self._send(f"go movetime {max(100, int(move_time))}")
+            await self._send(f"go movetime {move_time}")
             evaluation = 0.0
             nodes = 0
+            deadline = asyncio.get_running_loop().time() + move_time / 1000.0 + 5.0
             while True:
-                line = await self._read_line()
+                timeout = max(0.1, deadline - asyncio.get_running_loop().time())
+                line = await asyncio.wait_for(self._read_line(), timeout=timeout)
                 if line.startswith("info "):
                     parsed_eval, parsed_nodes = parse_info(line)
                     evaluation = parsed_eval if parsed_eval is not None else evaluation
@@ -109,9 +118,9 @@ class UCIProcess:
             await self.close()
             raise RuntimeError("failed to read stream from subprocess") from exc
 
-    async def _read_until(self, token: str) -> None:
+    async def _read_until(self, token: str, timeout: float) -> None:
         while True:
-            if await self._read_line() == token:
+            if await asyncio.wait_for(self._read_line(), timeout=timeout) == token:
                 return
 
 def parse_info(line: str) -> tuple[float | None, int | None]:
@@ -156,21 +165,21 @@ def _tail_file_lines(path: Path, max_lines: int = 500) -> list[str]:
     lines: list[bytes] = []
     if not path.exists():
         return []
-    
+
     chunk_size = 4096
     with path.open("rb") as f:
         f.seek(0, 2)
         file_size = f.tell()
-        
+
         buffer = bytearray()
         pointer = file_size
-        
+
         while pointer > 0 and len(lines) <= max_lines:
             pointer = max(0, pointer - chunk_size)
             f.seek(pointer)
             chunk = f.read(file_size - pointer if pointer == 0 else chunk_size)
             buffer[:0] = chunk
-            
+
             while b"\n" in buffer:
                 newline_index = buffer.rindex(b"\n")
                 line = buffer[newline_index + 1:]
@@ -179,12 +188,12 @@ def _tail_file_lines(path: Path, max_lines: int = 500) -> list[str]:
                 buffer = buffer[:newline_index]
                 if len(lines) > max_lines:
                     break
-            
+
             file_size = pointer
-            
+
         if len(lines) <= max_lines and buffer:
             lines.append(bytes(buffer))
-            
+
     lines.reverse()
     return [line.decode("utf-8") for line in lines[-max_lines:]]
 
@@ -215,8 +224,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     try:
         while True:
             payload = await websocket.receive_text()
-            message = json.loads(payload)
             try:
+                message = json.loads(payload)
+                if not isinstance(message, dict) or "fen" not in message:
+                    raise ValueError("message must contain a FEN")
                 result = await engine.best_move(message["fen"], int(message.get("move_time", 1000)))
                 await websocket.send_json({"move": result.move, "evaluation": result.evaluation, "nodes": result.nodes})
             except Exception as sub_exc:
@@ -230,7 +241,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Run ZERO WebSocket engine bridge.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--checkpoint", default="checkpoints/latest.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/zero_x/accepted.pt")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--simulations", type=int, default=200)
     args = parser.parse_args(argv)

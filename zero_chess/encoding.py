@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from .board import Board
-from .constants import BLACK, BK, BQ, WHITE, WK, WQ
+from .constants import BK, BLACK, BQ, WHITE, WK, WQ
 from .move import Move
 
 HISTORY = 8
-INPUT_CHANNELS = HISTORY * 14 + 7
+INPUT_CHANNELS = HISTORY * 14 + 9
 POLICY_PLANES = 73
 POLICY_SIZE = POLICY_PLANES * 64
 
@@ -88,7 +88,7 @@ def legal_policy_indices(board: Board) -> dict[Move, int]:
     return {move: move_to_policy_index(board, move) for move in board.legal_moves()}
 
 def encode_board(board: Board, history: list[Board] | None = None, device: str | None = None):
-    """Return a torch tensor of shape ``(119, 8, 8)`` oriented for the active player."""
+    """Return a torch tensor of shape ``(121, 8, 8)`` oriented for the active player."""
     try:
         import torch
     except ImportError as exc:
@@ -98,7 +98,7 @@ def encode_board(board: Board, history: list[Board] | None = None, device: str |
     return encode_board_into(planes, board, history)
 
 def encode_boards(boards: list[Board], histories: list[list[Board]] | None = None, device: str | None = None):
-    """Batch-encode a list of boards into a tensor of shape ``(N, 119, 8, 8)``."""
+    """Batch-encode a list of boards into a tensor of shape ``(N, 121, 8, 8)``."""
     try:
         import torch
     except ImportError as exc:
@@ -124,11 +124,11 @@ def encode_board_into(planes, board: Board, history: list[Board] | None = None):
                 continue
             oriented = sq if perspective == WHITE else 63 - sq
             rank, file_ = oriented >> 3, oriented & 7
-            
+
             plane_idx = PIECE_TO_PLANE[piece]
             if perspective == BLACK:
                 plane_idx = (plane_idx + 6) % 12
-                
+
             planes[base + plane_idx, rank, file_] = 1.0
 
         occurrences = pos.hash_history.count(pos.zobrist_hash)
@@ -140,7 +140,7 @@ def encode_board_into(planes, board: Board, history: list[Board] | None = None):
     extra = HISTORY * 14
     if board.turn == WHITE:
         planes[extra].fill_(1.0)
-        
+
     own_ks, own_qs, opp_ks, opp_qs = (WK, WQ, BK, BQ) if perspective == WHITE else (BK, BQ, WK, WQ)
     if board.castling_rights & own_ks:
         planes[extra + 1].fill_(1.0)
@@ -150,11 +150,14 @@ def encode_board_into(planes, board: Board, history: list[Board] | None = None):
         planes[extra + 3].fill_(1.0)
     if board.castling_rights & opp_qs:
         planes[extra + 4].fill_(1.0)
-        
+
     if board.ep_square is not None:
         ep = board.ep_square if perspective == WHITE else 63 - board.ep_square
         planes[extra + 5, :, ep & 7] = 1.0
     planes[extra + 6].fill_(min(board.fullmove_number, 512) / 512.0)
+    planes[extra + 7].fill_(min(board.halfmove_clock, 100) / 100.0)
+    if board.is_check(perspective):
+        planes[extra + 8].fill_(1.0)
     return planes
 
 def policy_target(board: Board, visits: dict[Move, int], device: str | None = None):
@@ -165,7 +168,13 @@ def policy_target(board: Board, visits: dict[Move, int], device: str | None = No
         raise RuntimeError("policy_target requires PyTorch; install zero-chess[train]") from exc
 
     target = torch.zeros(POLICY_SIZE, dtype=torch.float32, device=device)
-    total = sum(visits.values())
+    legal_by_move = {move: move_to_policy_index(board, move) for move in board.legal_moves()}
+    valid_visits = {
+        legal_by_move[move]: max(0, int(count))
+        for move, count in visits.items()
+        if move in legal_by_move
+    }
+    total = sum(valid_visits.values())
     if total <= 0:
         legal = board.legal_moves()
         if not legal:
@@ -174,21 +183,9 @@ def policy_target(board: Board, visits: dict[Move, int], device: str | None = No
         for move in legal:
             target[move_to_policy_index(board, move)] = prob
         return target
-    for move, count in visits.items():
-        target[move_to_policy_index(board, move)] = count / total
+    for index, count in valid_visits.items():
+        target[index] = count / total
     return target
-
-def policy_mask(board: Board, device: str | None = None):
-    """Generate a bool mask indicating legal moves in the policy output shape."""
-    try:
-        import torch
-    except ImportError as exc:
-        raise RuntimeError("policy_mask requires PyTorch; install zero-chess[train]") from exc
-
-    mask = torch.zeros(POLICY_SIZE, dtype=torch.bool, device=device)
-    for move in board.legal_moves():
-        mask[move_to_policy_index(board, move)] = True
-    return mask
 
 def encode_move_mask(legal_moves: list[Move] | None, board: Board, device: str | None = None):
     """Generate a float mask indicating legal moves in the policy output shape."""
@@ -208,11 +205,7 @@ def encode_move_mask_into(mask, legal_moves: list[Move] | None, board: Board):
     return mask
 
 def terminal_wdl(value: float) -> tuple[float, float, float]:
-    """Map a value scalar into Win, Draw, Loss target probabilities."""
-    from .targets import DRAW_VALUE
+    """Map a terminal minimax value to its one-hot WDL target."""
+    from .targets import terminal_wdl_target
 
-    if abs(value - DRAW_VALUE) < 1e-9:
-        return (0.0, 1.0, 0.0)
-    if value > DRAW_VALUE:
-        return (1.0, 0.0, 0.0)
-    return (0.0, 0.0, 1.0)
+    return terminal_wdl_target(value)

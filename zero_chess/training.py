@@ -1,66 +1,98 @@
-"""Continuous self-play training utilities and optimized optimization loops."""
+"""Continuous ZERO-X optimization with policy and unified-WDL targets."""
 
 from __future__ import annotations
 
-import argparse
+import concurrent.futures
 import json
 import math
+import os
+import random
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-from torch.nn import functional as F
+import torch.nn.functional as F
 
 from .board import Board
-from .constants import WHITE, BLACK
-from .encoding import POLICY_SIZE, encode_board, encode_boards, encode_move_mask, move_to_policy_index
-from .ewc import ElasticWeightConsolidation
-from .model import ModelConfig, ZeroNet, load_model, parameter_count, save_model
-from .move import Move
+from .encoding import POLICY_SIZE, encode_board, encode_move_mask
+from .model import NUM_VALUE_BINS, ZeroNet
 from .replay import Experience, PrioritizedReplayBuffer
+
+
+def compute_two_hot_target(
+    targets: torch.Tensor, num_bins: int = NUM_VALUE_BINS, device: torch.device | None = None
+) -> torch.Tensor:
+    if num_bins < 2:
+        raise ValueError("num_bins must be at least 2")
+    target_device = targets.device if device is None else torch.device(device)
+    target_dtype = targets.dtype if targets.is_floating_point() else torch.float32
+    targets = targets.reshape(-1).to(device=target_device, dtype=target_dtype)
+    bin_centers = torch.linspace(-1.0, 1.0, num_bins, device=target_device, dtype=target_dtype)
+    bin_width = bin_centers[1] - bin_centers[0]
+
+    clamped = targets.clamp(-1.0, 1.0)
+    indices = ((clamped + 1.0) / bin_width).clamp(0, num_bins - 2).long()
+
+    left_bin = bin_centers[indices]
+    right_weight = (clamped - left_bin) / bin_width
+    left_weight = 1.0 - right_weight
+
+    two_hot = torch.zeros((targets.shape[0], num_bins), device=target_device, dtype=target_dtype)
+    two_hot.scatter_add_(1, indices.unsqueeze(1), left_weight.unsqueeze(1))
+    two_hot.scatter_add_(1, (indices + 1).unsqueeze(1), right_weight.unsqueeze(1))
+
+    return two_hot
+
 
 @dataclass(slots=True)
 class TrainConfig:
-    """Hyperparameters for the training loop: batch size, learning rates, loss weights, and device."""
-    batch_size: int = 2048  # 128GB RAM + Blackwell: massive batches
-    initial_lr: float = 2e-3  # Higher LR for larger batches
-    continuous_lr: float = 1e-4
+    batch_size: int = 1024
+    initial_lr: float = 2e-3
+    continuous_lr: float = 1e-5
+    total_steps: int = 600_000
+    warmup_steps: int = 3_000
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
-    td_lambda: float = 0.7
-    value_weight: float = 1.0
-    wdl_weight: float = 1.0
-    ewc_weight: float = 1.0
-    aux_weight: float = 0.3  # Increased auxiliary focus
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     mixed_precision: bool = True
     log_path: str = "logs/training.log"
+    material_loss_weight: float = 0.0
+    moves_left_loss_weight: float = 0.0
+    opponent_policy_loss_weight: float = 0.0
+
 
 class ContinuousLRScheduler:
-    """Manages cosine annealing rates decaying down to strict continuous baselines."""
-
-    def __init__(self, optimizer: torch.optim.Optimizer, initial_lr: float = 1e-3, final_lr: float = 3e-5) -> None:
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        initial_lr: float = 2e-3,
+        final_lr: float = 1e-5,
+        total_steps: int = 600_000,
+        warmup_steps: int = 3_000,
+    ) -> None:
         self.optimizer = optimizer
         self.initial_lr = initial_lr
         self.final_lr = final_lr
+        self.total_steps = total_steps
+        self.warmup_steps = warmup_steps
 
-    def step(self, iteration: int) -> float:
-        """Set the optimizer learning rate for the given iteration and return it."""
-        lr = self.lr_at(iteration)
+    def lr_at(self, step: int) -> float:
+        step = max(0, int(step))
+        if step < self.warmup_steps:
+            return self.initial_lr * step / max(1, self.warmup_steps)
+        progress = min(1.0, (step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps))
+        return self.final_lr + 0.5 * (self.initial_lr - self.final_lr) * (1.0 + math.cos(math.pi * progress))
+
+    def step(self, step: int) -> float:
+        lr = self.lr_at(step)
         for group in self.optimizer.param_groups:
             group["lr"] = lr
         return lr
 
-    def lr_at(self, iteration: int) -> float:
-        """Return the learning rate at the given iteration using cosine annealing."""
-        if iteration >= 500:
-            return self.final_lr
-        return self.final_lr + 0.5 * (self.initial_lr - self.final_lr) * (1.0 + math.cos(math.pi * iteration / 500.0))
 
 class TrainingLogger:
-    """Monitors losses and writes averages across sliding windows."""
-
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -68,268 +100,296 @@ class TrainingLogger:
 
     def log(self, metrics: dict[str, float]) -> dict[str, float]:
         self.window.append(metrics)
-        averages = {}
-        target_keys = (
-            "policy_loss", "value_loss", "wdl_loss", "ewc_loss", 
-            "aux_loss", "loss", "policy_entropy", "value_error",
-            "material_loss", "mobility_loss", "king_safety_loss"
-        )
-        for key in target_keys:
-            if any(key in row for row in self.window):
-                valid_vals = [row[key] for row in self.window if key in row]
-                averages[f"avg_{key}_100"] = sum(valid_vals) / len(valid_vals)
+        averages = {
+            f"avg_{key}_100": sum(row[key] for row in self.window if key in row) /
+            sum(key in row for row in self.window)
+            for key in (
+                "loss", "policy_loss", "value_loss", "wdl_loss", "material_loss",
+                "moves_left_loss", "opponent_policy_loss", "value_error",
+            )
+            if any(key in row for row in self.window)
+        }
         payload = {**metrics, **averages}
-        with self.path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(payload, sort_keys=True) + "\n")
+        with self.path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, sort_keys=True) + "\n")
         return payload
 
+
 def make_optimizer(model: torch.nn.Module, config: TrainConfig) -> torch.optim.Optimizer:
-    """Instantiate a fused AdamW optimizer for Blackwell maximum throughput."""
-    try:
-        return torch.optim.AdamW(
-            model.parameters(),
-            lr=config.initial_lr,
-            weight_decay=config.weight_decay,
-            fused=True,
-            betas=(0.9, 0.95),
-        )
-    except (RuntimeError, TypeError):
-        return torch.optim.AdamW(
-            model.parameters(),
-            lr=config.initial_lr,
-            weight_decay=config.weight_decay,
-            betas=(0.9, 0.95),
-        )
+    options = dict(lr=config.initial_lr, weight_decay=config.weight_decay, betas=(0.9, 0.95))
+    if str(config.device).startswith("cuda"):
+        try:
+            return torch.optim.AdamW(model.parameters(), fused=True, **options)
+        except (RuntimeError, TypeError):
+            pass
+    return torch.optim.AdamW(model.parameters(), **options)
+
+
+_ENCODING_WORKERS = min(32, max(1, os.cpu_count() or 1))
+_ENCODING_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_ENCODING_WORKERS,
+    thread_name_prefix="zero-encoding",
+)
+
+
+def _encode_experience(exp: Experience) -> tuple[torch.Tensor, torch.Tensor]:
+    """Encode one experience into its input planes and legal-move mask.
+
+    Repetition counts are read from the Experience fields directly instead of
+    re-counting occurrences on freshly FEN-parsed boards, whose hash-history
+    would never reflect the sampled game's prior positions.
+    """
+    board = Board.from_fen(exp.fen)
+    history = [Board.from_fen(fen) for fen in exp.history_fens]
+    legal = board.legal_moves()
+
+    planes = encode_board(board, history=history, device="cpu")
+    if exp.repetitions >= 2:
+        planes[12].fill_(1.0)
+    if exp.repetitions >= 3:
+        planes[13].fill_(1.0)
+    for index, count in enumerate(exp.history_repetitions):
+        base = (index + 1) * 14
+        if count >= 2:
+            planes[base + 12].fill_(1.0)
+        if count >= 3:
+            planes[base + 13].fill_(1.0)
+
+    mask = encode_move_mask(legal, board, device="cpu")
+    return planes, mask
+
+
+def _policy_from_exp(exp: Experience) -> torch.Tensor:
+    target = torch.zeros(POLICY_SIZE, dtype=torch.float32)
+    for index, probability in exp.policy.items():
+        if 0 <= index < POLICY_SIZE:
+            target[index] = max(0.0, float(probability))
+    total = target.sum()
+    if total > 0.0:
+        target /= total
+    return target
+
+
+def _opponent_move_mask(exp: Experience) -> torch.Tensor:
+    mask = torch.zeros(POLICY_SIZE, dtype=torch.float32)
+    legal_indices = exp.opponent_legal_policy or tuple(exp.opponent_policy or ())
+    if not legal_indices:
+        return mask
+    for index in legal_indices:
+        if 0 <= index < POLICY_SIZE:
+            mask[index] = 1.0
+    return mask
+
+
+_HORIZONTAL_POLICY_PLANE_MAP = (
+    0, 7, 6, 5, 4, 3, 2, 1,
+    7, 6, 5, 4, 3, 2, 1, 0,
+)
+
+
+def _build_policy_flip_indices() -> torch.Tensor:
+    destinations = torch.empty(POLICY_SIZE, dtype=torch.long)
+    for plane in range(73):
+        if plane < 56:
+            reflected_plane = _HORIZONTAL_POLICY_PLANE_MAP[plane // 7] * 7 + plane % 7
+        elif plane < 64:
+            reflected_plane = 56 + _HORIZONTAL_POLICY_PLANE_MAP[8 + plane - 56]
+        else:
+            promotion, direction = divmod(plane - 64, 3)
+            reflected_plane = 64 + promotion * 3 + (2 - direction)
+        for square in range(64):
+            destinations[plane * 64 + square] = reflected_plane * 64 + (square & ~7) + (7 - (square & 7))
+    return destinations
+
+
+_POLICY_FLIP_INDICES = _build_policy_flip_indices()
+_POLICY_FLIP_INDICES_BY_DEVICE: dict[torch.device, torch.Tensor] = {}
+
+
+def _flip_policy_horizontally(policy: torch.Tensor) -> torch.Tensor:
+    device = policy.device
+    indices = _POLICY_FLIP_INDICES_BY_DEVICE.get(device)
+    if indices is None or indices.device != device:
+        indices = _POLICY_FLIP_INDICES.to(device)
+        _POLICY_FLIP_INDICES_BY_DEVICE[device] = indices
+    flipped = torch.empty_like(policy)
+    flipped[:, indices] = policy
+    return flipped
+
+
+def _augment_batch(
+    x: torch.Tensor,
+    move_mask: torch.Tensor,
+    policy_targets: torch.Tensor,
+    opponent_policy_targets: torch.Tensor,
+    opponent_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if random.random() < 0.5:
+        x_flipped = torch.flip(x, dims=[-1]).clone()
+
+        extra = 8 * 14
+        x_flipped[:, [extra + 1, extra + 2]] = x_flipped[:, [extra + 2, extra + 1]].clone()
+        x_flipped[:, [extra + 3, extra + 4]] = x_flipped[:, [extra + 4, extra + 3]].clone()
+
+        policy_flipped = _flip_policy_horizontally(policy_targets)
+        mask_flipped = _flip_policy_horizontally(move_mask)
+        opponent_policy_flipped = _flip_policy_horizontally(opponent_policy_targets)
+        opponent_mask_flipped = _flip_policy_horizontally(opponent_mask)
+
+        return x_flipped, mask_flipped, policy_flipped, opponent_policy_flipped, opponent_mask_flipped
+    return x, move_mask, policy_targets, opponent_policy_targets, opponent_mask
+
+
+def _weighted_mean(losses: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    return (losses * weights).sum() / weights.sum().clamp_min(torch.finfo(weights.dtype).eps)
+
 
 def train_step(
     model: ZeroNet,
     optimizer: torch.optim.Optimizer,
     replay: PrioritizedReplayBuffer,
     config: TrainConfig,
-    ewc: ElasticWeightConsolidation | None = None,
     iteration: int = 0,
     scheduler: ContinuousLRScheduler | None = None,
-    scaler: torch.amp.GradScaler | None = None,
     logger: TrainingLogger | None = None,
-) -> tuple[dict[str, float], torch.amp.GradScaler]:
-    """Execute a single, high-speed gradient backpropagation step.
-
-    Returns the metrics dictionary and the ``GradScaler`` used (creating one if
-    none was supplied so callers can reuse it across iterations).
-    """
+) -> dict[str, float]:
     model.train()
-    beta = replay.anneal_beta(iteration)
+    beta = replay.anneal_beta(iteration, config.total_steps)
     batch = replay.sample_with_weights(config.batch_size, beta=beta)
-
-    device_type = "cuda" if str(config.device).startswith("cuda") else "cpu"
-    use_pinned = device_type == "cuda"
-
-    boards = [Board.from_fen(exp.fen) for exp in batch.experiences]
-    legal_moves = [board.legal_moves() for board in boards]
-
-    x = encode_boards(boards, device="cpu")
-    mask = torch.stack([encode_move_mask(legal, board, device="cpu") for board, legal in zip(boards, legal_moves, strict=True)])
-    policy_target = torch.stack([_policy_from_exp(board, exp, legal) for board, exp, legal in zip(boards, batch.experiences, legal_moves, strict=True)])
-
-    value_targets = []
-    wdl_targets = []
-    material_targets = []
-    mobility_targets = []
-    king_targets = []
-    for exp, board, legal in zip(batch.experiences, boards, legal_moves, strict=True):
-        raw_target = td_blended_target(exp.value, exp.td_value, config.td_lambda) + exp.reward_bonus
-        value_targets.append(max(-31.0, min(1.0, raw_target)))
-        wdl_targets.append(exp.wdl)
-        material, mobility, king_safety = _auxiliary_targets(board, legal)
-        material_targets.append(material)
-        mobility_targets.append(mobility)
-        king_targets.append(king_safety)
-
-    value_target = torch.tensor(value_targets, dtype=torch.float32)
-    wdl_target = torch.tensor(wdl_targets, dtype=torch.float32)
+    encoded = list(_ENCODING_EXECUTOR.map(_encode_experience, batch.experiences))
+    x = torch.stack([row[0] for row in encoded])
+    mask = torch.stack([row[1] for row in encoded])
+    policy_targets = torch.stack([_policy_from_exp(exp) for exp in batch.experiences])
+    opponent_mask = torch.stack([_opponent_move_mask(exp) for exp in batch.experiences])
+    wdl_targets = torch.tensor([exp.wdl for exp in batch.experiences], dtype=torch.float32)
+    q_mcts_targets = torch.tensor([[exp.q_mcts] for exp in batch.experiences], dtype=torch.float32)
+    z_terminal_targets = (wdl_targets[:, 0:1] - wdl_targets[:, 2:3])
+    terminal_targets = torch.tensor(
+        [exp.target_kind == "terminal" for exp in batch.experiences], dtype=torch.bool
+    ).unsqueeze(-1)
+    hybrid_value_targets = torch.where(
+        terminal_targets,
+        0.5 * z_terminal_targets + 0.5 * q_mcts_targets,
+        q_mcts_targets,
+    )
+    material_targets = torch.tensor([list(exp.material) for exp in batch.experiences], dtype=torch.float32)
+    moves_left_targets = torch.tensor([[exp.moves_left] for exp in batch.experiences], dtype=torch.float32)
+    opponent_policy_targets = torch.zeros((len(batch.experiences), POLICY_SIZE), dtype=torch.float32)
+    opponent_policy_available = torch.zeros(len(batch.experiences), dtype=torch.float32)
+    for row, exp in enumerate(batch.experiences):
+        if exp.opponent_policy:
+            for index, probability in exp.opponent_policy.items():
+                opponent_policy_targets[row, index] = probability
+            opponent_policy_available[row] = 1.0
     sample_weights = torch.tensor(batch.weights, dtype=torch.float32)
-    material_target = torch.tensor(material_targets, dtype=torch.float32)
-    mobility_target = torch.tensor(mobility_targets, dtype=torch.float32)
-    king_target = torch.tensor(king_targets, dtype=torch.float32)
 
-    if use_pinned:
-        x = x.pin_memory().to(config.device, non_blocking=True)
-        mask = mask.pin_memory().to(config.device, non_blocking=True)
-        policy_target = policy_target.pin_memory().to(config.device, non_blocking=True)
-        scalar_transfer = [t.pin_memory().to(config.device, non_blocking=True) for t in
-                           (value_target, wdl_target, sample_weights, material_target, mobility_target, king_target)]
-        value_target, wdl_target, sample_weights, material_target, mobility_target, king_target = scalar_transfer
+    x, mask, policy_targets, opponent_policy_targets, opponent_mask = _augment_batch(
+        x, mask, policy_targets, opponent_policy_targets, opponent_mask
+    )
+
+    device = torch.device(config.device)
+    tensors = (
+        x, mask, policy_targets, opponent_mask, wdl_targets, hybrid_value_targets, material_targets,
+        moves_left_targets, opponent_policy_targets, opponent_policy_available, sample_weights,
+        terminal_targets,
+    )
+    if device.type == "cuda":
+        tensors = tuple(tensor.pin_memory().to(device, non_blocking=True) for tensor in tensors)
     else:
-        x, mask, policy_target = x.to(config.device), mask.to(config.device), policy_target.to(config.device)
-        value_target = value_target.to(config.device)
-        wdl_target = wdl_target.to(config.device)
-        sample_weights = sample_weights.to(config.device)
-        material_target = material_target.to(config.device)
-        mobility_target = mobility_target.to(config.device)
-        king_target = king_target.to(config.device)
+        tensors = tuple(tensor.to(device) for tensor in tensors)
+    (
+        x, mask, policy_targets, opponent_mask, wdl_targets, hybrid_value_targets, material_targets,
+        moves_left_targets, opponent_policy_targets, opponent_policy_available, sample_weights,
+        terminal_targets,
+    ) = tensors
+
+    two_hot_value_targets = compute_two_hot_target(
+        hybrid_value_targets.squeeze(-1), num_bins=model.config.num_value_bins, device=device
+    )
 
     optimizer.zero_grad(set_to_none=True)
-    device_type = "cuda" if str(config.device).startswith("cuda") else "cpu"
-    use_amp = config.mixed_precision and device_type == "cuda"
-    
-    is_bf16 = device_type == "cuda" and torch.cuda.is_bf16_supported()
-    amp_dtype = torch.bfloat16 if (is_bf16 or device_type == "cpu") else torch.float16
-    
-    if scaler is None:
-        # Only fp16 autocast requires gradient scaling; bf16 has fp32 exponent range.
-        needs_scaler = use_amp and amp_dtype == torch.float16
-        if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
-            scaler = torch.amp.GradScaler("cuda", enabled=needs_scaler)
-        else:
-            scaler = torch.cuda.amp.GradScaler(enabled=needs_scaler)
-
-    with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
+    use_amp = config.mixed_precision and device.type == "cuda"
+    autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True) if use_amp else nullcontext()
+    with autocast:
         out = model(x, mask, return_dict=True)
-        log_policy = F.log_softmax(out["masked_policy_logits"], dim=-1)
-        policy_loss_vec = -(policy_target * log_policy).sum(dim=-1)
-        
-        value_pred = out["value"].squeeze(-1)
-        value_loss_vec = F.mse_loss(value_pred, value_target, reduction="none")
-        wdl_loss_vec = -(wdl_target * F.log_softmax(out["wdl_logits"], dim=-1)).sum(dim=-1)
-        
-        # Calculate individual auxiliary target losses [1]
-        mat_loss_vec = F.mse_loss(out["material"], material_target, reduction="none")
-        mob_loss_vec = F.mse_loss(out["mobility"], mobility_target, reduction="none")
-        king_loss_vec = F.mse_loss(out["king_safety"], king_target, reduction="none")
-        aux_loss_vec = mat_loss_vec + mob_loss_vec + king_loss_vec
-        
-        policy_loss = (policy_loss_vec * sample_weights).mean()
-        value_loss = (value_loss_vec * sample_weights).mean()
-        wdl_loss = (wdl_loss_vec * sample_weights).mean()
-        aux_loss = (aux_loss_vec * sample_weights).mean()
-        ewc_loss = ewc.loss(model) if ewc else torch.zeros((), device=config.device)
-        
+        policy_loss_vec = -(policy_targets * F.log_softmax(out["masked_policy_logits"], dim=-1)).sum(dim=-1)
+        value_loss_vec = -(two_hot_value_targets * F.log_softmax(out["value_logits"], dim=-1)).sum(dim=-1)
+        wdl_loss_vec = -(wdl_targets * F.log_softmax(out["wdl_logits"], dim=-1)).sum(dim=-1)
+        material_loss_vec = (out["material"] - material_targets).pow(2).mean(dim=-1)
+        moves_left_loss_vec = (out["moves_left"] - moves_left_targets).pow(2).squeeze(-1)
+
+        masked_opponent_logits = out["opponent_policy_logits"].masked_fill(opponent_mask <= 0, -1e4)
+        opponent_policy_loss_vec = -(
+            opponent_policy_targets * F.log_softmax(masked_opponent_logits, dim=-1)
+        ).sum(dim=-1)
+
+        policy_loss = _weighted_mean(policy_loss_vec, sample_weights)
+        value_loss = _weighted_mean(value_loss_vec, sample_weights)
+        wdl_loss = _weighted_mean(wdl_loss_vec, sample_weights * terminal_targets.squeeze(-1).float())
+        material_loss = _weighted_mean(material_loss_vec, sample_weights)
+        moves_left_loss = _weighted_mean(moves_left_loss_vec, sample_weights)
+        opponent_denominator = (sample_weights * opponent_policy_available).sum().clamp_min(
+            torch.finfo(sample_weights.dtype).eps
+        )
+        opponent_policy_loss = (
+            opponent_policy_loss_vec * sample_weights * opponent_policy_available
+        ).sum() / opponent_denominator
+
         loss = (
             policy_loss
-            + config.value_weight * value_loss
-            + config.wdl_weight * wdl_loss
-            + config.ewc_weight * ewc_loss
-            + config.aux_weight * aux_loss
+            + 0.25 * value_loss
+            + 0.50 * wdl_loss
+            + config.material_loss_weight * material_loss
+            + config.moves_left_loss_weight * moves_left_loss
+            + config.opponent_policy_loss_weight * opponent_policy_loss
         )
 
-        # Advanced Telemetry: Policy Entropy and Value Prediction Error
-        with torch.no_grad():
-            probs = torch.softmax(out["masked_policy_logits"], dim=-1)
-            # Clip probabilities to prevent log(0)
-            clipped_probs = torch.clamp(probs, min=1e-9)
-            policy_entropy = -(probs * torch.log(clipped_probs)).sum(dim=-1).mean()
-            value_error = torch.abs(value_pred - value_target).mean()
-
-    loss_val = float(loss.detach().cpu())
-    grad_norm_before = torch.zeros((), device=config.device)
-
-    if not math.isfinite(loss_val) or loss_val > 2000.0:
-        import warnings
-        warnings.warn(
-            f"Loss sanity check failed: loss = {loss_val:.4f}. Skipping optimizer step and replay buffer priority update to prevent weight corruption.",
-            RuntimeWarning,
-            stacklevel=2,
+    if not torch.isfinite(loss):
+        raise FloatingPointError(f"non-finite training loss at step {iteration}")
+    if scheduler is not None:
+        scheduler.step(iteration)
+    loss.backward()
+    try:
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(), config.grad_clip, error_if_nonfinite=True
         )
+    except RuntimeError as exc:
         optimizer.zero_grad(set_to_none=True)
-    else:
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        grad_norm_before = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-        if scheduler is not None:
-            scheduler.step(iteration)
-
-        with torch.no_grad():
-            priorities = (value_pred.detach() - value_target).abs().cpu().tolist()
-            replay.update_priorities(batch.indices, priorities)
+        raise FloatingPointError(f"non-finite gradients at step {iteration}") from exc
+    optimizer.step()
+    with torch.no_grad():
+        value_pred = out["value"].detach().squeeze(-1)
+        value_errors = (value_pred - hybrid_value_targets.squeeze(-1)).abs().float()
+        probabilities = torch.softmax(out["masked_policy_logits"].detach(), dim=-1)
+        entropy = -(probabilities * torch.log(probabilities.clamp_min(1e-9))).sum(dim=-1).mean()
+        policy_kl = (
+            policy_targets
+            * (torch.log(policy_targets.clamp_min(1e-9)) - torch.log(probabilities.clamp_min(1e-9)))
+        ).sum(dim=-1)
+        replay.update_priorities(
+            batch.indices,
+            (value_errors + policy_kl).float().cpu().tolist(),
+            batch.generations,
+        )
 
     metrics = {
         "step": float(iteration),
-        "loss": float(loss_val),
+        "loss": float(loss.detach().cpu()),
         "policy_loss": float(policy_loss.detach().cpu()),
         "value_loss": float(value_loss.detach().cpu()),
         "wdl_loss": float(wdl_loss.detach().cpu()),
-        "ewc_loss": float(ewc_loss.detach().cpu()),
-        "aux_loss": float(aux_loss.detach().cpu()),
-        "material_loss": float(mat_loss_vec.mean().detach().cpu()),
-        "mobility_loss": float(mob_loss_vec.mean().detach().cpu()),
-        "king_safety_loss": float(king_loss_vec.mean().detach().cpu()),
-        "policy_entropy": float(policy_entropy.cpu()),
-        "value_error": float(value_error.cpu()),
-        "grad_norm": float(min(float(grad_norm_before.detach().cpu()), config.grad_clip)),
-        "lr": optimizer.param_groups[0]["lr"],
+        "material_loss": float(material_loss.detach().cpu()),
+        "moves_left_loss": float(moves_left_loss.detach().cpu()),
+        "opponent_policy_loss": float(opponent_policy_loss.detach().cpu()),
+        "policy_entropy": float(entropy.detach().cpu()),
+        "value_error": float((value_pred - hybrid_value_targets.squeeze(-1)).abs().mean().detach().cpu()),
+        "grad_norm": float(min(float(grad_norm.detach().cpu()), config.grad_clip)),
+        "lr": float(optimizer.param_groups[0]["lr"]),
         "replay_size": float(len(replay)),
         "beta": float(beta),
+        "terminal_target_fraction": float(terminal_targets.float().mean().detach().cpu()),
+        "truncated_target_fraction": float((~terminal_targets).float().mean().detach().cpu()),
     }
     if logger is not None:
         metrics = logger.log(metrics)
-    return metrics, scaler
-
-def td_blended_target(outcome: float, bootstrap: float, lambda_td: float = 0.7) -> float:
-    """Weight the terminal result and the bootstrapped TD reward prediction."""
-    return lambda_td * outcome + (1.0 - lambda_td) * bootstrap
-
-def _policy_from_exp(board: Board, exp: Experience, legal: list[Move] | None = None) -> torch.Tensor:
-    """Format experience probabilities into the target policy vector shape (CPU tensor)."""
-    target = torch.zeros(POLICY_SIZE, dtype=torch.float32)
-    total = sum(exp.policy.values())
-    if total <= 0:
-        if legal is None:
-            legal = board.legal_moves()
-        if legal:
-            prob = 1.0 / len(legal)
-            for move in legal:
-                target[move_to_policy_index(board, move)] = prob
-        return target
-    for uci, prob in exp.policy.items():
-        move = Move.from_uci(uci)
-        target[move_to_policy_index(board, move)] = float(prob) / total
-    return target
-
-_PIECE_VALUES = {"P": 1, "N": 3, "B": 3, "R": 5, "Q": 9, "p": -1, "n": -3, "b": -3, "r": -5, "q": -9}
-_MAX_MATERIAL = 39.0
-_MAX_MOBILITY = 218.0
-
-def _auxiliary_targets(board: Board, legal: list[Move] | None = None) -> tuple[float, float, float]:
-    """Calculate material balance, move mobility, and king safety auxiliary targets."""
-    own = opp = 0
-    squares = board.squares
-    turn = board.turn
-
-    for piece in squares:
-        if piece == "." or piece == "K" or piece == "k":
-            continue
-        val = _PIECE_VALUES[piece.upper()]
-        if (piece.isupper() and turn == WHITE) or (piece.islower() and turn == BLACK):
-            own += val
-        else:
-            opp += val
-
-    material = (own - opp) / _MAX_MATERIAL
-    move_count = len(legal) if legal is not None else len(board.legal_moves())
-    mobility = move_count / _MAX_MOBILITY
-    king_safety = 0.0 if board.is_check(board.turn) else 1.0
-    return material, mobility, king_safety
-
-def main(argv: list[str] | None = None) -> None:
-    """CLI entry point: run one training step from a saved replay buffer."""
-    parser = argparse.ArgumentParser(description="Run one ZERO training step from a replay buffer.")
-    parser.add_argument("--replay", required=True)
-    parser.add_argument("--checkpoint")
-    parser.add_argument("--out", default="checkpoints/zero.pt")
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    args = parser.parse_args(argv)
-
-    replay = PrioritizedReplayBuffer.load(args.replay)
-    model = load_model(args.checkpoint, args.device) if args.checkpoint else ZeroNet(ModelConfig()).to(args.device)
-    config = TrainConfig(batch_size=args.batch_size, device=args.device)
-    optimizer = make_optimizer(model, config)
-    scheduler = ContinuousLRScheduler(optimizer, config.initial_lr, config.continuous_lr)
-    metrics, _ = train_step(model, optimizer, replay, config, iteration=0, scheduler=scheduler, logger=TrainingLogger(config.log_path))
-    save_model(args.out, model, optimizer=optimizer.state_dict(), metrics=metrics)
-    print({"params": parameter_count(model), **metrics})
-
-if __name__ == "__main__":
-    main()
+    return metrics

@@ -1,4 +1,5 @@
 import type { PieceSymbol } from "chess.js";
+import Image from "next/image";
 
 const pieces: PieceSymbol[] = ["q", "r", "b", "n"];
 const pieceAssetVersion = "cburnett-real-1";
@@ -28,10 +29,13 @@ export function PromotionDialog({
             onClick={() => onChoose(piece)}
             aria-label={labels[piece]}
           >
-            <img
+            <Image
               className="piece-img"
               src={`/pieces/cburnett/${color}${piece.toUpperCase()}.svg?v=${pieceAssetVersion}`}
               alt={labels[piece]}
+              width={64}
+              height={64}
+              unoptimized
             />
           </button>
         ))}

@@ -24,6 +24,18 @@ def test_uci_position_command() -> None:
     assert engine.board.fen().startswith("rnbqkbnr/pppp1ppp/8/4p3/4P3")
 
 
+def test_uci_does_not_reuse_tree_across_different_base_positions() -> None:
+    engine = UCIEngine()
+    engine.handle("position startpos moves e2e4")
+    engine.handle("position fen 4k3/8/8/8/8/8/8/4K3 w - - 0 1")
+    assert engine.board.fen() == "4k3/8/8/8/8/8/8/4K3 w - - 0 1"
+
+
+def test_uci_time_allocation_never_exceeds_remaining_time() -> None:
+    engine = UCIEngine()
+    assert 1 <= engine._time_to_use(["wtime", "10", "btime", "10"]) <= 10
+
+
 def test_uci_core_commands(capsys) -> None:
     engine = UCIEngine()
     assert engine.handle("uci")
