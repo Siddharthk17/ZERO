@@ -51,9 +51,11 @@ ROOK_DIRS = ((1, 0), (-1, 0), (0, 1), (0, -1))
 BISHOP_DIRS = ((1, 1), (1, -1), (-1, 1), (-1, -1))
 QUEEN_DIRS = ROOK_DIRS + BISHOP_DIRS
 
+
 def opposite(color: int) -> int:
     """Return the opposite color using a fast bitwise XOR."""
     return color ^ 1
+
 
 def color_of(piece: str) -> int | None:
     """Return the color of the piece, optimized to avoid set hashing overhead."""
@@ -61,23 +63,28 @@ def color_of(piece: str) -> int | None:
         return None
     return WHITE if piece.isupper() else BLACK
 
+
 def piece_type(piece: str) -> str:
     """Return the base uppercase representation of a piece."""
     return piece.upper()
+
 
 def piece_for(color: int, kind: str) -> str:
     """Format piece symbol representation according to color."""
     return kind.upper() if color == WHITE else kind.lower()
 
+
 def square_name(sq: int) -> str:
     """Return standard algebraic notation (e.g. 'e4') for a square index."""
     return f"{chr(97 + (sq & 7))}{(sq >> 3) + 1}"
+
 
 def parse_square(name: str) -> int:
     """Convert standard algebraic notation (e.g. 'e4') into a 0-63 square index."""
     if len(name) != 2 or name[0] < "a" or name[0] > "h" or name[1] < "1" or name[1] > "8":
         raise ValueError(f"invalid square coordinate: {name!r}")
     return ((int(name[1]) - 1) << 3) | (ord(name[0]) - 97)
+
 
 def square_color(sq: int) -> int:
     """Return 0 for dark squares, 1 for light squares."""

@@ -12,11 +12,14 @@ def test_native_extension_board_smoke_when_built() -> None:
     from zero_chess.encoding import encode_board, move_to_policy_index
 
     try:
-        engine = importlib.import_module("zero_chess.zero_rust_engine")
+        engine = importlib.import_module("zero_rust_engine")
     except ImportError:
-        import pytest
+        try:
+            engine = importlib.import_module("zero_chess.zero_rust_engine")
+        except ImportError:
+            import pytest
 
-        pytest.skip("native extension is not built")
+            pytest.skip("native extension is not built")
     board = engine.FastRustBoard()
     assert len(board.legal_moves()) == 20
     python_board = Board.starting_position()
@@ -24,13 +27,17 @@ def test_native_extension_board_smoke_when_built() -> None:
     python_encoding = encode_board(python_board).flatten()
     assert torch.equal(native_encoding, python_encoding)
     assert set(board.policy_indices()) == {
-        move_to_policy_index(python_board, move)
-        for move in python_board.legal_moves()
+        move_to_policy_index(python_board, move) for move in python_board.legal_moves()
     }
     board.push_uci("e2e4")
     previous = python_board.copy()
     python_board.push_uci("e2e4")
     assert torch.equal(torch.tensor(board.encode()), encode_board(python_board, history=[previous]).flatten())
+
+    castle = engine.FastRustBoard("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1")
+    assert "e1g1" in castle.legal_moves()
+    castle.push_uci("e1g1")
+    assert castle.fen().startswith("r3k2r/8/8/8/8/8/8/R4RK1 b")
 
 
 def test_sparse_rust_policy_is_checked_against_legal_moves() -> None:
@@ -48,20 +55,24 @@ def test_ingest_rust_batch_builds_replay_experiences() -> None:
     inserted = ingest_rust_batch(
         replay,
         {
-            "games": [{
-                "experiences": [{
-                    "fen": board.fen(),
-                    "policy_indices": [expected_index],
-                    "policy_values": [1.0],
-                    "value": 0.0,
-                    "wdl": [0.0, 1.0, 0.0],
-                    "material": [39.0, 0.0],
-                    "moves_left": 0.42,
-                    "opponent_policy_indices": [expected_index],
-                    "opponent_policy_values": [1.0],
-                    "history_fens": [],
-                }]
-            }]
+            "games": [
+                {
+                    "experiences": [
+                        {
+                            "fen": board.fen(),
+                            "policy_indices": [expected_index],
+                            "policy_values": [1.0],
+                            "value": 0.0,
+                            "wdl": [0.0, 1.0, 0.0],
+                            "material": [39.0, 0.0],
+                            "moves_left": 0.42,
+                            "opponent_policy_indices": [expected_index],
+                            "opponent_policy_values": [1.0],
+                            "history_fens": [],
+                        }
+                    ]
+                }
+            ]
         },
     )
     assert inserted == 1
@@ -111,15 +122,19 @@ def test_ingest_rust_batch_preserves_truncated_target_kind() -> None:
     inserted = ingest_rust_batch(
         replay,
         {
-            "games": [{
-                "experiences": [{
-                    "fen": board.fen(),
-                    "policy_indices": [],
-                    "policy_values": [],
-                    "wdl": [0.0, 1.0, 0.0],
-                    "target_kind": "truncated",
-                }]
-            }]
+            "games": [
+                {
+                    "experiences": [
+                        {
+                            "fen": board.fen(),
+                            "policy_indices": [],
+                            "policy_values": [],
+                            "wdl": [0.0, 1.0, 0.0],
+                            "target_kind": "truncated",
+                        }
+                    ]
+                }
+            ]
         },
     )
     assert inserted == 1
@@ -130,12 +145,14 @@ def test_native_game_history_records_target_provenance(tmp_path) -> None:
     path = tmp_path / "games.jsonl"
     count = append_rust_game_history(
         {
-            "games": [{
-                "result": 0.0,
-                "termination": "max_plies",
-                "moves": ["e2e4"],
-                "experiences": [{"target_kind": "truncated"}],
-            }]
+            "games": [
+                {
+                    "result": 0.0,
+                    "termination": "max_plies",
+                    "moves": ["e2e4"],
+                    "experiences": [{"target_kind": "truncated"}],
+                }
+            ]
         },
         path,
         model_path="accepted.ts",

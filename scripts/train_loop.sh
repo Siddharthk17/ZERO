@@ -3,6 +3,8 @@
 set -uo pipefail
 
 CHECKPOINT="checkpoints/zero_x/accepted.pt"
+RUN_STATE="checkpoints/zero_x/run_state.json"
+REPLAY="checkpoints/zero_x/replay.pkl"
 DEVICE="cuda"
 
 echo "Starting ZERO Rust/Python master training loop..."
@@ -11,8 +13,11 @@ while true; do
     if [ -f "$CHECKPOINT" ]; then
         echo "Resuming from existing checkpoint: $CHECKPOINT"
         CMD+=(--resume "$CHECKPOINT")
+    elif [ -f "$RUN_STATE" ] || [ -f "$REPLAY" ]; then
+        echo "Resuming from recoverable ZERO-X state"
     else
         echo "Starting training from scratch..."
+        CMD+=(--fresh)
     fi
     
     # Run the canonical master loop and pass all CLI arguments through.

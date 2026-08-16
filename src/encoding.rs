@@ -194,7 +194,10 @@ fn encode_position_planes(
 pub fn move_to_policy_index(board: &Board, chess_move: Move) -> Result<usize, EncodingError> {
     let perspective = board.side_to_move();
     let from = orient_square(square_index(chess_move.from), perspective);
-    let to = orient_square(square_index(chess_move.to), perspective);
+    let to = orient_square(
+        square_index(standard_destination(board, chess_move)),
+        perspective,
+    );
     if from >= 64 || to >= 64 {
         return Err(EncodingError::SquareOutOfRange);
     }
@@ -263,6 +266,32 @@ pub fn move_to_policy_index(board: &Board, chess_move: Move) -> Result<usize, En
         return Err(EncodingError::InvalidMoveGeometry);
     }
     Ok((direction_index * 7 + (distance - 1)) * 64 + from)
+}
+
+/// Cozy-chess stores orthodox castling as a king-to-rook move internally.
+/// Keep that representation inside the search, but expose standard UCI and
+/// policy coordinates at every Python/GUI boundary.
+#[inline]
+fn standard_destination(board: &Board, chess_move: Move) -> Square {
+    if board.piece_on(chess_move.from) != Some(Piece::King) {
+        return chess_move.to;
+    }
+    match (chess_move.from, chess_move.to) {
+        (Square::E1, Square::H1) => Square::G1,
+        (Square::E1, Square::A1) => Square::C1,
+        (Square::E8, Square::H8) => Square::G8,
+        (Square::E8, Square::A8) => Square::C8,
+        _ => chess_move.to,
+    }
+}
+
+#[inline]
+pub fn standard_uci(board: &Board, chess_move: Move) -> String {
+    let destination = standard_destination(board, chess_move);
+    match chess_move.promotion {
+        Some(promotion) => format!("{}{}{}", chess_move.from, destination, promotion),
+        None => format!("{}{}", chess_move.from, destination),
+    }
 }
 
 pub fn legal_policy_mask(board: &Board) -> PolicyMask {
@@ -337,5 +366,30 @@ pub fn flip_augmentation(
     }
     for (index, probability) in policy.iter().copied().enumerate() {
         flipped_policy[flip_policy_index_horizontally(index)] = probability;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn orthodox_castling_uses_standard_uci_and_policy_coordinates() {
+        let board: Board = "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1"
+            .parse()
+            .expect("valid castling position");
+        let mut castle = None;
+        board.generate_moves(|moves| {
+            for chess_move in moves {
+                if chess_move.from == Square::E1 && chess_move.to == Square::H1 {
+                    castle = Some(chess_move);
+                    return true;
+                }
+            }
+            false
+        });
+        let castle = castle.expect("cozy-chess should generate the kingside castle");
+        assert_eq!(standard_uci(&board, castle), "e1g1");
+        assert_eq!(move_to_policy_index(&board, castle), Ok(15 * 64 + 4));
     }
 }

@@ -1,3 +1,5 @@
+import pytest
+
 from zero_chess import Board
 from zero_chess.replay import Experience, PrioritizedReplayBuffer
 
@@ -26,6 +28,16 @@ def test_replay_updates_priorities() -> None:
     assert replay.hot[batch.indices[0]].priority > 1
 
 
+def test_replay_rejects_non_finite_priority_updates() -> None:
+    import math
+
+    replay = PrioritizedReplayBuffer(hot_capacity=2)
+    replay.add(make_exp())
+    batch = replay.sample_with_weights(1)
+    with pytest.raises(ValueError, match="finite"):
+        replay.update_priorities(batch.indices, [math.nan])
+
+
 def test_hot_overflow_stays_in_ram() -> None:
     replay = PrioritizedReplayBuffer(hot_capacity=2)
     replay.add(make_exp())
@@ -39,6 +51,7 @@ def test_hot_overflow_stays_in_ram() -> None:
 
 def test_sampling_is_detinistic_with_seed() -> None:
     import random
+
     replay = PrioritizedReplayBuffer(hot_capacity=32, rng=random.Random(12345))
     for _ in range(32):
         replay.add(make_exp())
@@ -90,3 +103,15 @@ def test_replay_save_load_preserves_sampling_rng(tmp_path) -> None:
     replay.save(path)
     loaded = PrioritizedReplayBuffer.load(path)
     assert replay.rng.getstate() == loaded.rng.getstate()
+
+
+def test_replay_save_load_preserves_full_ring_cursor(tmp_path) -> None:
+    replay = PrioritizedReplayBuffer(hot_capacity=2)
+    replay.add(make_exp(priority=1.0))
+    replay.add(make_exp(priority=2.0))
+    replay.add(make_exp(priority=3.0))
+    cursor = replay._cursor
+    path = tmp_path / "replay_cursor.pkl"
+    replay.save(path)
+    loaded = PrioritizedReplayBuffer.load(path)
+    assert loaded._cursor == cursor

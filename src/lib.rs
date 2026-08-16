@@ -12,12 +12,15 @@ mod python {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use cozy_chess::{Board, Color, Move};
+    use cozy_chess::{Board, Color, GameStatus, Move};
     use pyo3::exceptions::{PyRuntimeError, PyValueError};
     use pyo3::prelude::*;
     use pyo3::types::{PyDict, PyList};
+    use rand::{rngs::StdRng, Rng, SeedableRng};
 
-    use crate::encoding::{encode_board_into, legal_policy_mask, HistoryPosition, INPUT_SIZE};
+    use crate::encoding::{
+        encode_board_into, legal_policy_mask, standard_uci, HistoryPosition, INPUT_SIZE,
+    };
     use crate::evaluator::SharedGpuEvaluator;
     use crate::mcts::{Mcts, SearchConfig};
     use crate::self_play::{generate_self_play, SelfPlayConfig};
@@ -66,7 +69,7 @@ mod python {
             let mut legal = Vec::with_capacity(218);
             self.board.generate_moves(|moves| {
                 for chess_move in moves {
-                    legal.push(chess_move.to_string());
+                    legal.push(standard_uci(&self.board, chess_move));
                 }
                 false
             });
@@ -74,11 +77,13 @@ mod python {
         }
 
         fn encode(&self) -> Vec<f32> {
-            let repetitions = 1 + self
+            let repetitions = self
                 .history
                 .iter()
                 .filter(|entry| entry.board.same_position(&self.board))
-                .count() as u8;
+                .count()
+                .saturating_add(1)
+                .min(u8::MAX as usize) as u8;
             let mut encoded = [0.0; INPUT_SIZE];
             encode_board_into(&self.board, &self.history, repetitions, &mut encoded);
             encoded.to_vec()
@@ -98,7 +103,7 @@ mod python {
             let mut selected: Option<Move> = None;
             self.board.generate_moves(|moves| {
                 for chess_move in moves {
-                    if chess_move.to_string() == uci {
+                    if standard_uci(&self.board, chess_move) == uci {
                         selected = Some(chess_move);
                         return true;
                     }
@@ -107,14 +112,13 @@ mod python {
             });
             let chess_move = selected
                 .ok_or_else(|| PyValueError::new_err("illegal UCI move for this position"))?;
-            let repetitions = 1 + self
+            let repetitions = self
                 .history
                 .iter()
                 .filter(|entry| entry.board.same_position(&self.board))
-                .count() as u8;
-            if self.history.len() == 512 {
-                let _ = self.history.pop();
-            }
+                .count()
+                .saturating_add(1)
+                .min(u8::MAX as usize) as u8;
             self.history.insert(
                 0,
                 HistoryPosition {
@@ -137,11 +141,14 @@ mod python {
         #[pyo3(signature = (simulations = 128))]
         fn analyze_uniform(&self, py: Python<'_>, simulations: u32) -> PyResult<Py<PyDict>> {
             let board = self.board.clone();
+            let display_board = board.clone();
             let history = self.history.clone();
-            let repetitions = 1 + history
+            let repetitions = history
                 .iter()
                 .filter(|entry| entry.board.same_position(&board))
-                .count() as u8;
+                .count()
+                .saturating_add(1)
+                .min(u8::MAX as usize) as u8;
             let result = py
                 .detach(move || {
                     let evaluator = SharedGpuEvaluator::uniform(64, 64, Duration::from_micros(500));
@@ -168,12 +175,14 @@ mod python {
             let result_dict = PyDict::new(py);
             result_dict.set_item(
                 "best_move",
-                result.best_move.map(|chess_move| chess_move.to_string()),
+                result
+                    .best_move
+                    .map(|chess_move| standard_uci(&display_board, chess_move)),
             )?;
             result_dict.set_item("value", result.root_value)?;
             let visits = PyList::empty(py);
             for (chess_move, count) in result.visits {
-                visits.append((chess_move.to_string(), count))?;
+                visits.append((standard_uci(&display_board, chess_move), count))?;
             }
             result_dict.set_item("visits", visits)?;
             Ok(result_dict.unbind())
@@ -187,15 +196,17 @@ mod python {
         slot_count: usize,
         batch_size: usize,
     ) -> PyResult<Arc<SharedGpuEvaluator>> {
-        let device = if device.starts_with("cuda") {
-            let index = device
-                .split(':')
-                .nth(1)
-                .and_then(|text| text.parse::<usize>().ok())
-                .unwrap_or(0);
-            tch::Device::Cuda(index)
-        } else {
-            tch::Device::Cpu
+        let device = match device {
+            "cpu" => tch::Device::Cpu,
+            "cuda" => tch::Device::Cuda(0),
+            value if value.strip_prefix("cuda:").is_some() => {
+                let index = value
+                    .strip_prefix("cuda:")
+                    .and_then(|text| text.parse::<usize>().ok())
+                    .ok_or_else(|| PyValueError::new_err("device must be cpu, cuda, or cuda:N"))?;
+                tch::Device::Cuda(index)
+            }
+            _ => return Err(PyValueError::new_err("device must be cpu, cuda, or cuda:N")),
         };
         SharedGpuEvaluator::torchscript(
             model_path,
@@ -205,6 +216,148 @@ mod python {
             Duration::from_micros(200),
         )
         .map_err(runtime_error)
+    }
+
+    #[cfg(feature = "libtorch")]
+    #[pyfunction]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (candidate_path, incumbent_path, games, simulations = 64, device = "cpu", seed = 0, max_plies = 512, opening_random_plies = 4))]
+    fn evaluate_torchscript_match(
+        py: Python<'_>,
+        candidate_path: &str,
+        incumbent_path: &str,
+        games: usize,
+        simulations: u32,
+        device: &str,
+        seed: u64,
+        max_plies: usize,
+        opening_random_plies: usize,
+    ) -> PyResult<Py<PyDict>> {
+        if games == 0 || !games.is_multiple_of(2) {
+            return Err(PyValueError::new_err(
+                "games must be a positive even number",
+            ));
+        }
+        if simulations == 0 || max_plies == 0 || opening_random_plies > max_plies {
+            return Err(PyValueError::new_err("invalid native match configuration"));
+        }
+        if max_plies > crate::mcts::MAX_SEARCH_DEPTH {
+            return Err(PyValueError::new_err(
+                "max_plies exceeds native search depth",
+            ));
+        }
+        let candidate_path = candidate_path.to_owned();
+        let incumbent_path = incumbent_path.to_owned();
+        let device = device.to_owned();
+        let totals = py
+            .detach(move || {
+                let candidate = create_model_evaluator(&candidate_path, &device, 2, 1)
+                    .map_err(|error| error.to_string())?;
+                let incumbent = create_model_evaluator(&incumbent_path, &device, 2, 1)
+                    .map_err(|error| error.to_string())?;
+                let mut wins_a = 0_u32;
+                let mut wins_b = 0_u32;
+                let mut draws = 0_u32;
+
+                for game_index in 0..games {
+                    let mut rng = StdRng::seed_from_u64(seed.wrapping_add(game_index as u64));
+                    let mut board = Board::default();
+                    let mut history = Vec::<HistoryPosition>::new();
+                    for _ in 0..opening_random_plies {
+                        let mut legal = Vec::with_capacity(218);
+                        board.generate_moves(|moves| {
+                            legal.extend(moves);
+                            false
+                        });
+                        if legal.is_empty() {
+                            break;
+                        }
+                        let chess_move = legal[rng.gen_range(0..legal.len())];
+                        history.insert(
+                            0,
+                            HistoryPosition {
+                                board: board.clone(),
+                                repetitions: 1,
+                            },
+                        );
+                        board.play(chess_move);
+                    }
+
+                    let mut mcts_a = Mcts::new(Arc::clone(&candidate), 100_000, 1)
+                        .map_err(|error| error.to_string())?;
+                    let mut mcts_b = Mcts::new(Arc::clone(&incumbent), 100_000, 1)
+                        .map_err(|error| error.to_string())?;
+                    let a_is_white = game_index < games / 2;
+                    let mut repetitions = repetition_count(&board, &history);
+                    for _ in 0..max_plies.saturating_sub(opening_random_plies) {
+                        let status = board.status();
+                        if matches!(status, GameStatus::Won | GameStatus::Drawn)
+                            || repetitions >= 3
+                            || crate::mcts::is_dead_position(&board)
+                            || board.halfmove_clock() >= 100
+                        {
+                            break;
+                        }
+                        let config = SearchConfig {
+                            simulations,
+                            batch_size: 1,
+                            temperature: 0.0,
+                            add_root_noise: false,
+                            ..SearchConfig::default()
+                        };
+                        let a_to_move = (board.side_to_move() == Color::White) == a_is_white;
+                        let result = if a_to_move {
+                            mcts_a.search(&board, &history, repetitions, config, &mut rng)
+                        } else {
+                            mcts_b.search(&board, &history, repetitions, config, &mut rng)
+                        }
+                        .map_err(|error| error.to_string())?;
+                        let Some(chess_move) = result.best_move else {
+                            break;
+                        };
+                        history.insert(
+                            0,
+                            HistoryPosition {
+                                board: board.clone(),
+                                repetitions,
+                            },
+                        );
+                        board.play(chess_move);
+                        repetitions = repetition_count(&board, &history);
+                        mcts_a
+                            .advance_to_with_context(chess_move, &board, &history, repetitions)
+                            .map_err(|error| error.to_string())?;
+                        mcts_b
+                            .advance_to_with_context(chess_move, &board, &history, repetitions)
+                            .map_err(|error| error.to_string())?;
+                    }
+
+                    match board.status() {
+                        GameStatus::Won if board.side_to_move() == Color::White => wins_b += 1,
+                        GameStatus::Won => wins_a += 1,
+                        GameStatus::Drawn | GameStatus::Ongoing => draws += 1,
+                    }
+                }
+                candidate.shutdown();
+                incumbent.shutdown();
+                Ok::<(u32, u32, u32), String>((wins_a, wins_b, draws))
+            })
+            .map_err(runtime_error)?;
+        let output = PyDict::new(py);
+        output.set_item("wins_a", totals.0)?;
+        output.set_item("wins_b", totals.1)?;
+        output.set_item("draws", totals.2)?;
+        output.set_item("games", games)?;
+        Ok(output.unbind())
+    }
+
+    fn repetition_count(board: &Board, history: &[HistoryPosition]) -> u8 {
+        history
+            .iter()
+            .filter(|entry| entry.board.same_position(board))
+            .count()
+            .saturating_add(1)
+            .min(u8::MAX as usize) as u8
     }
 
     #[cfg(not(feature = "libtorch"))]
@@ -229,6 +382,7 @@ mod python {
         path: std::path::PathBuf,
         modified: std::time::SystemTime,
         size: u64,
+        deployment_hash: Option<String>,
         device: String,
         slot_count: usize,
         batch_size: usize,
@@ -254,10 +408,14 @@ mod python {
             .canonicalize()
             .map_err(runtime_error)?;
         let metadata = std::fs::metadata(&path).map_err(runtime_error)?;
+        let hash_path = std::path::PathBuf::from(format!("{}.sha256", path.display()));
         let key = EvaluatorCacheKey {
             path,
             modified: metadata.modified().map_err(runtime_error)?,
             size: metadata.len(),
+            deployment_hash: std::fs::read_to_string(hash_path)
+                .ok()
+                .map(|value| value.trim().to_owned()),
             device: device.to_owned(),
             slot_count,
             batch_size,
@@ -389,6 +547,8 @@ mod python {
     fn zero_rust_engine(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module.add_class::<FastRustBoard>()?;
         module.add_function(wrap_pyfunction!(generate_self_play_batch_rust, module)?)?;
+        #[cfg(feature = "libtorch")]
+        module.add_function(wrap_pyfunction!(evaluate_torchscript_match, module)?)?;
         Ok(())
     }
 }

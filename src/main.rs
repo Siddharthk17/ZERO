@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cozy_chess::{Board, Move};
-use zero_rust_engine::encoding::HistoryPosition;
+use zero_rust_engine::encoding::{standard_uci, HistoryPosition};
 use zero_rust_engine::evaluator::SharedGpuEvaluator;
 use zero_rust_engine::mcts::{Mcts, SearchConfig};
 
@@ -35,7 +35,7 @@ impl UciSession {
         let words: Vec<_> = command.split_whitespace().collect();
         let moves_at = words.iter().position(|word| *word == "moves");
         let position_words = &words[..moves_at.unwrap_or(words.len())];
-        self.board = if position_words.get(1) == Some(&"startpos") {
+        let mut candidate_board = if position_words.get(1) == Some(&"startpos") {
             Board::default()
         } else if position_words.get(1) == Some(&"fen") && position_words.len() >= 8 {
             position_words[2..8]
@@ -45,23 +45,25 @@ impl UciSession {
         } else {
             return Err("invalid position command".to_owned());
         };
-        self.history.clear();
-        self.mcts.reset();
+        let mut candidate_history = Vec::with_capacity(512);
         if let Some(index) = moves_at {
             for uci in &words[index + 1..] {
-                let chess_move = legal_uci_move(&self.board, uci)
+                let chess_move = legal_uci_move(&candidate_board, uci)
                     .ok_or_else(|| format!("illegal move in position command: {uci}"))?;
-                let repetitions = repetitions(&self.board, &self.history);
-                self.history.insert(
+                let repetitions = repetitions(&candidate_board, &candidate_history);
+                candidate_history.insert(
                     0,
                     HistoryPosition {
-                        board: self.board.clone(),
+                        board: candidate_board.clone(),
                         repetitions,
                     },
                 );
-                self.board.play(chess_move);
+                candidate_board.play(chess_move);
             }
         }
+        self.board = candidate_board;
+        self.history = candidate_history;
+        self.mcts.reset();
         Ok(())
     }
 
@@ -112,7 +114,7 @@ fn legal_uci_move(board: &Board, uci: &str) -> Option<Move> {
     let mut selected = None;
     board.generate_moves(|moves| {
         for chess_move in moves {
-            if chess_move.to_string() == uci {
+            if standard_uci(board, chess_move) == uci {
                 selected = Some(chess_move);
                 return true;
             }
@@ -123,10 +125,11 @@ fn legal_uci_move(board: &Board, uci: &str) -> Option<Move> {
 }
 
 fn repetitions(board: &Board, history: &[HistoryPosition]) -> u8 {
-    1 + history
+    history
         .iter()
         .filter(|entry| entry.board.same_position(board))
         .count()
+        .saturating_add(1)
         .min(u8::MAX as usize) as u8
 }
 
@@ -160,7 +163,11 @@ fn main() {
             }
             _ if command.starts_with("go") => match session.go(&command) {
                 Ok(Some(chess_move)) => {
-                    let _ = writeln!(stdout, "bestmove {chess_move}");
+                    let _ = writeln!(
+                        stdout,
+                        "bestmove {}",
+                        standard_uci(&session.board, chess_move)
+                    );
                 }
                 Ok(None) => {
                     let _ = writeln!(stdout, "bestmove 0000");

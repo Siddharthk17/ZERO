@@ -18,8 +18,10 @@ from .targets import DRAW_VALUE, apply_contempt, opponent_value
 
 class Evaluator(Protocol):
     """Protocol for batch position evaluators returning priors, value, and uncertainty."""
+
     def evaluate_batch(self, boards: list[Board]) -> list[tuple[dict[Move, float], float, float]]:
         """Return ``(legal_priors, value, uncertainty)`` for each board."""
+
 
 class UniformEvaluator:
     """Fallback evaluator for bootstrap self-play and CPU-only smoke tests."""
@@ -37,6 +39,7 @@ class UniformEvaluator:
             prob = 1.0 / len(moves) if moves else 0.0
             out.append(({move: prob for move in moves}, 0.0, 1.0))
         return out
+
 
 class NetworkEvaluator:
     """Synchronous model evaluator with lock-free forward pass.
@@ -58,12 +61,15 @@ class NetworkEvaluator:
     ) -> list[tuple[dict[Move, float], float, float]]:
         return self.model.evaluate_batch(boards, self.device, histories=histories)
 
+
 @dataclass(slots=True)
 class _EvalRequest:
     boards: list[Board]
+    histories: list[list[Board] | None]
     done: Event = field(default_factory=Event)
     results: list[tuple[dict[Move, float], float, float]] | None = None
     error: BaseException | None = None
+
 
 class SharedBatchEvaluator:
     """Coalesces evaluator calls from multiple self-play threads into large GPU batches."""
@@ -95,12 +101,19 @@ class SharedBatchEvaluator:
         self._worker = Thread(target=self._run, name="zero-gpu-batch-evaluator", daemon=True)
         self._worker.start()
 
-    def evaluate_batch(self, boards: list[Board]) -> list[tuple[dict[Move, float], float, float]]:
+    def evaluate_batch(
+        self,
+        boards: list[Board],
+        histories: list[list[Board] | None] | None = None,
+    ) -> list[tuple[dict[Move, float], float, float]]:
         if not boards:
             return []
         if len(boards) > self.max_batch_size:
             raise ValueError("a single evaluator request cannot exceed max_batch_size")
-        request = _EvalRequest(list(boards))
+        normalized_histories = list(histories) if histories is not None else [None] * len(boards)
+        if len(normalized_histories) != len(boards):
+            raise ValueError("histories must have the same length as boards")
+        request = _EvalRequest(list(boards), normalized_histories)
         with self._condition:
             if self._closed:
                 raise RuntimeError("SharedBatchEvaluator is closed")
@@ -171,8 +184,15 @@ class SharedBatchEvaluator:
 
     def _evaluate_requests(self, requests: list[_EvalRequest]) -> None:
         flat_boards = [board for request in requests for board in request.boards]
+        flat_histories = [history for request in requests for history in request.histories]
         try:
-            flat_results = self.model.evaluate_batch(flat_boards, self.device)
+            if isinstance(self.model, (UniformEvaluator, NetworkEvaluator)):
+                if isinstance(self.model, NetworkEvaluator):
+                    flat_results = self.model.evaluate_batch(flat_boards, flat_histories)
+                else:
+                    flat_results = self.model.evaluate_batch(flat_boards)
+            else:
+                flat_results = self.model.evaluate_batch(flat_boards, self.device)
             if len(flat_results) != len(flat_boards):
                 raise RuntimeError("evaluator returned a result count different from its input batch")
         except BaseException as exc:
@@ -192,9 +212,11 @@ class SharedBatchEvaluator:
             offset = end
             request.done.set()
 
+
 @dataclass(slots=True)
 class Node:
     """A node in the MCTS search tree tracking visits, values, priors, and children."""
+
     prior_probability: float = 0.0
     visit_count: int = 0
     total_value: float = 0.0
@@ -227,21 +249,23 @@ class Node:
     def expanded(self) -> bool:
         return self.is_expanded
 
-    def apply_virtual_loss(self) -> None:
-        self.total_value -= VIRTUAL_LOSS_VALUE
+    def apply_virtual_loss(self, value: float = -VIRTUAL_LOSS_VALUE) -> None:
+        self.total_value += value
         self.visit_count += VIRTUAL_LOSS_VISITS
         self.virtual_loss_count += 1
 
-    def undo_virtual_loss(self) -> None:
+    def undo_virtual_loss(self, value: float = -VIRTUAL_LOSS_VALUE) -> None:
         if self.virtual_loss_count <= 0:
             return
-        self.total_value += VIRTUAL_LOSS_VALUE
+        self.total_value -= value
         self.visit_count -= VIRTUAL_LOSS_VISITS
         self.virtual_loss_count -= 1
+
 
 @dataclass(slots=True)
 class SearchResult:
     """Result of an MCTS search: selected move, visit counts, root node, and resignation flag."""
+
     move: Move | None
     visits: dict[Move, int]
     root: Node
@@ -259,12 +283,14 @@ class SearchResult:
         yield self.move
         yield self.policy
 
+
 @dataclass(slots=True)
 class _Leaf:
     node: Node
     board: Board
     path: list[Node]
     history: list[Board]
+
 
 class MCTS:
     """Search orchestrator with alternating minimax backups and FPU selection."""
@@ -281,7 +307,7 @@ class MCTS:
         dirichlet_alpha: float = 0.3,
         dirichlet_epsilon: float = 0.25,
         fpu_reduction: float = 0.25,
-        use_transpositions: bool = False, # Defaulted to False to prevent cyclic graphs [2]
+        use_transpositions: bool = False,  # Defaulted to False to prevent cyclic graphs [2]
         rng: random.Random | None = None,
         **_: object,
     ) -> None:
@@ -299,22 +325,25 @@ class MCTS:
         self.use_transpositions = use_transpositions
         self.rng = rng or random.Random()
         self.root = Node()
+        self.root_board: Board | None = None
         self.root_hash: int | None = None
-        self.root_context: tuple[int, int, int, int] | None = None
-        self.transposition_table: dict[tuple[int, int, int, int], Node] = {}
+        self.root_context: tuple[object, ...] | None = None
+        self.transposition_table: dict[tuple[object, ...], Node] = {}
         self._resign_streak: dict[int, int] = {}
+        self._root_noise_applied = False
         self.last_average_batch_size = 0.0
         self.last_batches = 0
 
     def _coerce_evaluator(self, network: object | None) -> Evaluator:
         if network is None:
             return UniformEvaluator()
-        if hasattr(network, "evaluate_batch"):
+        if hasattr(network, "evaluate_batch") and not hasattr(network, "parameters"):
             return network  # type: ignore[return-value]
         return NetworkEvaluator(network)
 
     def reset(self) -> None:
         """Iteratively tear down MCTS nodes to speed up GC and avoid recursion limit crashes."""
+
         def _clear_node(node: Node | None) -> None:
             if node is None:
                 return
@@ -334,11 +363,14 @@ class MCTS:
                     for child in children:
                         if child is not None:
                             stack.append(child)
+
         if hasattr(self, "root") and self.root:
             _clear_node(self.root)
             self.root = Node()
         self.root_hash = None
+        self.root_board = None
         self.root_context = None
+        self._root_noise_applied = False
 
         if hasattr(self, "transposition_table"):
             for node in list(self.transposition_table.values()):
@@ -361,17 +393,20 @@ class MCTS:
     ) -> SearchResult:
         budget = self.simulations if num_simulations is None else num_simulations
         self.c_puct = self.c_puct if c_puct is None else c_puct
-        root = self._root_for(board)
-        if not root.is_expanded and board.outcome() is None:
-            self._expand_root(root, board, history or [])
-        if add_noise if add_noise is not None else self.add_noise_default:
+        history = history or []
+        root = self._root_for(board, history)
+        if not root.is_expanded and self._root_terminal(board, history) is None:
+            self._expand_root(root, board, history)
+        use_noise = add_noise if add_noise is not None else self.add_noise_default
+        if use_noise and not self._root_noise_applied:
             self._add_dirichlet_noise(root)
+            self._root_noise_applied = True
 
         simulations_done = 0
         batch_sizes: list[int] = []
         while simulations_done < budget and not (stop_event and stop_event.is_set()):
             leaves, terminals = self._collect_batch(
-                board, root, budget - simulations_done, stop_event=stop_event, history=history or []
+                board, root, budget - simulations_done, stop_event=stop_event, history=history
             )
             if not leaves and not terminals:
                 break
@@ -398,30 +433,48 @@ class MCTS:
         add_noise: bool = False,
         generation: int = 10,
         history: list[Board] | None = None,
+        stop_event: Event | None = None,
     ) -> SearchResult:
         deadline = time.monotonic() + max(milliseconds, 1) / 1000.0
-        root = self._root_for(board)
-        if not root.is_expanded and board.outcome() is None:
-            self._expand_root(root, board, history or [])
-        while time.monotonic() < deadline:
-            self.search(
+        history = history or []
+        root = self._root_for(board, history)
+        if not root.is_expanded and self._root_terminal(board, history) is None:
+            self._expand_root(root, board, history)
+        last_result: SearchResult | None = None
+        while time.monotonic() < deadline and not (stop_event and stop_event.is_set()):
+            last_result = self.search(
                 board,
                 self.batch_size,
                 temperature,
                 add_noise,
                 generation,
                 history=history,
+                stop_event=stop_event,
             )
+            if last_result.resigned:
+                return last_result
         visits = {move: child.visit_count for move, child in root.children.items()}
         root_q_with_contempt = apply_contempt(root.q)
         return SearchResult(
-            self._select_move(visits, temperature), visits, root, root_q_with_contempt=root_q_with_contempt
+            self._select_move(visits, temperature),
+            visits,
+            root,
+            resigned=last_result.resigned if last_result is not None else False,
+            root_q_with_contempt=root_q_with_contempt,
         )
 
-    def _root_for(self, board: Board) -> Node:
-        context = _board_context(board)
+    def _root_terminal(self, board: Board, history: list[Board]) -> str | None:
+        if _repetition_count(board, history, []) >= 3:
+            return "1/2-1/2"
+        return board.outcome()
+
+    def _root_for(self, board: Board, history: list[Board] | None = None) -> Node:
+        context = _board_context(board, history)
         if self.root_context is None:
+            if self.root_board is not None and self.root_board.fen() != board.fen():
+                self.root = Node()
             self.root_hash = board.zobrist_hash
+            self.root_board = board.copy()
             self.root_context = context
             if self.use_transpositions:
                 self.transposition_table[context] = self.root
@@ -435,7 +488,9 @@ class MCTS:
             if self.use_transpositions:
                 self.transposition_table[context] = self.root
         self.root_hash = board.zobrist_hash
+        self.root_board = board.copy()
         self.root_context = context
+        self._root_noise_applied = False
         return self.root
 
     def _collect_batch(
@@ -454,17 +509,19 @@ class MCTS:
                 break
             sim_board = board.copy()
             sim_history = [position.copy() for position in (history or [])[:7]]
+            branch_positions: list[tuple[str, int, int, int | None]] = []
             node = root
             path = [node]
             is_repetition = False
             while node.is_expanded and node.children:
                 move, node = self._select_child(node)
                 previous = sim_board.copy()
-                sim_board.push(move)
+                branch_positions.append(sim_board._position_key())
+                sim_board._push_unchecked(move)
                 sim_history.insert(0, previous)
                 del sim_history[7:]
                 path.append(node)
-                if sim_board.is_threefold_repetition():
+                if _repetition_count(sim_board, history or [], branch_positions) >= 3:
                     is_repetition = True
                     break
             if is_repetition:
@@ -474,8 +531,8 @@ class MCTS:
                 if terminal is not None:
                     terminals.append((path, terminal, sim_board.turn))
                 else:
-                    for n in path:
-                        n.apply_virtual_loss()
+                    for depth, n in enumerate(path):
+                        n.apply_virtual_loss(-VIRTUAL_LOSS_VALUE if depth == 0 else VIRTUAL_LOSS_VALUE)
                     leaves.append(_Leaf(node, sim_board, path, sim_history))
         return leaves, terminals
 
@@ -491,13 +548,13 @@ class MCTS:
                 self._backpropagate(leaf.path, value, leaf.board.turn)
         finally:
             for leaf in leaves:
-                for node in leaf.path:
-                    node.undo_virtual_loss()
+                for depth, node in enumerate(leaf.path):
+                    node.undo_virtual_loss(-VIRTUAL_LOSS_VALUE if depth == 0 else VIRTUAL_LOSS_VALUE)
 
     def _evaluate_leaves(self, leaves: list[_Leaf]):
         boards = [leaf.board for leaf in leaves]
         histories = [leaf.history for leaf in leaves]
-        if isinstance(self.evaluator, NetworkEvaluator):
+        if isinstance(self.evaluator, (NetworkEvaluator, SharedBatchEvaluator)):
             return self.evaluator.evaluate_batch(boards, histories)
         return self.evaluator.evaluate_batch(boards)
 
@@ -510,18 +567,21 @@ class MCTS:
         priors, _value, uncertainty = result
         self._expand_with_priors(root, board, priors, uncertainty)
 
-    def _expand_with_priors(
-        self, node: Node, board: Board, priors: dict[Move, float], uncertainty: float
-    ) -> None:
+    def _expand_with_priors(self, node: Node, board: Board, priors: dict[Move, float], uncertainty: float) -> None:
         node.uncertainty = uncertainty
         if node.is_expanded:
             return
-        total_prior = sum(max(0.0, prior) for prior in priors.values())
-        for move, prior in priors.items():
-            normalized = max(0.0, prior) / total_prior if total_prior > 0 else 0.0
+        legal_moves = board.legal_moves()
+        legal_priors = {
+            move: float(priors.get(move, 0.0)) for move in legal_moves if math.isfinite(float(priors.get(move, 0.0)))
+        }
+        total_prior = sum(max(0.0, prior) for prior in legal_priors.values())
+        for move in legal_moves:
+            prior = legal_priors.get(move, 0.0)
+            normalized = max(0.0, prior) / total_prior if total_prior > 0 else 1.0 / len(legal_moves)
             child = None
             if self.use_transpositions:
-                board.push(move)
+                board._push_unchecked(move)
                 child_context = _board_context(board)
                 child = self.transposition_table.get(child_context)
                 if child is None:
@@ -607,8 +667,8 @@ class MCTS:
         noise = _dirichlet([self.dirichlet_alpha] * len(root.children), self.rng)
         for child, eta in zip(root.children.values(), noise, strict=True):
             child.prior_probability = (
-                (1 - self.dirichlet_epsilon) * child.prior_probability + self.dirichlet_epsilon * eta
-            )
+                1 - self.dirichlet_epsilon
+            ) * child.prior_probability + self.dirichlet_epsilon * eta
 
     def _should_resign(self, board: Board, root: Node, generation: int) -> bool:
         """Optional explicit resignation policy; disabled by default in self-play."""
@@ -623,14 +683,22 @@ class MCTS:
     def advance_to(self, move: Move) -> None:
         if move in self.root.children:
             self.root = self.root.children[move]
+            if self.root_board is not None and move in self.root_board.legal_moves():
+                self.root_board = self.root_board.copy()
+                self.root_board._push_unchecked(move)
+            else:
+                self.root_board = None
             self.root_hash = None
             self.root_context = None
+            self._root_noise_applied = False
             self.transposition_table.clear()
             return
         self.root = Node()
         self.root_hash = None
         self.root_context = None
+        self._root_noise_applied = False
         self.transposition_table.clear()
+
 
 def _dirichlet(alphas: list[float], rng: random.Random) -> list[float]:
     samples = [rng.gammavariate(alpha, 1.0) for alpha in alphas]
@@ -640,11 +708,34 @@ def _dirichlet(alphas: list[float], rng: random.Random) -> list[float]:
     return [sample / total for sample in samples]
 
 
-def _board_context(board: Board) -> tuple[int, int, int, int]:
-    """Include draw history in root reuse without retaining another board copy."""
+def _repetition_count(
+    board: Board,
+    history: list[Board],
+    branch_positions: list[tuple[str, int, int, int | None]],
+) -> int:
+    """Count the current position across external and simulated history."""
+    key = board._position_key()
     return (
-        board.zobrist_hash,
+        1
+        + sum(position._position_key() == key for position in history)
+        + sum(position_key == key for position_key in branch_positions)
+    )
+
+
+def _board_context(board: Board, history: list[Board] | None = None) -> tuple[object, ...]:
+    """Include neural-input and draw-history context in root reuse."""
+    history_signature = tuple(
+        (
+            position._position_key(),
+            position.halfmove_clock,
+            position.fullmove_number,
+        )
+        for position in (history or [])
+    )
+    return (
+        board._position_key(),
         board.halfmove_clock,
-        len(board.hash_history),
-        hash(tuple(board.hash_history)),
+        board.fullmove_number,
+        tuple(board.position_history),
+        history_signature,
     )

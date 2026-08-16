@@ -54,13 +54,6 @@ export function gameResultLabel(game: Chess) {
   return "Game over";
 }
 
-export function formatClock(seconds: number) {
-  const safe = Math.max(0, Math.floor(seconds));
-  const minutes = Math.floor(safe / 60);
-  const rest = safe % 60;
-  return `${minutes}:${rest.toString().padStart(2, "0")}`;
-}
-
 export function evalToWhitePercent(evaluation: number) {
   const clamped = Math.max(-8, Math.min(8, evaluation));
   return Math.round((1 / (1 + Math.exp(-clamped / 2))) * 100);

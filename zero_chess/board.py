@@ -52,6 +52,7 @@ class _State:
     fullmove_number: int
     zobrist_hash: int
 
+
 class Board:
     """Complete chess position with highly optimized legal move generation."""
 
@@ -65,6 +66,7 @@ class Board:
         "_stack",
         "zobrist_hash",
         "hash_history",
+        "position_history",
     )
 
     def __init__(
@@ -87,7 +89,8 @@ class Board:
             self.fullmove_number = other.fullmove_number
             self._stack = []
             self.zobrist_hash = other.zobrist_hash
-            self.hash_history = other.hash_history
+            self.hash_history = other.hash_history.copy()
+            self.position_history = other.position_history.copy()
             return
         self.squares = squares[:] if squares is not None else self._parse_placement(STARTING_FEN.split()[0])
         self.turn = turn
@@ -98,6 +101,7 @@ class Board:
         self._stack: list[_State] = []
         self.zobrist_hash = self.compute_zobrist()
         self.hash_history = history[:] if history is not None else [self.zobrist_hash]
+        self.position_history = [self._position_key()]
 
     @classmethod
     def starting_position(cls) -> "Board":
@@ -110,6 +114,10 @@ class Board:
             raise ValueError(f"FEN must have six fields: {fen!r}")
         placement, active, castling, ep, halfmove, fullmove = fields
         board = cls._parse_placement(placement)
+        if board.count("K") != 1 or board.count("k") != 1:
+            raise ValueError("FEN must contain exactly one king per side")
+        if any(board[square] in {"P", "p"} for square in (*range(8), *range(56, 64))):
+            raise ValueError("pawns cannot be placed on the first or eighth rank")
 
         if active not in ("w", "b"):
             raise ValueError(f"invalid active color: {active!r}")
@@ -145,6 +153,14 @@ class Board:
             raise ValueError(f"invalid FEN move counters: {halfmove!r} {fullmove!r}") from exc
         if halfmove_clock < 0 or fullmove_number < 1:
             raise ValueError("FEN move counters must be non-negative and fullmove_number >= 1")
+        if rights & WK and (board[parse_square("e1")] != "K" or board[parse_square("h1")] != "R"):
+            raise ValueError("white kingside castling right is inconsistent with the board")
+        if rights & WQ and (board[parse_square("e1")] != "K" or board[parse_square("a1")] != "R"):
+            raise ValueError("white queenside castling right is inconsistent with the board")
+        if rights & BK and (board[parse_square("e8")] != "k" or board[parse_square("h8")] != "r"):
+            raise ValueError("black kingside castling right is inconsistent with the board")
+        if rights & BQ and (board[parse_square("e8")] != "k" or board[parse_square("a8")] != "r"):
+            raise ValueError("black queenside castling right is inconsistent with the board")
         return cls(board, turn, rights, ep_square, halfmove_clock, fullmove_number)
 
     @staticmethod
@@ -184,6 +200,7 @@ class Board:
             self.hash_history,
         )
         clone._stack = self._stack.copy()
+        clone.position_history = self.position_history.copy()
         return clone
 
     def fen(self) -> str:
@@ -235,6 +252,14 @@ class Board:
         if ep_file is not None:
             value ^= EP_FILE_KEYS[ep_file]
         return mask64(value)
+
+    def _position_key(self) -> tuple[str, int, int, int | None]:
+        """Return an exact FIDE repetition identity without move counters."""
+        return ("".join(self.squares), self.turn, self.castling_rights, self._effective_ep_file())
+
+    def same_position(self, other: "Board") -> bool:
+        """Compare positions using exact FIDE repetition semantics."""
+        return self._position_key() == other._position_key()
 
     def _effective_ep_file(self) -> int | None:
         """Return the en-passant file only when a legal capture is available.
@@ -349,7 +374,7 @@ class Board:
         moves: list[Move] = []
         moving = self.turn
         for move in self.pseudo_legal_moves():
-            self.push(move)
+            self._push_unchecked(move)
             legal = not self.is_check(moving)
             self.pop()
             if legal:
@@ -364,7 +389,7 @@ class Board:
         """
         moving = self.turn
         for move in self.pseudo_legal_moves():
-            self.push(move)
+            self._push_unchecked(move)
             legal = not self.is_check(moving)
             self.pop()
             if legal:
@@ -506,14 +531,27 @@ class Board:
         raw = Move.from_uci(text)
         for move in self.legal_moves():
             if move.from_sq == raw.from_sq and move.to_sq == raw.to_sq and move.promotion == raw.promotion:
-                self.push(move)
+                self._push_unchecked(move)
                 return move
         raise ValueError(f"illegal move {text!r} in position {self.fen()}")
 
     def push(self, move: Move) -> None:
+        """Apply a fully legal move.
+
+        Internal move generation uses ``_push_unchecked`` to avoid recursively
+        regenerating legal moves. Public callers get a legality boundary.
+        """
+        for legal in self.legal_moves():
+            if legal.from_sq == move.from_sq and legal.to_sq == move.to_sq and legal.promotion == move.promotion:
+                self._push_unchecked(legal)
+                return
+        raise ValueError(f"illegal move {move!r} in position {self.fen()}")
+
+    def _push_unchecked(self, move: Move) -> None:
         """Apply a move to the board, updating state and pushing to the undo stack.
 
-        Raises ValueError if the source square is empty.
+        This private fast path assumes that ``move`` came from the current
+        position's pseudo-legal move generator.
         """
         piece = self.squares[move.from_sq]
         if piece == EMPTY:
@@ -602,10 +640,9 @@ class Board:
             new_hash ^= EP_FILE_KEYS[new_ep_file]
         self.zobrist_hash = mask64(new_hash)
         self.hash_history.append(self.zobrist_hash)
+        self.position_history.append(self._position_key())
 
-    def _update_castling_rights(
-        self, piece: str, from_sq: int, to_sq: int, captured: str, captured_sq: int
-    ) -> None:
+    def _update_castling_rights(self, piece: str, from_sq: int, to_sq: int, captured: str, captured_sq: int) -> None:
         if piece == "K":
             self.castling_rights &= ~(WK | WQ)
         elif piece == "k":
@@ -639,6 +676,7 @@ class Board:
         state = self._stack.pop()
         move = state.move
         self.hash_history.pop()
+        self.position_history.pop()
         self.turn = opposite(self.turn)
         self.castling_rights = state.castling_rights
         self.ep_square = state.ep_square
@@ -721,7 +759,39 @@ class Board:
 
     def is_threefold_repetition(self) -> bool:
         """Return True if the current position has occurred three or more times in the game."""
-        return Counter(self.hash_history)[self.zobrist_hash] >= 3
+        return Counter(self.position_history)[self._position_key()] >= 3
+
+    def is_fivefold_repetition(self) -> bool:
+        """Return True if the current position has occurred five or more times."""
+        return Counter(self.position_history)[self._position_key()] >= 5
+
+    def can_claim_threefold_repetition(self) -> bool:
+        """Return whether the player may claim threefold now or before a move."""
+        if self.is_threefold_repetition():
+            return True
+        for move in self.legal_moves():
+            self._push_unchecked(move)
+            claimed = Counter(self.position_history)[self._position_key()] >= 3
+            self.pop()
+            if claimed:
+                return True
+        return False
+
+    def can_claim_fifty_move(self) -> bool:
+        """Return whether the player may claim the fifty-move rule now or before a move."""
+        if self.halfmove_clock >= 100:
+            return True
+        if self.halfmove_clock < 99:
+            return False
+        for move in self.legal_moves():
+            piece = self.squares[move.from_sq]
+            if piece_type(piece) != "P" and not (move.flags & CAPTURE):
+                return True
+        return False
+
+    def is_seventy_five_move_draw(self) -> bool:
+        """Return True for the automatic 75-move draw threshold."""
+        return self.halfmove_clock >= 150
 
     def is_checkmate(self) -> bool:
         """Return True if the side to move is in checkmate (in check with no legal moves)."""
@@ -752,10 +822,11 @@ class Board:
             return "1/2-1/2"
         if self.has_insufficient_material():
             return "1/2-1/2"
-        # The 75-move rule is automatic; the 50-move rule is claimable.
-        if self.halfmove_clock >= 150:
+        # The 75-move rule and fivefold repetition are automatic; the 50-move
+        # rule and threefold repetition remain claimable.
+        if self.is_seventy_five_move_draw() or self.is_fivefold_repetition():
             return "1/2-1/2"
-        if claim_draws and (self.is_fifty_move_draw() or self.is_threefold_repetition()):
+        if claim_draws and (self.can_claim_fifty_move() or self.can_claim_threefold_repetition()):
             return "1/2-1/2"
         return None
 
@@ -792,7 +863,7 @@ class Board:
             if move.promotion:
                 san += f"={move.promotion}"
 
-        self.push(move)
+        self._push_unchecked(move)
         if self.is_check(self.turn):
             san += "#" if not self.legal_moves() else "+"
         self.pop()

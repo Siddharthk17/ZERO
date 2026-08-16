@@ -10,12 +10,15 @@ from copy import copy
 from dataclasses import dataclass
 from math import isfinite, nextafter
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 
 # Policy size matches the AlphaZero 73-plane encoding (73 * 64 = 4672).
 _POLICY_SIZE = 73 * 64
 _TARGET_KINDS = {"terminal", "truncated", "adjudicated"}
+REPLAY_SCHEMA_VERSION = 2
+ENCODING_VERSION = "zero-x-121x73-v1"
 
 
 def _normalize_policy_keys(fen: str, policy: dict) -> dict[int, float]:
@@ -27,11 +30,12 @@ def _normalize_policy_keys(fen: str, policy: dict) -> dict[int, float]:
     keys pass through directly (the fast path), while string keys are converted to
     policy indices by decoding the move against the position described by ``fen``.
     """
-    if not policy:
-        return {}
     from .board import Board
     from .encoding import move_to_policy_index
     from .move import Move
+
+    if not policy:
+        return {}
 
     board = Board.from_fen(fen)
     legal_by_uci = {move.uci(): move_to_policy_index(board, move) for move in board.legal_moves()}
@@ -77,10 +81,17 @@ class Experience:
             raise ValueError(f"unsupported replay target kind: {self.target_kind!r}")
         normalized_policy = _normalize_policy_keys(self.fen, self.policy)
         normalized_policy = {
-            index: max(0.0, float(value))
-            for index, value in normalized_policy.items()
-            if isfinite(float(value))
+            index: max(0.0, float(value)) for index, value in normalized_policy.items() if isfinite(float(value))
         }
+        if not normalized_policy:
+            from .board import Board
+            from .encoding import move_to_policy_index
+
+            board = Board.from_fen(self.fen)
+            legal_indices = [move_to_policy_index(board, move) for move in board.legal_moves()]
+            if legal_indices:
+                probability = 1.0 / len(legal_indices)
+                normalized_policy = {index: probability for index in legal_indices}
         self.policy = normalized_policy
 
         self.wdl = tuple(float(value.item() if hasattr(value, "item") else value) for value in self.wdl)
@@ -99,27 +110,29 @@ class Experience:
         self.q_mcts = min(1.0, max(-1.0, self.q_mcts))
         if isinstance(self.material, (list, tuple)) and len(self.material) == 2:
             white_material, black_material = self.material
+            white_material = float(white_material.item() if hasattr(white_material, "item") else white_material)
+            black_material = float(black_material.item() if hasattr(black_material, "item") else black_material)
+            if not isfinite(white_material) or not isfinite(black_material):
+                raise ValueError("material targets must be finite")
             self.material = (
-                min(1.0, max(0.0, float(white_material.item() if hasattr(white_material, "item") else white_material))),
-                min(1.0, max(0.0, float(black_material.item() if hasattr(black_material, "item") else black_material))),
+                min(1.0, max(0.0, white_material)),
+                min(1.0, max(0.0, black_material)),
             )
         else:
             self.material = (0.0, 0.0)
-        self.moves_left = min(1.0, max(0.0, float(
-            self.moves_left.item() if hasattr(self.moves_left, "item") else self.moves_left
-        )))
+        self.moves_left = float(self.moves_left.item() if hasattr(self.moves_left, "item") else self.moves_left)
+        if not isfinite(self.moves_left):
+            raise ValueError("moves-left target must be finite")
+        self.moves_left = min(1.0, max(0.0, self.moves_left))
         if self.opponent_policy is not None:
             normalized_opponent_policy = {
                 int(index): max(0.0, float(value.item() if hasattr(value, "item") else value))
                 for index, value in self.opponent_policy.items()
-                if 0 <= int(index) < 4_672
-                and isfinite(float(value.item() if hasattr(value, "item") else value))
+                if 0 <= int(index) < 4_672 and isfinite(float(value.item() if hasattr(value, "item") else value))
             }
             total = sum(normalized_opponent_policy.values())
             self.opponent_policy = (
-                {index: value / total for index, value in normalized_opponent_policy.items()}
-                if total > 0.0
-                else None
+                {index: value / total for index, value in normalized_opponent_policy.items()} if total > 0.0 else None
             )
         self.opponent_legal_policy = tuple(
             sorted({int(index) for index in self.opponent_legal_policy if 0 <= int(index) < _POLICY_SIZE})
@@ -131,9 +144,7 @@ class Experience:
             }
             total = sum(filtered_opponent.values())
             self.opponent_policy = (
-                {index: value / total for index, value in filtered_opponent.items()}
-                if total > 0.0
-                else None
+                {index: value / total for index, value in filtered_opponent.items()} if total > 0.0 else None
             )
         self.priority = float(self.priority.item() if hasattr(self.priority, "item") else self.priority)
         if not isfinite(self.priority):
@@ -146,12 +157,14 @@ class Experience:
         self.history_fens = tuple(str(fen) for fen in self.history_fens[:7])
         self.repetitions = max(1, min(255, int(self.repetitions)))
         history_repetitions = tuple(
-            max(1, min(255, int(value))) for value in self.history_repetitions[:len(self.history_fens)]
+            max(1, min(255, int(value))) for value in self.history_repetitions[: len(self.history_fens)]
         )
         self.history_repetitions = history_repetitions + (1,) * (len(self.history_fens) - len(history_repetitions))
 
     @property
     def value(self) -> float:
+        if self.target_kind == "truncated":
+            return self.q_mcts
         return 0.5 * (self.wdl[0] - self.wdl[2]) + 0.5 * self.q_mcts
 
 
@@ -205,6 +218,7 @@ class PrioritizedReplayBuffer:
         beta: float = 0.4,
         epsilon: float = 0.01,
         rng: random.Random | None = None,
+        metadata: dict[str, str] | None = None,
     ) -> None:
         if hot_capacity <= 0:
             raise ValueError("hot_capacity must be positive")
@@ -212,6 +226,12 @@ class PrioritizedReplayBuffer:
         self.alpha = float(alpha)
         self.beta = float(beta)
         self.epsilon = float(epsilon)
+        if not isfinite(self.alpha) or self.alpha < 0.0:
+            raise ValueError("alpha must be finite and non-negative")
+        if not isfinite(self.beta) or self.beta < 0.0:
+            raise ValueError("beta must be finite and non-negative")
+        if not isfinite(self.epsilon) or self.epsilon <= 0.0:
+            raise ValueError("epsilon must be finite and positive")
         self.rng = rng or random.Random()
         self.hot: list[Experience] = []
         self._generations: list[int] = []
@@ -219,6 +239,12 @@ class PrioritizedReplayBuffer:
         self._tree = SumTree(self.hot_capacity)
         self._max_priority = 1.0
         self._lock = threading.Lock()
+        self._save_lock = threading.Lock()
+        self.metadata = {
+            "schema_version": str(REPLAY_SCHEMA_VERSION),
+            "encoding_version": ENCODING_VERSION,
+            **(metadata or {}),
+        }
 
     def __len__(self) -> int:
         with self._lock:
@@ -293,7 +319,12 @@ class PrioritizedReplayBuffer:
         return self.beta
 
     def _priority_from_error(self, error: float) -> float:
-        return (abs(error) + self.epsilon) ** self.alpha
+        if not isfinite(error):
+            raise ValueError("priority error must be finite")
+        priority = (abs(error) + self.epsilon) ** self.alpha
+        if not isfinite(priority):
+            raise ValueError("priority must be finite")
+        return priority
 
     # -- Compatibility API -------------------------------------------------
 
@@ -319,26 +350,36 @@ class PrioritizedReplayBuffer:
         """Persist the hot buffer and priorities to ``path`` via pickle."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with self._lock:
-            data = {
-                # Freeze each record before releasing the lock.  Training can
-                # update priorities while the serialized snapshot is written.
-                "hot": [copy(exp) for exp in self.hot],
-                "hot_capacity": self.hot_capacity,
-                "alpha": self.alpha,
-                "beta": self.beta,
-                "epsilon": self.epsilon,
-                "_cursor": self._cursor,
-                "_max_priority": self._max_priority,
-                "_generations": self._generations.copy(),
-                "rng_state": self.rng.getstate(),
-            }
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        with open(temporary, "wb") as handle:
-            pickle.dump(data, handle, protocol=pickle.HIGHEST_PROTOCOL)
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.replace(path)
+        with self._save_lock:
+            with self._lock:
+                data = {
+                    # Policy/history containers are immutable after insertion;
+                    # copy the records while holding the lock so scalar priority
+                    # updates cannot race with serialization.
+                    "schema_version": REPLAY_SCHEMA_VERSION,
+                    "metadata": self.metadata.copy(),
+                    "hot": [copy(exp) for exp in self.hot],
+                    "hot_capacity": self.hot_capacity,
+                    "alpha": self.alpha,
+                    "beta": self.beta,
+                    "epsilon": self.epsilon,
+                    "_cursor": self._cursor,
+                    "_max_priority": self._max_priority,
+                    "_generations": self._generations.copy(),
+                    "rng_state": self.rng.getstate(),
+                }
+            temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+            try:
+                with open(temporary, "xb") as handle:
+                    pickle.dump(data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                temporary.replace(path)
+            finally:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
 
     @classmethod
     def load(cls, path: str | Path, hot_capacity: int | None = None) -> "PrioritizedReplayBuffer":
@@ -346,12 +387,21 @@ class PrioritizedReplayBuffer:
         path = Path(path)
         with open(path, "rb") as handle:
             data = pickle.load(handle)
+        if not isinstance(data, dict):
+            raise ValueError("replay snapshot root must be a dictionary")
+        schema_version = int(data.get("schema_version", 1))
+        if schema_version > REPLAY_SCHEMA_VERSION:
+            raise ValueError(f"replay schema {schema_version} is newer than supported schema {REPLAY_SCHEMA_VERSION}")
+        metadata = data.get("metadata", {})
+        if not isinstance(metadata, dict):
+            raise ValueError("replay metadata must be a dictionary")
         capacity = hot_capacity if hot_capacity is not None else data["hot_capacity"]
         buffer = cls(
             hot_capacity=capacity,
             alpha=data["alpha"],
             beta=data["beta"],
             epsilon=data["epsilon"],
+            metadata=metadata,
         )
         saved_hot = list(data["hot"])
         for exp in saved_hot:
@@ -373,11 +423,20 @@ class PrioritizedReplayBuffer:
             saved_generations = ordered_generations[-capacity:]
         buffer.hot = saved_hot
         buffer._generations = saved_generations
-        buffer._cursor = 0 if len(buffer.hot) >= capacity else len(buffer.hot)
-        buffer._max_priority = data["_max_priority"]
+        if len(buffer.hot) >= capacity:
+            buffer._cursor = int(data.get("_cursor", 0)) % capacity
+        else:
+            buffer._cursor = len(buffer.hot)
+        buffer._max_priority = float(data.get("_max_priority", 1.0))
+        if not isfinite(buffer._max_priority) or buffer._max_priority <= 0.0:
+            buffer._max_priority = 1.0
         if data.get("rng_state") is not None:
             buffer.rng.setstate(data["rng_state"])
         # Rebuild the SumTree from stored priorities.
         for index, exp in enumerate(buffer.hot):
+            if not isfinite(exp.priority) or exp.priority <= 0.0:
+                exp.priority = buffer._max_priority
             buffer._tree.update(index, exp.priority)
+        if buffer.hot:
+            buffer._max_priority = max(buffer._max_priority, *(exp.priority for exp in buffer.hot))
         return buffer

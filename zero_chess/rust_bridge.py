@@ -6,8 +6,10 @@ import importlib
 import json
 import threading
 from collections.abc import Iterable, Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from .encoding import POLICY_SIZE
 from .replay import Experience, PrioritizedReplayBuffer
@@ -18,6 +20,7 @@ class RustEngineUnavailableError(RuntimeError):
 
 
 _HISTORY_LOCK = threading.Lock()
+_MAX_HISTORY_BYTES = 2 * 1024 * 1024 * 1024
 
 
 def _engine():
@@ -29,10 +32,10 @@ def _engine():
         pass
     try:
         module = importlib.import_module("zero_rust_engine")
-    except ImportError as exc:
+    except (ImportError, OSError) as exc:
         try:
             module = importlib.import_module("zero_chess.zero_rust_engine")
-        except ImportError:
+        except (ImportError, OSError):
             raise RustEngineUnavailableError(
                 "zero_rust_engine is required for self-play; build with "
                 "`cargo build --release --features libtorch,python-extension`"
@@ -49,8 +52,16 @@ def generate_rust_self_play(
     device: str = "cuda",
     seed: int | None = None,
 ) -> Mapping[str, Any]:
+    if num_games <= 0:
+        raise ValueError("num_games must be positive")
+    if simulations <= 0:
+        raise ValueError("simulations must be positive")
     if not 1 <= batch_size <= 256:
         raise ValueError("Rust evaluator batch_size must be in 1..=256")
+    if device != "cpu" and device != "cuda" and not (
+        device.startswith("cuda:") and device[6:].isdigit()
+    ):
+        raise ValueError("device must be cpu, cuda, or cuda:N")
     kwargs = {
         "model_path": model_path,
         "num_games": int(num_games),
@@ -90,16 +101,14 @@ def sparse_policy_to_uci(board, indices: Iterable[int], values: Iterable[float])
 
     policy = sparse_policy_by_index(indices, values)
     uci_policy = {
-        legal_by_index[index]: probability
-        for index, probability in policy.items()
-        if index in legal_by_index
+        legal_by_index[index]: probability for index, probability in policy.items() if index in legal_by_index
     }
     total = sum(uci_policy.values())
     return {move: prob / total for move, prob in uci_policy.items()} if total else {}
 
 
 def ingest_rust_batch(replay: PrioritizedReplayBuffer, payload: Mapping[str, Any]) -> int:
-    inserted = 0
+    experiences: list[Experience] = []
     for game in payload.get("games", []):
         for raw in game.get("experiences", []):
             policy = sparse_policy_by_index(
@@ -116,7 +125,7 @@ def ingest_rust_batch(replay: PrioritizedReplayBuffer, payload: Mapping[str, Any
                 if isinstance(raw_mat, (tuple, list)) and len(raw_mat) == 2
                 else (0.0, 0.0)
             )
-            replay.add(
+            experiences.append(
                 Experience(
                     fen=raw["fen"],
                     policy=policy,
@@ -136,8 +145,8 @@ def ingest_rust_batch(replay: PrioritizedReplayBuffer, payload: Mapping[str, Any
                     history_repetitions=tuple(raw.get("history_repetitions", ())),
                 )
             )
-            inserted += 1
-    return inserted
+    replay.extend(experiences)
+    return len(experiences)
 
 
 def append_rust_game_history(
@@ -146,11 +155,19 @@ def append_rust_game_history(
     *,
     model_path: str,
     batch_index: int,
+    run_id: str | None = None,
 ) -> int:
     """Persist native game provenance without placing it in training targets."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     records = []
+    deployment_hash = None
+    hash_path = Path(f"{model_path}.sha256")
+    if hash_path.exists():
+        try:
+            deployment_hash = hash_path.read_text(encoding="ascii").strip()
+        except OSError:
+            deployment_hash = None
     for game_index, game in enumerate(payload.get("games", [])):
         raw_result = float(game.get("result", 0.0))
         result = "1-0" if raw_result > 0.0 else "0-1" if raw_result < 0.0 else "1/2-1/2"
@@ -170,11 +187,26 @@ def append_rust_game_history(
                 "experiences": len(experiences),
                 "target_counts": target_counts,
                 "model_path": str(model_path),
+                "model_hash": deployment_hash,
             }
         )
     if not records:
         return 0
+    run_id = run_id or uuid4().hex
+    timestamp = datetime.now(timezone.utc).isoformat()
+    for record in records:
+        record["id"] = f"{run_id}-{record['batch_index']}-{record['game_index']}"
+        record["run_id"] = run_id
+        record["timestamp"] = timestamp
+        record["game_number"] = record["game_index"] + 1
     with _HISTORY_LOCK:
+        if path.exists() and path.stat().st_size > _MAX_HISTORY_BYTES:
+            archive = path.with_name(path.name + ".1")
+            try:
+                archive.unlink()
+            except FileNotFoundError:
+                pass
+            path.replace(archive)
         with path.open("a", encoding="utf-8") as stream:
             for record in records:
                 stream.write(json.dumps(record, separators=(",", ":")) + "\n")

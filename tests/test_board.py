@@ -9,7 +9,7 @@ def perft(board: Board, depth: int) -> int:
         return 1
     total = 0
     for move in board.legal_moves():
-        board.push(move)
+        board._push_unchecked(move)
         total += perft(board, depth - 1)
         board.pop()
     return total
@@ -87,10 +87,35 @@ def test_threefold_repetition_hash_history() -> None:
     assert board.is_threefold_repetition()
 
 
+def test_fen_rejects_structurally_invalid_kings_and_pawns() -> None:
+    with pytest.raises(ValueError, match="exactly one king"):
+        Board.from_fen("8/8/8/8/8/8/8/K6K w - - 0 1")
+    with pytest.raises(ValueError, match="pawns"):
+        Board.from_fen("P3k3/8/8/8/8/8/8/4K3 w - - 0 1")
+
+
+def test_automatic_fivefold_and_seventy_five_move_draws() -> None:
+    board = Board.from_fen("4k3/8/8/8/8/8/1n6/KN6 w - - 0 1")
+    board.position_history.extend([board._position_key()] * 4)
+    assert board.is_fivefold_repetition()
+    assert board.outcome(claim_draws=False) == "1/2-1/2"
+    seventy_five = Board.from_fen("4k3/8/8/8/8/8/8/4K3 w - - 150 1")
+    assert seventy_five.is_seventy_five_move_draw()
+    assert seventy_five.outcome(claim_draws=False) == "1/2-1/2"
+
+
 def test_board_default_is_starting_position() -> None:
     board = Board()
     assert len(board.legal_moves()) == 20
     assert board.fen() == Board.starting_position().fen()
+
+
+def test_public_push_rejects_illegal_or_wrong_color_moves() -> None:
+    from zero_chess.move import Move
+
+    board = Board()
+    with pytest.raises(ValueError, match="illegal move"):
+        board.push(Move.from_uci("e7e5"))
 
 
 def test_piece_move_generation_smoke() -> None:
@@ -100,7 +125,7 @@ def test_piece_move_generation_smoke() -> None:
     assert {"d4b5", "d4f5", "d4b3", "d4f3"} <= knight_moves
     assert "d4h8" in {m.uci() for m in Board.from_fen("7k/8/8/8/3B4/8/8/4K3 w - - 0 1").legal_moves()}
     assert "d4d8" in {m.uci() for m in Board.from_fen("3k4/8/8/8/3R4/8/8/4K3 w - - 0 1").legal_moves()}
-    assert {"d4d8", "d4h8"} <= {m.uci() for m in Board.from_fen("3k3k/8/8/8/3Q4/8/8/4K3 w - - 0 1").legal_moves()}
+    assert {"d4d8", "d4h8"} <= {m.uci() for m in Board.from_fen("3k4/8/8/8/3Q4/8/8/4K3 w - - 0 1").legal_moves()}
     assert {"e1d1", "e1f1"} <= {m.uci() for m in Board.from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").legal_moves()}
 
 
@@ -144,7 +169,7 @@ def test_double_check_allows_only_king_moves() -> None:
 
 
 def test_absolute_pin_filters_off_ray_moves() -> None:
-    board = Board.from_fen("4r3/8/8/8/8/8/4R3/4K3 w - - 0 1")
+    board = Board.from_fen("4r2k/8/8/8/8/8/4R3/4K3 w - - 0 1")
     moves = {m.uci() for m in board.legal_moves()}
     assert "e2d2" not in moves
     assert "e2e8" in moves
@@ -240,6 +265,20 @@ def test_outcome_prioritizes_checkmate_and_honors_claim_flag() -> None:
     assert mate.outcome() == "1-0"
     ongoing = Board.from_fen("4k2r/8/8/8/8/8/8/R3K3 w Qk - 100 1")
     assert ongoing.outcome(claim_draws=False) is None
+
+
+def test_claimable_draws_before_the_claiming_move() -> None:
+    board = Board.from_fen("4k3/8/8/8/8/8/4R3/4K3 w - - 0 1")
+    move = next(move for move in board.legal_moves() if move.uci() == "e2e3")
+    after = board.copy()
+    after._push_unchecked(move)
+    board.position_history.extend([after._position_key(), after._position_key()])
+    assert not board.is_threefold_repetition()
+    assert board.can_claim_threefold_repetition()
+
+    fifty = Board.from_fen("4k3/8/8/8/8/8/4R3/4K3 w - - 99 1")
+    assert fifty.can_claim_fifty_move()
+    assert fifty.outcome() == "1/2-1/2"
 
 
 def test_fen_rejects_invalid_zero_and_negative_counters() -> None:

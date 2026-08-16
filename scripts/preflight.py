@@ -42,21 +42,25 @@ def main() -> None:
             device=args.device,
             seed=0x5EED,
         )
+        if len(payload.get("games", [])) != args.games:
+            raise SystemExit("native self-play returned an unexpected game count")
         inserted = ingest_rust_batch(replay, payload)
 
     if inserted <= 0:
         raise SystemExit("native self-play returned no replay experiences")
     config = TrainConfig(batch_size=1, device=args.device, mixed_precision=False)
     metrics = train_step(model, make_optimizer(model, config), replay, config, iteration=1)
-    print({
-        "torch": torch.__version__,
-        "device": str(device),
-        "cuda_available": torch.cuda.is_available(),
-        "native_games": len(payload.get("games", [])),
-        "replay_experiences": inserted,
-        "training_loss": metrics["loss"],
-        "status": "ready",
-    })
+    print(
+        {
+            "torch": torch.__version__,
+            "device": str(device),
+            "cuda_available": torch.cuda.is_available(),
+            "native_games": len(payload.get("games", [])),
+            "replay_experiences": inserted,
+            "training_loss": metrics["loss"],
+            "status": "ready",
+        }
+    )
 
 
 if __name__ == "__main__":

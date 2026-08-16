@@ -13,7 +13,7 @@ def perft(board: Board, depth: int) -> int:
         return 1
     total = 0
     for move in board.legal_moves():
-        board.push(move)
+        board._push_unchecked(move)
         total += perft(board, depth - 1)
         board.pop()
     return total

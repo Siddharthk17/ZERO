@@ -40,6 +40,29 @@ def test_virtual_loss_apply_and_undo() -> None:
     assert node.visit_count == 2
 
 
+def test_virtual_loss_preserves_parent_and_child_perspectives() -> None:
+    root = Node()
+    child = Node()
+    root.apply_virtual_loss(-3.0)
+    child.apply_virtual_loss(3.0)
+    assert root.q < 0.0
+    assert child.q > 0.0
+    child.undo_virtual_loss(3.0)
+    root.undo_virtual_loss(-3.0)
+    assert root.total_value == 0.0
+    assert child.total_value == 0.0
+
+
+def test_virtual_loss_makes_all_descendant_children_unattractive() -> None:
+    root, child, grandchild = Node(), Node(), Node()
+    root.apply_virtual_loss(-3.0)
+    child.apply_virtual_loss(3.0)
+    grandchild.apply_virtual_loss(3.0)
+    assert root.q < 0.0
+    assert child.q > 0.0
+    assert grandchild.q > 0.0
+
+
 def test_batch_mcts_uses_batched_evaluator_calls() -> None:
     evaluator = CountingEvaluator()
     result = MCTS(evaluator, batch_size=4, add_noise=False).search(Board(), num_simulations=8)
@@ -98,6 +121,7 @@ def test_reset_large_tree_does_not_overflow_recursion_limit() -> None:
     mcts = MCTS(UniformEvaluator())
     curr = mcts.root
     from zero_chess.move import Move
+
     for i in range(2000):
         # We can mock a move
         dummy_move = Move.from_uci("e2e4")
@@ -125,3 +149,13 @@ def test_evaluator_failure_cleans_up_virtual_loss() -> None:
     with pytest.raises(RuntimeError, match="synthetic"):
         mcts.search(Board(), num_simulations=1, add_noise=False)
     assert all(node.virtual_loss_count == 0 for node in [mcts.root, *mcts.root.children.values()])
+
+
+def test_root_context_includes_fullmove_and_external_history() -> None:
+    board_a = Board.from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1")
+    board_b = Board.from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 2")
+    previous = Board.starting_position()
+    from zero_chess.mcts import _board_context
+
+    assert _board_context(board_a) != _board_context(board_b)
+    assert _board_context(board_a, [previous]) != _board_context(board_a, [])

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import pickle
 import random
-import shutil
 import signal
 import threading
 import time
@@ -15,7 +16,15 @@ import torch
 
 from zero_chess.arena import gate_checkpoints
 from zero_chess.checkpoint import CheckpointManager
-from zero_chess.model import ModelConfig, ZeroNet, export_torchscript, load_model, save_model
+from zero_chess.model import (
+    ModelConfig,
+    ZeroNet,
+    export_torchscript,
+    load_model,
+    load_model_payload,
+    model_hash,
+    save_model,
+)
 from zero_chess.replay import PrioritizedReplayBuffer
 from zero_chess.rust_bridge import (
     RustEngineUnavailableError,
@@ -24,7 +33,49 @@ from zero_chess.rust_bridge import (
     generate_rust_self_play,
     ingest_rust_batch,
 )
-from zero_chess.training import ContinuousLRScheduler, TrainConfig, TrainingLogger, make_optimizer, train_step
+from zero_chess.training import (
+    ContinuousLRScheduler,
+    TrainConfig,
+    TrainingLogger,
+    make_optimizer,
+    train_step,
+)
+
+RUN_STATE_VERSION = 1
+
+
+def _load_run_state(path: Path, duration_days: float, fresh: bool) -> tuple[float, float]:
+    if path.exists() and not fresh:
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if state.get("version") != RUN_STATE_VERSION:
+                raise ValueError("unsupported run-state version")
+            started_at = float(state["started_at"])
+            deadline = float(state["deadline"])
+            if deadline > started_at:
+                return started_at, deadline
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            print(f"[Run Warning] Unable to read {path}; starting a new run clock.", flush=True)
+    started_at = time.time()
+    deadline = started_at + duration_days * 86400.0
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        stream.write(json.dumps({"version": RUN_STATE_VERSION, "started_at": started_at, "deadline": deadline}))
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
+    return started_at, deadline
+
+
+def _valid_checkpoint_payload(path: Path, device: str):
+    try:
+        payload = torch.load(path, map_location=device, weights_only=True)
+        model = load_model_payload(payload, device)
+        return payload, model
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, EOFError, pickle.PickleError) as exc:
+        print(f"[Checkpoint Warning] Ignoring invalid checkpoint {path}: {exc}", flush=True)
+        return None, None
 
 
 def configure_blackwell(device: str) -> None:
@@ -49,6 +100,8 @@ class ContinuousSelfPlayWorker(threading.Thread):
         self.lock = threading.Lock()
         self.consecutive_errors = 0
         self.fatal_error: str | None = None
+        self.active_since: float | None = None
+        self.last_progress = time.monotonic()
 
     def run(self) -> None:
         iteration = 0
@@ -58,6 +111,8 @@ class ContinuousSelfPlayWorker(threading.Thread):
                 continue
             iteration += 1
             try:
+                with self.lock:
+                    self.active_since = time.monotonic()
                 payload = generate_rust_self_play(
                     str(self.deployment_path),
                     num_games=self.args.games_per_batch,
@@ -68,7 +123,14 @@ class ContinuousSelfPlayWorker(threading.Thread):
                 )
                 if self._stop_requested.is_set():
                     break
+                games = payload.get("games", [])
+                if len(games) != self.args.games_per_batch:
+                    raise RuntimeError(
+                        f"native self-play returned {len(games)} games; expected {self.args.games_per_batch}"
+                    )
                 pos_added = ingest_rust_batch(self.replay, payload)
+                if pos_added <= 0:
+                    raise RuntimeError("native self-play returned no trainable experiences")
                 append_rust_game_history(
                     payload,
                     self.history_path,
@@ -79,6 +141,7 @@ class ContinuousSelfPlayWorker(threading.Thread):
                     self.total_games += len(payload.get("games", []))
                     self.total_positions += pos_added
                     self.consecutive_errors = 0
+                    self.last_progress = time.monotonic()
             except Exception as e:
                 print(f"\n[SelfPlay Warning] {e}", flush=True)
                 with self.lock:
@@ -87,6 +150,9 @@ class ContinuousSelfPlayWorker(threading.Thread):
                         self.fatal_error = str(e)
                         return
                 self._stop_requested.wait(1.0)
+            finally:
+                with self.lock:
+                    self.active_since = None
 
     def stop(self) -> None:
         self._stop_requested.set()
@@ -97,6 +163,14 @@ class ContinuousSelfPlayWorker(threading.Thread):
 
     def health_error(self) -> str | None:
         with self.lock:
+            if (
+                self.fatal_error is None
+                and self.active_since is not None
+                and time.monotonic() - self.active_since > self.args.self_play_timeout
+            ):
+                self.fatal_error = (
+                    f"native self-play stalled for more than {self.args.self_play_timeout:.0f} seconds"
+                )
             return self.fatal_error
 
 
@@ -114,6 +188,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-channels", type=int, default=64)
     parser.add_argument("--target-replay-ratio", type=float, default=4.0)
     parser.add_argument("--warmup-experiences", type=int, default=10_000)
+    parser.add_argument("--replay-capacity", type=int, default=4_000_000)
     parser.add_argument("--replay-path", type=Path, default=Path("checkpoints/zero_x/replay.pkl"))
     parser.add_argument("--history-path", type=Path, default=Path("data/training_games.jsonl"))
     parser.add_argument("--candidate-interval", type=int, default=5_000)
@@ -122,6 +197,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gate-device", default="cpu")
     parser.add_argument("--replay-save-interval", type=int, default=5_000)
     parser.add_argument("--shutdown-timeout", type=float, default=300.0)
+    parser.add_argument("--self-play-timeout", type=float, default=600.0)
+    parser.add_argument("--run-state-path", type=Path, default=Path("checkpoints/zero_x/run_state.json"))
     parser.add_argument("--disable-gating", action="store_true")
     parser.add_argument(
         "--fresh",
@@ -150,12 +227,16 @@ def main() -> None:
         raise SystemExit("--target-replay-ratio must be positive")
     if args.warmup_experiences <= 0:
         raise SystemExit("--warmup-experiences must be positive")
+    if args.replay_capacity < args.warmup_experiences:
+        raise SystemExit("--replay-capacity must be at least --warmup-experiences")
     if args.candidate_interval <= 0:
         raise SystemExit("--candidate-interval must be positive")
     if args.replay_save_interval <= 0:
         raise SystemExit("--replay-save-interval must be positive")
     if args.shutdown_timeout <= 0.0:
         raise SystemExit("--shutdown-timeout must be positive")
+    if args.self_play_timeout <= 0.0:
+        raise SystemExit("--self-play-timeout must be positive")
     if args.gate_games <= 0 or args.gate_games % 2:
         raise SystemExit("--gate-games must be a positive even number")
     if args.gate_simulations <= 0:
@@ -166,8 +247,10 @@ def main() -> None:
         raise SystemExit("CUDA was requested but torch.cuda.is_available() is false")
     try:
         _engine()
-    except (ImportError, RustEngineUnavailableError) as exc:
+    except (ImportError, OSError, RustEngineUnavailableError) as exc:
         raise SystemExit(f"Native Rust self-play extension is unavailable: {exc}") from exc
+    if torch.device(args.device).type == "cuda" and not torch.cuda.is_bf16_supported():
+        raise SystemExit("CUDA BF16 is unavailable; use --device cpu or a BF16-capable GPU")
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -181,8 +264,13 @@ def main() -> None:
         accepted_checkpoint.exists()
         or (model_dir / "latest.pt").exists()
         or args.replay_path.exists()
+        or args.run_state_path.exists()
     ):
         raise SystemExit("--fresh requires a new checkpoint and replay path")
+
+    _started_at, run_deadline = _load_run_state(args.run_state_path, args.days, args.fresh)
+    if time.time() >= run_deadline:
+        raise SystemExit("the persisted training run deadline has already been reached")
 
     model_config = ModelConfig(
         channels=args.channels,
@@ -195,17 +283,32 @@ def main() -> None:
 
     step = 0
     resume_optimizer_state = None
+    accepted_step = 0
     resume_path = args.resume
-    if resume_path is None:
-        if accepted_checkpoint.exists():
-            resume_path = accepted_checkpoint
-    if resume_path:
-        checkpoint_payload = torch.load(resume_path, map_location=args.device)
-        model = load_model(resume_path, args.device)
+    checkpoint_payload = None
+    model = None
+    candidates = []
+    if resume_path is not None:
+        candidates.append(resume_path)
+    if accepted_checkpoint not in candidates:
+        candidates.append(accepted_checkpoint)
+    if model_dir.joinpath("latest.pt") not in candidates:
+        candidates.append(model_dir / "latest.pt")
+    candidates.extend(sorted(model_dir.glob("zero_iter_*.pt"), reverse=True))
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        payload, loaded_model = _valid_checkpoint_payload(candidate, args.device)
+        if payload is not None:
+            checkpoint_payload = payload
+            model = loaded_model
+            resume_path = candidate
+            break
+    if model is None:
+        model = ZeroNet(model_config).to(args.device)
+    else:
         step = int(checkpoint_payload.get("metrics", {}).get("step", 0))
         resume_optimizer_state = checkpoint_payload.get("optimizer")
-    else:
-        model = ZeroNet(model_config).to(args.device)
 
     optimizer = make_optimizer(model, train_config)
     if resume_optimizer_state is not None:
@@ -219,14 +322,20 @@ def main() -> None:
 
     try:
         replay = (
-            PrioritizedReplayBuffer.load(args.replay_path, hot_capacity=4_000_000)
+            PrioritizedReplayBuffer.load(args.replay_path, hot_capacity=args.replay_capacity)
             if args.replay_path.exists()
-            else PrioritizedReplayBuffer(hot_capacity=4_000_000)
+            else PrioritizedReplayBuffer(hot_capacity=args.replay_capacity)
         )
     except (OSError, ValueError, KeyError, TypeError, EOFError, pickle.PickleError) as exc:
         print(f"[Replay Warning] Unable to load {args.replay_path}: {exc}; starting empty.", flush=True)
-        replay = PrioritizedReplayBuffer(hot_capacity=4_000_000)
-    accepted_existed = accepted_checkpoint.exists()
+        replay = PrioritizedReplayBuffer(hot_capacity=args.replay_capacity)
+    replay.metadata["last_accepted_model_hash"] = model_hash(model)
+    accepted_payload, accepted_model = _valid_checkpoint_payload(accepted_checkpoint, args.device)
+    accepted_existed = accepted_payload is not None
+    if accepted_existed:
+        accepted_step = int(accepted_payload.get("metrics", {}).get("step", 0))
+        del accepted_payload
+        del accepted_model
     if not accepted_existed:
         save_model(
             accepted_checkpoint,
@@ -235,6 +344,7 @@ def main() -> None:
             optimizer=optimizer.state_dict(),
             metrics={"step": float(step), "accepted": 1.0},
         )
+        accepted_step = step
     accepted_model = load_model(accepted_checkpoint, args.device)
     export_torchscript(deployment_path, accepted_model, args.device)
     del accepted_model
@@ -244,13 +354,14 @@ def main() -> None:
     model_is_accepted = (not accepted_existed) or resume_path == accepted_checkpoint
 
     stop = False
+
     def sig_handler(_s, _f):
         nonlocal stop
         stop = True
+
     signal.signal(signal.SIGINT, sig_handler)
     signal.signal(signal.SIGTERM, sig_handler)
 
-    start_time = time.monotonic()
     last_candidate_step = step
     last_replay_save_step = step
     total_samples_trained = 0
@@ -262,15 +373,20 @@ def main() -> None:
         f"({model.parameter_count():,} params)",
         flush=True,
     )
-    print(f"  RAM Replay Capacity: 4,000,000 | SGD Batch Size: {args.training_batch_size}", flush=True)
+    print(
+        f"  RAM Replay Capacity: {args.replay_capacity:,} | SGD Batch Size: {args.training_batch_size}",
+        flush=True,
+    )
     print("==========================================================================", flush=True)
 
     try:
         while not stop:
             if worker.health_error() is not None:
                 raise RuntimeError(f"self-play worker failed repeatedly: {worker.health_error()}")
-            elapsed_days = (time.monotonic() - start_time) / 86400.0
-            if elapsed_days >= args.days:
+            if not worker.is_alive() and worker.health_error() is None:
+                raise RuntimeError("self-play worker exited unexpectedly")
+            elapsed_days = max(0.0, (time.time() - _started_at) / 86400.0)
+            if time.time() >= run_deadline:
                 print("\n[COMPLETE] 31-day training target reached!", flush=True)
                 break
 
@@ -336,11 +452,17 @@ def main() -> None:
                         print(f"\n[GATE WARNING] {exc}; keeping incumbent.", flush=True)
                         accepted = False
                 if accepted:
-                    accepted_tmp = accepted_checkpoint.with_suffix(".pt.tmp")
-                    shutil.copy2(candidate_path, accepted_tmp)
-                    accepted_tmp.replace(accepted_checkpoint)
+                    save_model(
+                        accepted_checkpoint,
+                        model,
+                        iteration=step,
+                        optimizer=optimizer.state_dict(),
+                        metrics={**metrics, **gate_metrics, "accepted": 1.0},
+                    )
                     export_torchscript(deployment_path, model, args.device)
+                    replay.metadata["last_accepted_model_hash"] = model_hash(model)
                     model_is_accepted = True
+                    accepted_step = step
                     checkpoint_mgr.save(
                         model,
                         step,
@@ -348,12 +470,16 @@ def main() -> None:
                         metrics={**metrics, **gate_metrics, "accepted": 1.0},
                     )
                 else:
-                    accepted_payload = torch.load(accepted_checkpoint, map_location=args.device)
+                    accepted_payload = torch.load(accepted_checkpoint, map_location=args.device, weights_only=True)
                     model.load_state_dict(accepted_payload["model"], strict=True)
                     if accepted_payload.get("optimizer") is not None:
                         optimizer.load_state_dict(accepted_payload["optimizer"])
                     model_is_accepted = True
                     print(f"\n[GATE] Candidate step {step} rejected; incumbent retained.", flush=True)
+                try:
+                    candidate_path.unlink()
+                except OSError:
+                    pass
 
             if step - last_replay_save_step >= args.replay_save_interval:
                 replay.save(args.replay_path)
@@ -379,25 +505,28 @@ def main() -> None:
                 flush=True,
             )
         print("\n[SHUTDOWN] Saving final model checkpoint...", flush=True)
-        replay.save(args.replay_path)
         if not model_is_accepted:
-            accepted_payload = torch.load(accepted_checkpoint, map_location=args.device)
+            accepted_payload = torch.load(accepted_checkpoint, map_location=args.device, weights_only=True)
             model.load_state_dict(accepted_payload["model"], strict=True)
             if accepted_payload.get("optimizer") is not None:
                 optimizer.load_state_dict(accepted_payload["optimizer"])
+            accepted_step = int(accepted_payload.get("metrics", {}).get("step", accepted_step))
+            replay.metadata["last_accepted_model_hash"] = model_hash(model)
+        replay.save(args.replay_path)
         save_model(
             accepted_checkpoint,
             model,
-            iteration=step,
+            iteration=accepted_step,
             optimizer=optimizer.state_dict(),
-            metrics={"step": float(step), "accepted": 1.0},
+            metrics={"step": float(accepted_step), "training_step": float(step), "accepted": 1.0},
         )
         checkpoint_mgr.save(
             model,
-            step,
+            accepted_step,
             optimizer_state=optimizer.state_dict(),
-            metrics={"step": float(step), "accepted": 1.0},
+            metrics={"step": float(accepted_step), "training_step": float(step), "accepted": 1.0},
         )
+        logger.close()
 
 
 if __name__ == "__main__":

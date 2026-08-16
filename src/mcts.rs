@@ -10,6 +10,7 @@
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrayvec::ArrayVec;
 use cozy_chess::{Board, Color, GameStatus, Move, Piece};
@@ -21,6 +22,7 @@ use crate::evaluator::{Evaluation, EvaluationError, EvaluationTicket, SharedGpuE
 pub const MAX_BATCH: usize = 256;
 pub const MAX_SEARCH_DEPTH: usize = 512;
 const INVALID_NODE: u32 = u32::MAX;
+const EVALUATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 type NodeId = u32;
 
@@ -128,12 +130,16 @@ impl MctsNode {
     #[inline]
     fn apply_virtual_loss(&self) {
         self.visits.fetch_add(1, Ordering::Relaxed);
-        self.value_sum.fetch_add(-1.0, Ordering::Relaxed);
         self.virtual_losses.fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
-    fn undo_virtual_loss(&self) {
+    fn apply_virtual_value(&self, value: f32) {
+        self.value_sum.fetch_add(value, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn undo_virtual_loss(&self, value: f32) {
         if self
             .virtual_losses
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
@@ -142,7 +148,7 @@ impl MctsNode {
             .is_ok()
         {
             self.visits.fetch_sub(1, Ordering::Relaxed);
-            self.value_sum.fetch_add(1.0, Ordering::Relaxed);
+            self.value_sum.fetch_add(-value, Ordering::Relaxed);
         }
     }
 }
@@ -272,7 +278,6 @@ pub struct Mcts {
     root_context: Option<u64>,
     root_noise_applied: bool,
     leaves: Vec<Leaf>,
-    tickets: Vec<EvaluationTicket>,
     compact_queue: Vec<NodeId>,
     remap: Vec<NodeId>,
 }
@@ -296,7 +301,6 @@ impl Mcts {
             root_context: None,
             root_noise_applied: false,
             leaves: Vec::with_capacity(batch_capacity),
-            tickets: Vec::with_capacity(batch_capacity),
             compact_queue: Vec::with_capacity(node_capacity),
             remap: vec![INVALID_NODE; node_capacity],
         })
@@ -310,7 +314,6 @@ impl Mcts {
         self.root_context = None;
         self.root_noise_applied = false;
         self.leaves.clear();
-        self.tickets.clear();
     }
 
     /// Run a batched PUCT search. `history` is newest-first and excludes
@@ -329,6 +332,9 @@ impl Mcts {
         {
             return Err(MctsError::BatchTooLarge);
         }
+        if config.simulations == 0 {
+            return Err(MctsError::InvalidConfig("simulations must be positive"));
+        }
         validate_config(config)?;
         self.ensure_root(board, history, current_repetitions);
         let status = board.status();
@@ -342,6 +348,7 @@ impl Mcts {
             });
         }
         if current_repetitions >= 3
+            || is_claimable_draw(board, history, &[], current_repetitions)
             || is_dead_position(board)
             || board.halfmove_clock() >= 100
             || matches!(status, GameStatus::Drawn)
@@ -374,60 +381,56 @@ impl Mcts {
                 }
                 continue;
             }
-            self.tickets.clear();
-            let mut submit_error = None;
-            for leaf in &self.leaves {
-                match self.evaluator.submit(&leaf.encoded, leaf.legal_mask) {
-                    Ok(ticket) => self.tickets.push(ticket),
-                    Err(error) => {
-                        submit_error = Some(MctsError::from(error));
-                        break;
-                    }
-                }
-            }
-            if let Some(error) = submit_error {
-                for ticket in self.tickets.drain(..) {
-                    let _ = ticket.wait();
-                }
-                for leaf in &self.leaves {
-                    self.undo_virtual_loss(&leaf.path)?;
-                }
-                self.leaves.clear();
-                return Err(error);
-            }
-            let mut evaluation_error = None;
-            while let (Some(leaf), Some(ticket)) = (self.leaves.pop(), self.tickets.pop()) {
-                self.undo_virtual_loss(&leaf.path)?;
-                match ticket.wait() {
-                    Ok(result) => {
-                        if let Err(error) = self.expand_with_evaluation(
-                            leaf.node,
-                            &leaf.board,
-                            &result,
-                            Some(&leaf.legal_moves),
-                        ) {
-                            evaluation_error = Some(error);
+            let leaf_capacity = self.leaves.capacity();
+            let mut remaining =
+                std::mem::replace(&mut self.leaves, Vec::with_capacity(leaf_capacity));
+            let mut pending: Vec<(Leaf, EvaluationTicket)> = Vec::with_capacity(remaining.len());
+            while let Some(leaf) = remaining.pop() {
+                loop {
+                    match self.evaluator.try_submit(&leaf.encoded, leaf.legal_mask) {
+                        Ok(ticket) => {
+                            pending.push((leaf, ticket));
                             break;
                         }
-                        if let Err(error) = self.backup(&leaf.path, result.value) {
-                            evaluation_error = Some(error);
-                            break;
+                        Err(EvaluationError::Busy) if !pending.is_empty() => {
+                            if let Err(error) =
+                                self.complete_pending_evaluation(&mut pending, &mut done)
+                            {
+                                self.undo_virtual_loss(&leaf.path)?;
+                                self.cleanup_pending(&mut pending);
+                                for remaining_leaf in remaining.drain(..) {
+                                    self.undo_virtual_loss(&remaining_leaf.path)?;
+                                }
+                                return Err(error);
+                            }
                         }
-                        done = done.saturating_add(1);
-                    }
-                    Err(error) => {
-                        evaluation_error = Some(MctsError::from(error));
-                        break;
+                        Err(EvaluationError::Busy) => {
+                            if !self.evaluator.is_healthy() {
+                                self.undo_virtual_loss(&leaf.path)?;
+                                self.cleanup_pending(&mut pending);
+                                for remaining_leaf in remaining.drain(..) {
+                                    self.undo_virtual_loss(&remaining_leaf.path)?;
+                                }
+                                return Err(MctsError::Evaluation(EvaluationError::Closed));
+                            }
+                            std::thread::sleep(Duration::from_micros(50));
+                        }
+                        Err(error) => {
+                            self.undo_virtual_loss(&leaf.path)?;
+                            self.cleanup_pending(&mut pending);
+                            for remaining_leaf in remaining.drain(..) {
+                                self.undo_virtual_loss(&remaining_leaf.path)?;
+                            }
+                            return Err(MctsError::Evaluation(error));
+                        }
                     }
                 }
             }
-            if let Some(error) = evaluation_error {
-                for leaf in &self.leaves {
-                    self.undo_virtual_loss(&leaf.path)?;
+            while !pending.is_empty() {
+                if let Err(error) = self.complete_pending_evaluation(&mut pending, &mut done) {
+                    self.cleanup_pending(&mut pending);
+                    return Err(error);
                 }
-                self.leaves.clear();
-                self.tickets.clear();
-                return Err(error);
             }
         }
 
@@ -442,16 +445,39 @@ impl Mcts {
         })
     }
 
+    fn complete_pending_evaluation(
+        &mut self,
+        pending: &mut Vec<(Leaf, EvaluationTicket)>,
+        done: &mut u32,
+    ) -> Result<(), MctsError> {
+        let (leaf, ticket) = pending.pop().ok_or(MctsError::InvalidTree)?;
+        self.undo_virtual_loss(&leaf.path)?;
+        let result = ticket
+            .wait_timeout(EVALUATION_TIMEOUT)
+            .map_err(MctsError::Evaluation)?;
+        self.expand_with_evaluation(leaf.node, &leaf.board, &result, Some(&leaf.legal_moves))?;
+        self.backup(&leaf.path, result.value)?;
+        *done = done.saturating_add(1);
+        Ok(())
+    }
+
+    fn cleanup_pending(&self, pending: &mut Vec<(Leaf, EvaluationTicket)>) {
+        for (leaf, ticket) in pending.drain(..) {
+            let _ = ticket.wait_timeout(Duration::from_millis(100));
+            let _ = self.undo_virtual_loss(&leaf.path);
+        }
+    }
+
     /// Make a selected move the root.  The reachable subtree is copied into a
     /// preallocated spare arena, re-indexed from zero, then the arena vectors
     /// are swapped. Thus old siblings are immediately reclaimable and tree
     /// reuse cannot exhaust the fixed node pool over a 512-ply game.
     pub fn advance_to(&mut self, played: Move, next_board: &Board) -> Result<(), MctsError> {
         self.advance_to_internal(played, next_board)?;
-        // Callers that do not carry history still get safe behaviour: the
-        // next search will invalidate the reused root when its context is
-        // supplied to `ensure_root`.
-        self.root_context = None;
+        // This is the history-free variant.  A caller that has repetition
+        // history must use `advance_to_with_context`; ensure_root will safely
+        // invalidate this subtree when the supplied context differs.
+        self.root_context = Some(context_signature(next_board, &[], 1));
         Ok(())
     }
 
@@ -469,6 +495,18 @@ impl Mcts {
     }
 
     fn advance_to_internal(&mut self, played: Move, next_board: &Board) -> Result<(), MctsError> {
+        if let Some(current_board) = self.root_board.as_ref() {
+            let mut expected = current_board.clone();
+            if expected.status() == GameStatus::Ongoing {
+                if !expected.is_legal(played) {
+                    return Err(MctsError::InvalidTree);
+                }
+                expected.play(played);
+                if &expected != next_board {
+                    return Err(MctsError::InvalidTree);
+                }
+            }
+        }
         let root = self.node(self.root)?;
         let mut next = None;
         for child_id in child_ids(root) {
@@ -580,6 +618,14 @@ impl Mcts {
                     // than risking a stack allocation or hot-loop panic.
                     self.backup(&path, 0.0)?;
                     terminal_count += 1;
+                    break;
+                }
+                if repetitions >= 3
+                    || is_claimable_draw(&board, root_history, &branch_history, repetitions)
+                {
+                    self.backup(&path, 0.0)?;
+                    terminal_count += 1;
+                    node = INVALID_NODE;
                     break;
                 }
             }
@@ -710,15 +756,22 @@ impl Mcts {
     }
 
     fn apply_virtual_loss(&self, path: &[NodeId]) -> Result<(), MctsError> {
-        for &id in path {
-            self.node(id)?.apply_virtual_loss();
+        for (depth, &id) in path.iter().enumerate() {
+            let node = self.node(id)?;
+            node.apply_virtual_loss();
+            // The root's own FPU estimate should fall, while every selected
+            // child must look good from its own side-to-move perspective. The
+            // selector negates child values when comparing them to the parent.
+            let virtual_value = if depth == 0 { -1.0 } else { 1.0 };
+            node.apply_virtual_value(virtual_value);
         }
         Ok(())
     }
 
     fn undo_virtual_loss(&self, path: &[NodeId]) -> Result<(), MctsError> {
-        for &id in path {
-            self.node(id)?.undo_virtual_loss();
+        for (depth, &id) in path.iter().enumerate() {
+            let virtual_value = if depth == 0 { -1.0 } else { 1.0 };
+            self.node(id)?.undo_virtual_loss(virtual_value);
         }
         Ok(())
     }
@@ -890,18 +943,20 @@ pub fn is_dead_position(board: &Board) -> bool {
         return false;
     }
 
-    let mut bishop_square_colors = [Vec::new(), Vec::new()];
+    let mut bishop_color_masks = [0_u8; 2];
+    let mut bishop_counts = [0_usize; 2];
     let mut knights = [0_usize; 2];
     for color in [Color::White, Color::Black] {
         let color_index = color as usize;
         for square in board.colored_pieces(color, Piece::Bishop) {
             let index = square as usize;
-            bishop_square_colors[color_index].push(((index & 7) + (index >> 3)) & 1);
+            bishop_counts[color_index] += 1;
+            bishop_color_masks[color_index] |= 1 << (((index & 7) + (index >> 3)) & 1);
         }
         knights[color_index] = board.colored_pieces(color, Piece::Knight).len() as usize;
     }
 
-    let bishop_count = bishop_square_colors[0].len() + bishop_square_colors[1].len();
+    let bishop_count = bishop_counts[0] + bishop_counts[1];
     let minor_count = bishop_count + knights[0] + knights[1];
     if minor_count <= 1 {
         return true;
@@ -909,24 +964,77 @@ pub fn is_dead_position(board: &Board) -> bool {
     if knights != [0, 0] {
         return false;
     }
-    let mut bishop_color = None;
-    for color in bishop_square_colors.iter().flatten().copied() {
-        if bishop_color.is_some_and(|previous| previous != color) {
-            return false;
-        }
-        bishop_color = Some(color);
+    (bishop_color_masks[0] | bishop_color_masks[1]).count_ones() <= 1
+}
+
+pub fn is_claimable_draw(
+    board: &Board,
+    history: &[HistoryPosition],
+    branch_history: &[Board],
+    repetitions: u8,
+) -> bool {
+    if repetitions >= 3 || can_claim_fifty_move(board) {
+        return true;
     }
-    true
+    if repetitions < 2 {
+        return false;
+    }
+    board.generate_moves(|moves| {
+        for chess_move in moves {
+            let mut next = board.clone();
+            next.play(chess_move);
+            let occurrences = 1
+                + history
+                    .iter()
+                    .filter(|entry| entry.board.same_position(&next))
+                    .count()
+                + branch_history
+                    .iter()
+                    .filter(|entry| entry.same_position(&next))
+                    .count();
+            if occurrences >= 3 {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+fn can_claim_fifty_move(board: &Board) -> bool {
+    if board.halfmove_clock() >= 100 {
+        return true;
+    }
+    if board.halfmove_clock() < 99 {
+        return false;
+    }
+    board.generate_moves(|moves| {
+        for chess_move in moves {
+            let mut next = board.clone();
+            next.play(chess_move);
+            if next.halfmove_clock() >= 100 {
+                return true;
+            }
+        }
+        false
+    })
 }
 
 fn context_signature(board: &Board, history: &[HistoryPosition], repetitions: u8) -> u64 {
-    let mut signature = board.hash().wrapping_add(repetitions as u64);
+    let mut signature = board
+        .hash()
+        .wrapping_add(repetitions as u64)
+        .rotate_left(11)
+        ^ board.fullmove_number() as u64
+        ^ (board.halfmove_clock() as u64).rotate_left(23);
     for (index, entry) in history.iter().enumerate() {
         signature = signature.rotate_left(7)
             ^ entry
                 .board
                 .hash()
-                .wrapping_add((entry.repetitions as u64) << (index % 8));
+                .wrapping_add((entry.repetitions as u64) << (index % 8))
+                .rotate_left(3)
+            ^ entry.board.fullmove_number() as u64
+            ^ (entry.board.halfmove_clock() as u64).rotate_left(19);
     }
     signature
 }
@@ -1176,5 +1284,61 @@ mod tests {
             validate_config(invalid),
             Err(MctsError::InvalidConfig(_))
         ));
+    }
+
+    #[test]
+    fn virtual_loss_alternates_value_perspective() {
+        let root = MctsNode::root();
+        let child = MctsNode::new(0, None, 1.0);
+        root.apply_virtual_loss();
+        root.apply_virtual_value(-1.0);
+        child.apply_virtual_loss();
+        child.apply_virtual_value(1.0);
+        assert!(root.q() < 0.0);
+        assert!(child.q() > 0.0);
+        child.undo_virtual_loss(1.0);
+        root.undo_virtual_loss(-1.0);
+        assert_eq!(root.visits.load(Ordering::Relaxed), 0);
+        assert_eq!(child.visits.load(Ordering::Relaxed), 0);
+        assert_eq!(root.value_sum.load(Ordering::Relaxed), 0.0);
+        assert_eq!(child.value_sum.load(Ordering::Relaxed), 0.0);
+    }
+
+    #[test]
+    fn virtual_loss_keeps_all_descendant_children_unattractive() {
+        let root = MctsNode::root();
+        let child = MctsNode::new(0, None, 1.0);
+        let grandchild = MctsNode::new(1, None, 1.0);
+        root.apply_virtual_loss();
+        root.apply_virtual_value(-1.0);
+        child.apply_virtual_loss();
+        child.apply_virtual_value(1.0);
+        grandchild.apply_virtual_loss();
+        grandchild.apply_virtual_value(1.0);
+        assert!(root.q() < 0.0);
+        assert!(child.q() > 0.0);
+        assert!(grandchild.q() > 0.0);
+    }
+
+    #[test]
+    fn evaluator_slot_starvation_does_not_deadlock_batched_search() {
+        let evaluator = SharedGpuEvaluator::uniform(1, 1, Duration::ZERO);
+        let mut mcts = Mcts::new(Arc::clone(&evaluator), 512, 2).expect("valid capacities");
+        let mut rng = rand::thread_rng();
+        let result = mcts.search(
+            &Board::default(),
+            &[],
+            1,
+            SearchConfig {
+                simulations: 2,
+                batch_size: 2,
+                add_root_noise: false,
+                temperature: 0.0,
+                ..SearchConfig::default()
+            },
+            &mut rng,
+        );
+        assert!(result.is_ok());
+        evaluator.shutdown();
     }
 }

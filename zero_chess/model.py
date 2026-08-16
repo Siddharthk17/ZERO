@@ -52,6 +52,16 @@ class ModelConfig:
     policy_channels: int = 64
     num_value_bins: int = NUM_VALUE_BINS
 
+    def __post_init__(self) -> None:
+        if self.input_channels != 121:
+            raise ValueError("ZERO-X uses the fixed 121-plane input ABI")
+        if self.policy_size != POLICY_SIZE:
+            raise ValueError("ZERO-X uses the fixed 73-plane policy ABI")
+        if self.channels <= 0 or self.blocks <= 0 or self.policy_channels <= 0:
+            raise ValueError("model dimensions must be positive")
+        if self.policy_size % 64 != 0 or self.num_value_bins < 2:
+            raise ValueError("invalid policy or value-head dimensions")
+
 
 class SwiGLUSqueezeExcitation(nn.Module):
     def __init__(self, channels: int, reduction: int = 8) -> None:
@@ -100,10 +110,9 @@ class ZeroNet(nn.Module):
             LayerNorm2d(channels),
             nn.SiLU(),
         )
-        self.tower = nn.Sequential(*[
-            ConvResidualBlock(channels, reduction=self.config.se_reduction)
-            for _ in range(self.config.blocks)
-        ])
+        self.tower = nn.Sequential(
+            *[ConvResidualBlock(channels, reduction=self.config.se_reduction) for _ in range(self.config.blocks)]
+        )
 
         # Policy Head (73 Planes)
         self.policy_head = nn.Sequential(
@@ -190,15 +199,16 @@ class ZeroNet(nn.Module):
         if device is None:
             device = next(self.parameters()).device
         device = torch.device(device)
+        if device.type == "cuda" and not torch.cuda.is_bf16_supported():
+            raise RuntimeError("ZERO-X CUDA inference requires native bfloat16 support")
         was_training = self.training
         self.eval()
         try:
             legal_moves = [board.legal_moves() for board in boards]
             x = encode_boards(boards, histories=histories, device="cpu")
-            mask = torch.stack([
-                encode_move_mask(legal, board, device="cpu")
-                for board, legal in zip(boards, legal_moves, strict=True)
-            ])
+            mask = torch.stack(
+                [encode_move_mask(legal, board, device="cpu") for board, legal in zip(boards, legal_moves, strict=True)]
+            )
             if device.type == "cuda":
                 x = x.pin_memory().to(device, non_blocking=True)
                 mask = mask.pin_memory().to(device, non_blocking=True)
@@ -221,15 +231,15 @@ class ZeroNet(nn.Module):
                 if not legal:
                     results.append(({}, float(value), 0.0))
                     continue
-                indices = torch.tensor(
-                    [move_to_policy_index(board, move) for move in legal], dtype=torch.long
-                )
+                indices = torch.tensor([move_to_policy_index(board, move) for move in legal], dtype=torch.long)
                 probabilities = row.index_select(0, indices).tolist()
-                results.append((
-                    {move: float(prob) for move, prob in zip(legal, probabilities, strict=True)},
-                    float(value),
-                    0.0,
-                ))
+                results.append(
+                    (
+                        {move: float(prob) for move, prob in zip(legal, probabilities, strict=True)},
+                        float(value),
+                        0.0,
+                    )
+                )
             return results
         finally:
             self.train(was_training)
@@ -240,15 +250,15 @@ def _config_from_payload(config: dict) -> ModelConfig:
     return ModelConfig(**{key: value for key, value in config.items() if key in valid})
 
 
-def load_model(path: str | Path, device: str | torch.device = "cpu") -> ZeroNet:
-    payload = torch.load(path, map_location=device)
+def load_model_payload(payload, device: str | torch.device = "cpu") -> ZeroNet:
     state = payload.get("model", payload) if isinstance(payload, dict) else payload
     config_dict = dict(payload.get("config", {})) if isinstance(payload, dict) else {}
     if "stem.0.weight" in state:
         config_dict["channels"] = state["stem.0.weight"].shape[0]
         config_dict["input_channels"] = state["stem.0.weight"].shape[1]
     indices = [
-        int(key.split(".")[1]) for key in state
+        int(key.split(".")[1])
+        for key in state
         if key.startswith("tower.") and len(key.split(".")) > 1 and key.split(".")[1].isdigit()
     ]
     if indices:
@@ -267,8 +277,16 @@ def load_model(path: str | Path, device: str | torch.device = "cpu") -> ZeroNet:
         config_dict["se_reduction"] = channels // hidden if hidden > 32 and channels % hidden == 0 else 8
     model = ZeroNet(_config_from_payload(config_dict)).to(device)
     model.load_state_dict(state, strict=True)
+    expected_hash = payload.get("model_hash") if isinstance(payload, dict) else None
+    if expected_hash is not None and model_hash(model) != expected_hash:
+        raise ValueError("checkpoint model_hash does not match its state dictionary")
     model.eval()
     return model
+
+
+def load_model(path: str | Path, device: str | torch.device = "cpu") -> ZeroNet:
+    payload = torch.load(path, map_location=device, weights_only=True)
+    return load_model_payload(payload, device)
 
 
 def save_model(path: str | Path, model: ZeroNet, **extra) -> None:
@@ -329,11 +347,19 @@ def export_torchscript(path: str | Path, model: ZeroNet, device: str | torch.dev
     deployment = _TorchScriptDeploymentWrapper(copy.deepcopy(model).eval()).to(device=dev, dtype=dtype)
 
     example_x = torch.zeros((1, model.config.input_channels, 8, 8), device=dev, dtype=dtype)
-    example_mask = torch.ones((1, POLICY_SIZE), device=dev, dtype=torch.float32)
+    example_mask = torch.ones((1, model.config.policy_size), device=dev, dtype=torch.float32)
     tmp_path = path.with_suffix(".tmp")
 
     with torch.inference_mode():
         traced = torch.jit.trace(deployment, (example_x, example_mask), check_trace=False)
         traced.save(str(tmp_path))
     tmp_path.replace(path)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    sidecar = path.with_suffix(path.suffix + ".sha256")
+    sidecar_tmp = sidecar.with_suffix(sidecar.suffix + ".tmp")
+    with sidecar_tmp.open("w", encoding="ascii") as stream:
+        stream.write(digest + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    sidecar_tmp.replace(sidecar)
     return path

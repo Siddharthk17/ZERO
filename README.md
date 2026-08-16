@@ -60,6 +60,22 @@ self-play.
 
 ## Running a fresh experiment
 
+The Python package installs without compiling native code by default. For a
+production native install on the workstation, use `scripts/install.sh`, or
+explicitly set `ZERO_BUILD_NATIVE=1` when building a wheel. If the installed
+PyTorch version is newer than `tch`, the ABI check must be consciously enabled
+with `ZERO_ALLOW_UNSUPPORTED_LIBTORCH=1` only after native smoke validation.
+The locked `tch 0.24.0` binding targets LibTorch 2.11.0, while the target
+workstation uses PyTorch 2.12. The override is therefore required for this
+repository version and must be followed by `scripts/preflight.py --full-model`;
+do not treat a successful compile alone as ABI validation.
+
+For the declared workstation stack, the native install command is:
+
+```bash
+ZERO_ALLOW_UNSUPPORTED_LIBTORCH=1 bash scripts/install.sh
+```
+
 ZERO-X stores its outputs separately from retired checkpoints and replay data:
 
 - checkpoints: `checkpoints/zero_x/`
@@ -76,9 +92,14 @@ bash scripts/train_loop.sh
 .\scripts\train_loop.ps1 -Device cuda -Days 31
 ```
 
-`perft.py --depth 5` must report `4865609`. The restart wrapper resumes only
-from `checkpoints/zero_x/accepted.pt`, preventing accidental use of pre-ZERO-X
-Transformer/reward-shaped checkpoints.
+The training deadline is persisted in `checkpoints/zero_x/run_state.json`, so
+the restart wrappers resume the original 31-day window instead of starting a
+new window after a crash.
+
+`perft.py --depth 5` must report `4865609`. The restart wrapper prefers
+`checkpoints/zero_x/accepted.pt` and falls back only to validated local
+checkpoints, preventing accidental use of pre-ZERO-X Transformer/reward-shaped
+checkpoints.
 
 Useful launch parameters:
 

@@ -34,7 +34,13 @@ def test_training_step_runs_and_clips() -> None:
     opt = make_optimizer(model, config)
     metrics = train_step(model, opt, replay, config, iteration=1)
     for key in [
-        "policy_loss", "value_loss", "wdl_loss", "moves_left_loss", "opponent_policy_loss", "value_error", "loss"
+        "policy_loss",
+        "value_loss",
+        "wdl_loss",
+        "moves_left_loss",
+        "opponent_policy_loss",
+        "value_error",
+        "loss",
     ]:
         assert key in metrics
     assert metrics["grad_norm"] <= 1.0
@@ -50,6 +56,18 @@ def test_checkpoint_round_trip(tmp_path) -> None:
         a = model(x)["policy_logits"]
         b = loaded(x)["policy_logits"]
     assert torch.allclose(a, b)
+
+
+def test_checkpoint_hash_rejects_tampered_state(tmp_path) -> None:
+    model = ZeroNet(ModelConfig(channels=16, blocks=1))
+    path = tmp_path / "model_tampered.pt"
+    save_model(path, model)
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    key = next(key for key in payload["model"] if key != "bin_centers")
+    payload["model"][key].view(-1)[0] += 1.0
+    torch.save(payload, path)
+    with pytest.raises(ValueError, match="model_hash"):
+        load_model(path)
 
 
 def test_load_model_recovers_se_resnet_shape(tmp_path) -> None:

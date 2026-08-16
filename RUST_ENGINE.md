@@ -14,18 +14,22 @@ For the Python extension and the CUDA evaluator, build against a LibTorch distri
 
 ```bash
 export LIBTORCH=/opt/libtorch
-cargo build --release --features libtorch,python-extension
+cargo build --release --locked --features libtorch,python-extension
 ln -sf target/release/libzero_rust_engine.so zero_rust_engine.so
 ```
 
-When intentionally building against a Python PyTorch install, `tch` supports `LIBTORCH_USE_PYTORCH=1`. Its ABI version check must only be bypassed when that combination has been validated for the target deployment:
+When intentionally building against a Python PyTorch install, `tch` supports `LIBTORCH_USE_PYTORCH=1`. Its ABI version check is enforced by default. Set `ZERO_ALLOW_UNSUPPORTED_LIBTORCH=1` only after validating the exact PyTorch/LibTorch ABI for the target deployment:
 
 ```bash
 export LIBTORCH_USE_PYTORCH=1
-# Required only when the PyTorch version is newer than tch's supported ABI.
-export LIBTORCH_BYPASS_VERSION_CHECK=1
-cargo build --release --features libtorch,python-extension
+export ZERO_ALLOW_UNSUPPORTED_LIBTORCH=1
+cargo build --release --locked --features libtorch,python-extension
 ```
+
+The override is mandatory for the repository's locked `tch 0.24.0` versus the
+PyTorch 2.12 workstation stack. Run the native preflight after every clean
+installation. TorchScript exports also write a `.sha256` sidecar used for
+deployment provenance and evaluator cache invalidation.
 
 On Windows, run `powershell -ExecutionPolicy Bypass -File
 scripts/build_native.ps1`. The script installs the generated DLL as

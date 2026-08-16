@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from .board import Board
-from .encoding import POLICY_SIZE, encode_board, encode_move_mask
+from .encoding import POLICY_SIZE, encode_board, encode_move_mask, move_to_policy_index
 from .model import NUM_VALUE_BINS, ZeroNet
 from .replay import Experience, PrioritizedReplayBuffer
 
@@ -58,9 +58,33 @@ class TrainConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     mixed_precision: bool = True
     log_path: str = "logs/training.log"
-    material_loss_weight: float = 0.0
-    moves_left_loss_weight: float = 0.0
+    material_loss_weight: float = 0.05
+    moves_left_loss_weight: float = 0.05
+    # The opponent-response head is retained for research experiments but is
+    # disabled in the canonical target because its label depends on an
+    # unconditioned sampled move. Enable only with an explicitly defined label
+    # producer.
     opponent_policy_loss_weight: float = 0.0
+
+    def __post_init__(self) -> None:
+        for name in (
+            "initial_lr",
+            "continuous_lr",
+            "weight_decay",
+            "grad_clip",
+            "material_loss_weight",
+            "moves_left_loss_weight",
+            "opponent_policy_loss_weight",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if self.batch_size <= 0 or self.total_steps <= 0 or self.warmup_steps < 0:
+            raise ValueError("training step counts and batch_size must be valid")
+        if self.opponent_policy_loss_weight > 0.0:
+            raise ValueError(
+                "opponent_policy_loss_weight is disabled until the target stores the conditioning move"
+            )
 
 
 class ContinuousLRScheduler:
@@ -93,26 +117,56 @@ class ContinuousLRScheduler:
 
 
 class TrainingLogger:
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, max_bytes: int = 256 * 1024 * 1024) -> None:
         self.path = Path(path)
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
+        self.max_bytes = max_bytes
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.window: deque[dict[str, float]] = deque(maxlen=100)
+        self._stream = self.path.open("a", encoding="utf-8", buffering=1)
 
     def log(self, metrics: dict[str, float]) -> dict[str, float]:
         self.window.append(metrics)
         averages = {
-            f"avg_{key}_100": sum(row[key] for row in self.window if key in row) /
-            sum(key in row for row in self.window)
+            f"avg_{key}_100": sum(row[key] for row in self.window if key in row)
+            / sum(key in row for row in self.window)
             for key in (
-                "loss", "policy_loss", "value_loss", "wdl_loss", "material_loss",
-                "moves_left_loss", "opponent_policy_loss", "value_error",
+                "loss",
+                "policy_loss",
+                "value_loss",
+                "wdl_loss",
+                "material_loss",
+                "moves_left_loss",
+                "opponent_policy_loss",
+                "value_error",
             )
             if any(key in row for row in self.window)
         }
         payload = {**metrics, **averages}
-        with self.path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(payload, sort_keys=True) + "\n")
+        line = json.dumps(payload, sort_keys=True) + "\n"
+        if self.path.exists() and self.path.stat().st_size + len(line.encode("utf-8")) > self.max_bytes:
+            self.close()
+            archive = self.path.with_name(self.path.name + ".1")
+            try:
+                archive.unlink()
+            except FileNotFoundError:
+                pass
+            self.path.replace(archive)
+            self._stream = self.path.open("a", encoding="utf-8", buffering=1)
+        self._stream.write(line)
         return payload
+
+    def close(self) -> None:
+        if not self._stream.closed:
+            self._stream.flush()
+            self._stream.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except (AttributeError, OSError):
+            pass
 
 
 def make_optimizer(model: torch.nn.Module, config: TrainConfig) -> torch.optim.Optimizer:
@@ -125,7 +179,10 @@ def make_optimizer(model: torch.nn.Module, config: TrainConfig) -> torch.optim.O
     return torch.optim.AdamW(model.parameters(), **options)
 
 
-_ENCODING_WORKERS = min(32, max(1, os.cpu_count() or 1))
+# Board/FEN encoding is Python-heavy and competes with Rayon and LibTorch. A
+# bounded pool avoids oversubscribing the workstation while retaining overlap
+# with the native self-play worker.
+_ENCODING_WORKERS = min(8, max(1, os.cpu_count() or 1))
 _ENCODING_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=_ENCODING_WORKERS,
     thread_name_prefix="zero-encoding",
@@ -167,6 +224,13 @@ def _policy_from_exp(exp: Experience) -> torch.Tensor:
     total = target.sum()
     if total > 0.0:
         target /= total
+    else:
+        board = Board.from_fen(exp.fen)
+        legal = board.legal_moves()
+        if legal:
+            probability = 1.0 / len(legal)
+            for move in legal:
+                target[move_to_policy_index(board, move)] = probability
     return target
 
 
@@ -182,8 +246,22 @@ def _opponent_move_mask(exp: Experience) -> torch.Tensor:
 
 
 _HORIZONTAL_POLICY_PLANE_MAP = (
-    0, 7, 6, 5, 4, 3, 2, 1,
-    7, 6, 5, 4, 3, 2, 1, 0,
+    0,
+    7,
+    6,
+    5,
+    4,
+    3,
+    2,
+    1,
+    7,
+    6,
+    5,
+    4,
+    3,
+    2,
+    1,
+    0,
 )
 
 
@@ -263,9 +341,9 @@ def train_step(
     opponent_mask = torch.stack([_opponent_move_mask(exp) for exp in batch.experiences])
     wdl_targets = torch.tensor([exp.wdl for exp in batch.experiences], dtype=torch.float32)
     q_mcts_targets = torch.tensor([[exp.q_mcts] for exp in batch.experiences], dtype=torch.float32)
-    z_terminal_targets = (wdl_targets[:, 0:1] - wdl_targets[:, 2:3])
+    z_terminal_targets = wdl_targets[:, 0:1] - wdl_targets[:, 2:3]
     terminal_targets = torch.tensor(
-        [exp.target_kind == "terminal" for exp in batch.experiences], dtype=torch.bool
+        [exp.target_kind in {"terminal", "adjudicated"} for exp in batch.experiences], dtype=torch.bool
     ).unsqueeze(-1)
     hybrid_value_targets = torch.where(
         terminal_targets,
@@ -288,9 +366,23 @@ def train_step(
     )
 
     device = torch.device(config.device)
+    model_device = next(model.parameters()).device
+    if model_device.type != device.type or (
+        device.index is not None and model_device.index != device.index
+    ):
+        raise ValueError(f"model is on {model_device}, but training device is {device}")
     tensors = (
-        x, mask, policy_targets, opponent_mask, wdl_targets, hybrid_value_targets, material_targets,
-        moves_left_targets, opponent_policy_targets, opponent_policy_available, sample_weights,
+        x,
+        mask,
+        policy_targets,
+        opponent_mask,
+        wdl_targets,
+        hybrid_value_targets,
+        material_targets,
+        moves_left_targets,
+        opponent_policy_targets,
+        opponent_policy_available,
+        sample_weights,
         terminal_targets,
     )
     if device.type == "cuda":
@@ -298,8 +390,17 @@ def train_step(
     else:
         tensors = tuple(tensor.to(device) for tensor in tensors)
     (
-        x, mask, policy_targets, opponent_mask, wdl_targets, hybrid_value_targets, material_targets,
-        moves_left_targets, opponent_policy_targets, opponent_policy_available, sample_weights,
+        x,
+        mask,
+        policy_targets,
+        opponent_mask,
+        wdl_targets,
+        hybrid_value_targets,
+        material_targets,
+        moves_left_targets,
+        opponent_policy_targets,
+        opponent_policy_available,
+        sample_weights,
         terminal_targets,
     ) = tensors
 
@@ -309,6 +410,8 @@ def train_step(
 
     optimizer.zero_grad(set_to_none=True)
     use_amp = config.mixed_precision and device.type == "cuda"
+    if use_amp and not torch.cuda.is_bf16_supported():
+        raise RuntimeError("CUDA BF16 is unavailable; disable mixed_precision for this device")
     autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True) if use_amp else nullcontext()
     with autocast:
         out = model(x, mask, return_dict=True)
@@ -319,17 +422,17 @@ def train_step(
         moves_left_loss_vec = (out["moves_left"] - moves_left_targets).pow(2).squeeze(-1)
 
         masked_opponent_logits = out["opponent_policy_logits"].masked_fill(opponent_mask <= 0, -1e4)
-        opponent_policy_loss_vec = -(
-            opponent_policy_targets * F.log_softmax(masked_opponent_logits, dim=-1)
-        ).sum(dim=-1)
+        opponent_policy_loss_vec = -(opponent_policy_targets * F.log_softmax(masked_opponent_logits, dim=-1)).sum(
+            dim=-1
+        )
 
         policy_loss = _weighted_mean(policy_loss_vec, sample_weights)
         value_loss = _weighted_mean(value_loss_vec, sample_weights)
         wdl_loss = _weighted_mean(wdl_loss_vec, sample_weights * terminal_targets.squeeze(-1).float())
         material_loss = _weighted_mean(material_loss_vec, sample_weights)
         moves_left_loss = _weighted_mean(moves_left_loss_vec, sample_weights)
-        opponent_denominator = (sample_weights * opponent_policy_available).sum().clamp_min(
-            torch.finfo(sample_weights.dtype).eps
+        opponent_denominator = (
+            (sample_weights * opponent_policy_available).sum().clamp_min(torch.finfo(sample_weights.dtype).eps)
         )
         opponent_policy_loss = (
             opponent_policy_loss_vec * sample_weights * opponent_policy_available
@@ -350,9 +453,7 @@ def train_step(
         scheduler.step(iteration)
     loss.backward()
     try:
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(), config.grad_clip, error_if_nonfinite=True
-        )
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip, error_if_nonfinite=True)
     except RuntimeError as exc:
         optimizer.zero_grad(set_to_none=True)
         raise FloatingPointError(f"non-finite gradients at step {iteration}") from exc
@@ -363,8 +464,7 @@ def train_step(
         probabilities = torch.softmax(out["masked_policy_logits"].detach(), dim=-1)
         entropy = -(probabilities * torch.log(probabilities.clamp_min(1e-9))).sum(dim=-1).mean()
         policy_kl = (
-            policy_targets
-            * (torch.log(policy_targets.clamp_min(1e-9)) - torch.log(probabilities.clamp_min(1e-9)))
+            policy_targets * (torch.log(policy_targets.clamp_min(1e-9)) - torch.log(probabilities.clamp_min(1e-9)))
         ).sum(dim=-1)
         replay.update_priorities(
             batch.indices,

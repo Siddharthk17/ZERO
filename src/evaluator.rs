@@ -16,11 +16,16 @@ const SLOT_PENDING: u8 = 1;
 const SLOT_RUNNING: u8 = 2;
 const SLOT_DONE: u8 = 3;
 const SLOT_ERROR: u8 = 4;
+const SLOT_CANCELLED: u8 = 5;
 const STOP_REQUEST: usize = usize::MAX;
+const SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub enum EvaluationError {
     Closed,
+    Busy,
+    Timeout,
     Backend(String),
     Protocol,
 }
@@ -29,6 +34,8 @@ impl fmt::Display for EvaluationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Closed => f.write_str("GPU evaluator is closed"),
+            Self::Busy => f.write_str("GPU evaluator has no free evaluation slot"),
+            Self::Timeout => f.write_str("GPU evaluator operation timed out"),
             Self::Backend(message) => write!(f, "GPU evaluator backend failed: {message}"),
             Self::Protocol => f.write_str("evaluation slot protocol violation"),
         }
@@ -58,6 +65,7 @@ struct SlotData {
     input: EncodedBoard,
     legal: PolicyMask,
     output: Evaluation,
+    error: Option<String>,
 }
 
 impl Default for SlotData {
@@ -66,6 +74,7 @@ impl Default for SlotData {
             input: [0.0; INPUT_SIZE],
             legal: PolicyMask::default(),
             output: Evaluation::default(),
+            error: None,
         }
     }
 }
@@ -88,14 +97,14 @@ impl EvalSlot {
 }
 
 trait BatchBackend: Send + 'static {
-    fn evaluate_slots(&mut self, slots: &[&EvalSlot]) -> Result<(), EvaluationError>;
+    fn evaluate_slots(&mut self, slots: &[(usize, &EvalSlot)]) -> Result<(), EvaluationError>;
 }
 
 pub struct UniformBackend;
 
 impl BatchBackend for UniformBackend {
-    fn evaluate_slots(&mut self, slots: &[&EvalSlot]) -> Result<(), EvaluationError> {
-        for slot in slots {
+    fn evaluate_slots(&mut self, slots: &[(usize, &EvalSlot)]) -> Result<(), EvaluationError> {
+        for (_, slot) in slots {
             let data = unsafe { &mut *slot.data.get() };
             let legal_count = data
                 .legal
@@ -198,32 +207,27 @@ impl SharedGpuEvaluator {
         evaluator
     }
 
-    pub fn submit(
+    pub fn slot_capacity(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn try_submit(
         self: &Arc<Self>,
         input: &EncodedBoard,
         legal: PolicyMask,
     ) -> Result<EvaluationTicket, EvaluationError> {
-        if self.closed.load(Ordering::Acquire) {
+        if self.closed.load(Ordering::Acquire) || self.actor_finished.load(Ordering::Acquire) {
             return Err(EvaluationError::Closed);
         }
-        let slot_index = loop {
-            if self.closed.load(Ordering::Acquire) {
-                return Err(EvaluationError::Closed);
-            }
-            match self.free_rx.recv_timeout(Duration::from_millis(1)) {
-                Ok(index) => break index,
-                Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => return Err(EvaluationError::Closed),
-            }
+        let slot_index = match self.free_rx.try_recv() {
+            Ok(index) => index,
+            Err(TryRecvError::Empty) => return Err(EvaluationError::Busy),
+            Err(TryRecvError::Disconnected) => return Err(EvaluationError::Closed),
         };
         let Some(slot) = self.slots.get(slot_index) else {
             let _ = self.free_tx.send(slot_index);
             return Err(EvaluationError::Protocol);
         };
-        if self.closed.load(Ordering::Acquire) {
-            let _ = self.free_tx.send(slot_index);
-            return Err(EvaluationError::Closed);
-        }
         if slot.state.load(Ordering::Acquire) != SLOT_FREE {
             let _ = self.free_tx.send(slot_index);
             return Err(EvaluationError::Protocol);
@@ -232,6 +236,7 @@ impl SharedGpuEvaluator {
             let data = &mut *slot.data.get();
             data.input.copy_from_slice(input);
             data.legal = legal;
+            data.error = None;
         }
         slot.state.store(SLOT_PENDING, Ordering::Release);
         if self.request_tx.send(slot_index).is_err() {
@@ -246,6 +251,26 @@ impl SharedGpuEvaluator {
         })
     }
 
+    pub fn submit(
+        self: &Arc<Self>,
+        input: &EncodedBoard,
+        legal: PolicyMask,
+    ) -> Result<EvaluationTicket, EvaluationError> {
+        let deadline = Instant::now() + SUBMIT_TIMEOUT;
+        loop {
+            match self.try_submit(input, legal) {
+                Ok(ticket) => return Ok(ticket),
+                Err(EvaluationError::Busy) => {
+                    if Instant::now() >= deadline {
+                        return Err(EvaluationError::Timeout);
+                    }
+                    thread::sleep(Duration::from_micros(50));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     pub fn evaluate(
         self: &Arc<Self>,
         input: &EncodedBoard,
@@ -255,6 +280,14 @@ impl SharedGpuEvaluator {
     }
 
     fn wait_slot(&self, slot_index: usize) -> Result<Evaluation, EvaluationError> {
+        self.wait_slot_until(slot_index, Instant::now() + SUBMIT_TIMEOUT)
+    }
+
+    fn wait_slot_until(
+        &self,
+        slot_index: usize,
+        deadline: Instant,
+    ) -> Result<Evaluation, EvaluationError> {
         let slot = self
             .slots
             .get(slot_index)
@@ -275,6 +308,8 @@ impl SharedGpuEvaluator {
                     }
                 }
                 SLOT_ERROR => {
+                    let message = unsafe { (&*slot.data.get()).error.clone() }
+                        .unwrap_or_else(|| "actor evaluation failed".to_owned());
                     if slot
                         .state
                         .compare_exchange(
@@ -286,9 +321,7 @@ impl SharedGpuEvaluator {
                         .is_ok()
                     {
                         let _ = self.free_tx.send(slot_index);
-                        return Err(EvaluationError::Backend(
-                            "actor evaluation failed".to_owned(),
-                        ));
+                        return Err(EvaluationError::Backend(message));
                     }
                 }
                 SLOT_PENDING | SLOT_RUNNING => {
@@ -316,6 +349,30 @@ impl SharedGpuEvaluator {
                         }
                         return Err(EvaluationError::Closed);
                     }
+                    if Instant::now() >= deadline {
+                        if slot
+                            .state
+                            .compare_exchange(
+                                SLOT_PENDING,
+                                SLOT_CANCELLED,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                            || slot
+                                .state
+                                .compare_exchange(
+                                    SLOT_RUNNING,
+                                    SLOT_CANCELLED,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                )
+                                .is_ok()
+                        {
+                            return Err(EvaluationError::Timeout);
+                        }
+                        continue;
+                    }
                     if spins < 128 {
                         std::hint::spin_loop();
                     } else {
@@ -324,6 +381,7 @@ impl SharedGpuEvaluator {
                     spins = spins.saturating_add(1);
                 }
                 SLOT_FREE => return Err(EvaluationError::Protocol),
+                SLOT_CANCELLED => return Err(EvaluationError::Timeout),
                 _ => return Err(EvaluationError::Closed),
             }
         }
@@ -333,10 +391,9 @@ impl SharedGpuEvaluator {
         if !self.closed.swap(true, Ordering::AcqRel) {
             let _ = self.request_tx.send(STOP_REQUEST);
         }
-        if let Ok(mut actor) = self.actor.lock() {
-            if let Some(handle) = actor.take() {
-                let _ = handle.join();
-            }
+        let handle = self.actor.lock().ok().and_then(|mut actor| actor.take());
+        if let Some(handle) = handle {
+            finish_actor(handle, &self.actor_finished);
         }
     }
 
@@ -349,6 +406,12 @@ impl EvaluationTicket {
     pub fn wait(mut self) -> Result<Evaluation, EvaluationError> {
         let index = self.slot_index.take().ok_or(EvaluationError::Protocol)?;
         self.evaluator.wait_slot(index)
+    }
+
+    pub fn wait_timeout(mut self, timeout: Duration) -> Result<Evaluation, EvaluationError> {
+        let index = self.slot_index.take().ok_or(EvaluationError::Protocol)?;
+        self.evaluator
+            .wait_slot_until(index, Instant::now() + timeout)
     }
 }
 
@@ -366,10 +429,22 @@ impl Drop for SharedGpuEvaluator {
         let _ = self.request_tx.send(STOP_REQUEST);
         if let Ok(actor) = self.actor.get_mut() {
             if let Some(handle) = actor.take() {
-                let _ = handle.join();
+                finish_actor(handle, &self.actor_finished);
             }
         }
     }
+}
+
+fn finish_actor(handle: JoinHandle<()>, actor_finished: &AtomicBool) {
+    let deadline = Instant::now() + SHUTDOWN_WAIT;
+    while !actor_finished.load(Ordering::Acquire) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+    if actor_finished.load(Ordering::Acquire) {
+        let _ = handle.join();
+    }
+    // A stuck foreign backend cannot be forcefully cancelled from Rust. Drop
+    // the handle after the bounded wait so shutdown does not deadlock the host.
 }
 
 fn run_actor<B: BatchBackend>(
@@ -380,16 +455,55 @@ fn run_actor<B: BatchBackend>(
     max_batch_size: usize,
     max_wait: Duration,
 ) {
-    struct ActorExit(Weak<SharedGpuEvaluator>);
+    struct ActorExit {
+        evaluator: Weak<SharedGpuEvaluator>,
+        slots: Arc<Vec<EvalSlot>>,
+    }
     impl Drop for ActorExit {
         fn drop(&mut self) {
-            if let Some(evaluator) = self.0.upgrade() {
+            if let Some(evaluator) = self.evaluator.upgrade() {
+                evaluator.closed.store(true, Ordering::Release);
+                for (index, slot) in self.slots.iter().enumerate() {
+                    let state = slot.state.load(Ordering::Acquire);
+                    let mut failed = false;
+                    if state == SLOT_PENDING || state == SLOT_RUNNING {
+                        unsafe {
+                            (*slot.data.get()).error =
+                                Some("evaluator actor terminated unexpectedly".to_owned());
+                        }
+                        failed = slot
+                            .state
+                            .compare_exchange(
+                                state,
+                                SLOT_ERROR,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok();
+                    }
+                    if !failed
+                        && slot
+                            .state
+                            .compare_exchange(
+                                SLOT_CANCELLED,
+                                SLOT_FREE,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                    {
+                        let _ = evaluator.free_tx.send(index);
+                    }
+                }
                 evaluator.actor_finished.store(true, Ordering::Release);
             }
         }
     }
 
-    let _actor_exit = ActorExit(Weak::clone(&evaluator));
+    let _actor_exit = ActorExit {
+        evaluator: Weak::clone(&evaluator),
+        slots: Arc::clone(&slots),
+    };
     let mut ids = Vec::with_capacity(max_batch_size);
     let mut batch = Vec::with_capacity(max_batch_size);
     loop {
@@ -419,10 +533,19 @@ fn run_actor<B: BatchBackend>(
                 }
                 Ok(index) => ids.push(index),
                 Err(TryRecvError::Empty) => {
-                    if Instant::now() >= deadline {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
                         break;
                     }
-                    std::hint::spin_loop();
+                    match requests.recv_timeout(remaining) {
+                        Ok(STOP_REQUEST) => {
+                            shared.closed.store(true, Ordering::Release);
+                            shutdown_requested = true;
+                            break;
+                        }
+                        Ok(index) => ids.push(index),
+                        Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+                    }
                 }
                 Err(TryRecvError::Disconnected) => break,
             }
@@ -442,7 +565,18 @@ fn run_actor<B: BatchBackend>(
                 )
                 .is_ok()
             {
-                batch.push(slot);
+                batch.push((index, slot));
+            } else if slot
+                .state
+                .compare_exchange(
+                    SLOT_CANCELLED,
+                    SLOT_FREE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                let _ = shared.free_tx.send(index);
             }
         }
         if batch.is_empty() {
@@ -455,14 +589,47 @@ fn run_actor<B: BatchBackend>(
         let backend_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             backend.evaluate_slots(&batch)
         }));
-        let panicked = backend_result.is_err();
-        let success = matches!(backend_result, Ok(Ok(())));
-        for slot in &batch {
-            slot.state.store(
-                if success { SLOT_DONE } else { SLOT_ERROR },
-                Ordering::Release,
-            );
+        let (success, error_message) = match backend_result {
+            Ok(Ok(())) => (true, None),
+            Ok(Err(error)) => (
+                false,
+                Some(match error {
+                    EvaluationError::Backend(message) => message,
+                    other => other.to_string(),
+                }),
+            ),
+            Err(_) => (false, Some("backend evaluation panicked".to_owned())),
+        };
+        for (index, slot) in &batch {
+            let target = if success { SLOT_DONE } else { SLOT_ERROR };
+            if let Some(message) = &error_message {
+                unsafe {
+                    (*slot.data.get()).error = Some(message.clone());
+                }
+            }
+            if slot
+                .state
+                .compare_exchange(SLOT_RUNNING, target, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                if slot
+                    .state
+                    .compare_exchange(
+                        SLOT_CANCELLED,
+                        SLOT_FREE,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    let _ = shared.free_tx.send(*index);
+                }
+                continue;
+            }
         }
+        let panicked = error_message
+            .as_deref()
+            .is_some_and(|message| message == "backend evaluation panicked");
         if shutdown_requested || panicked || !success {
             shared.closed.store(true, Ordering::Release);
             fail_pending(&shared, &requests);
@@ -477,21 +644,85 @@ fn fail_pending(evaluator: &SharedGpuEvaluator, requests: &Receiver<usize>) {
             continue;
         }
         if let Some(slot) = evaluator.slots.get(index) {
-            let _ = slot.state.compare_exchange(
-                SLOT_PENDING,
-                SLOT_ERROR,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+            if slot.state.load(Ordering::Acquire) == SLOT_PENDING {
+                unsafe {
+                    (*slot.data.get()).error = Some("evaluator closed".to_owned());
+                }
+                let marked = slot
+                    .state
+                    .compare_exchange(
+                        SLOT_PENDING,
+                        SLOT_ERROR,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok();
+                if !marked
+                    && slot
+                        .state
+                        .compare_exchange(
+                            SLOT_CANCELLED,
+                            SLOT_FREE,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                {
+                    let _ = evaluator.free_tx.send(index);
+                }
+            } else if slot
+                .state
+                .compare_exchange(
+                    SLOT_CANCELLED,
+                    SLOT_FREE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                let _ = evaluator.free_tx.send(index);
+            }
         }
     }
-    for slot in evaluator.slots.iter() {
-        let _ = slot.state.compare_exchange(
-            SLOT_PENDING,
-            SLOT_ERROR,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+    for (index, slot) in evaluator.slots.iter().enumerate() {
+        if slot.state.load(Ordering::Acquire) == SLOT_PENDING {
+            unsafe {
+                (*slot.data.get()).error = Some("evaluator closed".to_owned());
+            }
+            let marked = slot
+                .state
+                .compare_exchange(
+                    SLOT_PENDING,
+                    SLOT_ERROR,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok();
+            if !marked
+                && slot
+                    .state
+                    .compare_exchange(
+                        SLOT_CANCELLED,
+                        SLOT_FREE,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+            {
+                let _ = evaluator.free_tx.send(index);
+            }
+        } else if slot
+            .state
+            .compare_exchange(
+                SLOT_CANCELLED,
+                SLOT_FREE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            let _ = evaluator.free_tx.send(index);
+        }
     }
 }
 
@@ -502,8 +733,18 @@ mod tests {
     struct PanickingBackend;
 
     impl BatchBackend for PanickingBackend {
-        fn evaluate_slots(&mut self, _slots: &[&EvalSlot]) -> Result<(), EvaluationError> {
+        fn evaluate_slots(&mut self, _slots: &[(usize, &EvalSlot)]) -> Result<(), EvaluationError> {
             panic!("synthetic backend panic")
+        }
+    }
+
+    struct FailingBackend;
+
+    impl BatchBackend for FailingBackend {
+        fn evaluate_slots(&mut self, _slots: &[(usize, &EvalSlot)]) -> Result<(), EvaluationError> {
+            Err(EvaluationError::Backend(
+                "preserved backend detail".to_owned(),
+            ))
         }
     }
 
@@ -515,6 +756,20 @@ mod tests {
             .submit(&input, PolicyMask::default())
             .expect("slot should be available");
         assert!(matches!(ticket.wait(), Err(EvaluationError::Backend(_))));
+        evaluator.shutdown();
+    }
+
+    #[test]
+    fn backend_error_details_reach_waiting_tickets() {
+        let evaluator = SharedGpuEvaluator::start(FailingBackend, 1, 1, Duration::ZERO);
+        let input = [0.0; INPUT_SIZE];
+        let ticket = evaluator
+            .submit(&input, PolicyMask::default())
+            .expect("slot should be available");
+        assert!(matches!(
+            ticket.wait(),
+            Err(EvaluationError::Backend(message)) if message == "preserved backend detail"
+        ));
         evaluator.shutdown();
     }
 }
@@ -544,6 +799,11 @@ mod torchscript {
             device: Device,
             max_batch: usize,
         ) -> Result<Self, EvaluationError> {
+            if max_batch == 0 {
+                return Err(EvaluationError::Backend(
+                    "TorchScript evaluator max_batch must be positive".to_owned(),
+                ));
+            }
             let module = CModule::load_on_device(path, device)
                 .map_err(|error| EvaluationError::Backend(error.to_string()))?;
             let (input_pinned, mask_pinned) = if matches!(device, Device::Cuda(_)) {
@@ -581,14 +841,14 @@ mod torchscript {
     }
 
     impl BatchBackend for TorchScriptBackend {
-        fn evaluate_slots(&mut self, slots: &[&EvalSlot]) -> Result<(), EvaluationError> {
+        fn evaluate_slots(&mut self, slots: &[(usize, &EvalSlot)]) -> Result<(), EvaluationError> {
             let count = slots.len();
             let input_kind = if matches!(self.device, Device::Cuda(_)) {
                 Kind::BFloat16
             } else {
                 Kind::Float
             };
-            for (row, slot) in slots.iter().enumerate() {
+            for (row, (_, slot)) in slots.iter().enumerate() {
                 let data = unsafe { &*slot.data.get() };
                 self.input_staging[row * INPUT_SIZE..(row + 1) * INPUT_SIZE]
                     .copy_from_slice(&data.input);
@@ -652,6 +912,17 @@ mod torchscript {
                     "TorchScript outputs must be tensors".into(),
                 ));
             };
+            if policy_logits.size() != [count as i64, POLICY_SIZE as i64]
+                || value.size() != [count as i64, 1]
+                || wdl.size() != [count as i64, 3]
+            {
+                return Err(EvaluationError::Backend(format!(
+                    "TorchScript output shapes are invalid: policy={:?}, value={:?}, wdl={:?}",
+                    policy_logits.size(),
+                    value.size(),
+                    wdl.size()
+                )));
+            }
             let policy = policy_logits
                 .masked_fill(&mask.le(0), -1.0e4)
                 .softmax(-1, Kind::Float)
@@ -684,7 +955,7 @@ mod torchscript {
                 ));
             }
 
-            for (row, slot) in slots.iter().enumerate() {
+            for (row, (_, slot)) in slots.iter().enumerate() {
                 let output = unsafe { &mut (*slot.data.get()).output };
                 output.policy.copy_from_slice(
                     &self.policy_host_buffer[row * POLICY_SIZE..(row + 1) * POLICY_SIZE],

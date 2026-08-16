@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .board import Board
 from .constants import WHITE
 from .mcts import MCTS, NetworkEvaluator
-from .model import load_model
+from .model import export_torchscript, load_model
 
 
 @dataclass(slots=True)
@@ -67,9 +69,8 @@ def play_match(
                 break
             played = rng.choice(legal)
             previous = board.copy()
-            board.push(played)
+            board._push_unchecked(played)
             history.insert(0, previous)
-            del history[7:]
 
         for _ply in range(max_plies - opening_count):
             result = board.outcome()
@@ -87,9 +88,8 @@ def play_match(
                 break
             played = search.move
             previous = board.copy()
-            board.push(played)
+            board._push_unchecked(played)
             history.insert(0, previous)
-            del history[7:]
             mcts_a.advance_to(played)
             mcts_b.advance_to(played)
 
@@ -137,13 +137,12 @@ def gate_checkpoints(
     log_path: str | Path | None = None,
 ) -> MatchResult:
     """Evaluate candidate A against incumbent B without changing either file."""
-    candidate = load_model(candidate_path, device)
-    incumbent = load_model(incumbent_path, device)
-    result = play_match(
-        NetworkEvaluator(candidate, device),
-        NetworkEvaluator(incumbent, device),
+    result = _native_gate(
+        candidate_path,
+        incumbent_path,
         games=games,
         simulations=simulations,
+        device=device,
         opening_random_plies=opening_random_plies,
         seed=seed,
     )
@@ -155,16 +154,86 @@ def gate_checkpoints(
     return result
 
 
+def _native_gate(
+    candidate_path: str | Path,
+    incumbent_path: str | Path,
+    *,
+    games: int,
+    simulations: int,
+    device: str,
+    opening_random_plies: int,
+    seed: int,
+) -> MatchResult:
+    """Run gating through the same Rust MCTS/evaluator path as self-play."""
+    try:
+        from .rust_bridge import _engine
+
+        engine = _engine()
+        match_fn = getattr(engine, "evaluate_torchscript_match")
+    except (ImportError, OSError, AttributeError) as exc:
+        if os.environ.get("ZERO_GATE_NATIVE", "1") != "0":
+            raise RuntimeError("native gate is unavailable; set ZERO_GATE_NATIVE=0 only for tests") from exc
+        candidate = load_model(candidate_path, device)
+        incumbent = load_model(incumbent_path, device)
+        return play_match(
+            NetworkEvaluator(candidate, device),
+            NetworkEvaluator(incumbent, device),
+            games=games,
+            simulations=simulations,
+            opening_random_plies=opening_random_plies,
+            seed=seed,
+        )
+
+    with tempfile.TemporaryDirectory(prefix="zero-gate-") as directory:
+        candidate = load_model(candidate_path, device)
+        incumbent = load_model(incumbent_path, device)
+        candidate_ts = export_torchscript(Path(directory) / "candidate.ts", candidate, device)
+        incumbent_ts = export_torchscript(Path(directory) / "incumbent.ts", incumbent, device)
+        raw = match_fn(
+            str(candidate_ts),
+            str(incumbent_ts),
+            games=games,
+            simulations=simulations,
+            device=device,
+            seed=seed,
+            max_plies=512,
+            opening_random_plies=opening_random_plies,
+        )
+    wins_a = int(raw["wins_a"])
+    wins_b = int(raw["wins_b"])
+    draws = int(raw["draws"])
+    score_a = wins_a + 0.5 * draws
+    score_fraction = score_a / games
+    score_low, score_high = _wilson_interval(score_fraction, games)
+    return MatchResult(
+        games=games,
+        wins_a=wins_a,
+        wins_b=wins_b,
+        draws=draws,
+        score_a=score_a,
+        score_fraction=score_fraction,
+        elo_difference=_elo_difference(score_fraction),
+        score_low=score_low,
+        score_high=score_high,
+        simulations=simulations,
+        opening_random_plies=opening_random_plies,
+        seed=seed,
+    )
+
+
 def _elo_difference(score_fraction: float) -> float:
     score_fraction = min(1.0 - 1e-6, max(1e-6, float(score_fraction)))
     return 400.0 * math.log10(score_fraction / (1.0 - score_fraction))
 
 
 def _wilson_interval(score_fraction: float, games: int) -> tuple[float, float]:
-    z = 1.959963984540054
+    """Return a valid conservative interval for scores in {0, 0.5, 1}.
+
+    Wilson's binomial interval is not valid when draws contribute half a win.
+    Hoeffding's bounded-mean interval remains valid for the mixed score
+    variable and is intentionally conservative for model gating.
+    """
     n = float(games)
     p = float(score_fraction)
-    denominator = 1.0 + z * z / n
-    center = (p + z * z / (2.0 * n)) / denominator
-    radius = z * math.sqrt((p * (1.0 - p) + z * z / (4.0 * n)) / n) / denominator
-    return max(0.0, center - radius), min(1.0, center + radius)
+    radius = math.sqrt(math.log(40.0) / (2.0 * n))
+    return max(0.0, p - radius), min(1.0, p + radius)

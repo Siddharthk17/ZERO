@@ -5,6 +5,7 @@ param(
     [int] $Simulations = 400,
     [int] $EvalBatchSize = 256,
     [int] $TrainingBatchSize = 1024,
+    [int] $ReplayCapacity = 4000000,
     [int] $Channels = 256,
     [int] $Blocks = 12,
     [int] $PolicyChannels = 64,
@@ -15,6 +16,8 @@ param(
     [string] $GateDevice = "cpu",
     [int] $ReplaySaveInterval = 5000,
     [double] $ShutdownTimeout = 300,
+    [double] $SelfPlayTimeout = 600,
+    [string] $RunStatePath = "checkpoints/zero_x/run_state.json",
     [int] $Seed = 1592614637
 )
 
@@ -27,6 +30,8 @@ while ($true) {
     if (Test-Path $checkpoint) {
         Write-Host "Resuming ZERO-X from $checkpoint"
         $arguments += @("--resume", $checkpoint)
+    } elseif ((Test-Path $RunStatePath) -or (Test-Path "checkpoints/zero_x/replay.pkl")) {
+        Write-Host "Resuming ZERO-X from recoverable state"
     } else {
         Write-Host "Starting a fresh ZERO-X run"
         $arguments += "--fresh"
@@ -38,6 +43,7 @@ while ($true) {
         "--simulations", $Simulations,
         "--eval-batch-size", $EvalBatchSize,
         "--training-batch-size", $TrainingBatchSize,
+        "--replay-capacity", $ReplayCapacity,
         "--channels", $Channels,
         "--blocks", $Blocks,
         "--policy-channels", $PolicyChannels,
@@ -48,6 +54,8 @@ while ($true) {
         "--gate-device", $GateDevice,
         "--replay-save-interval", $ReplaySaveInterval,
         "--shutdown-timeout", $ShutdownTimeout,
+        "--self-play-timeout", $SelfPlayTimeout,
+        "--run-state-path", $RunStatePath,
         "--seed", $Seed
     )
 

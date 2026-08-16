@@ -17,16 +17,20 @@ from .model import ZeroNet, save_model
 @dataclass(slots=True)
 class CheckpointMeta:
     """Metadata for a single checkpoint: iteration, Elo, path, timestamp, and metrics."""
+
     iteration: int
     elo: float
     path: str
     created_at: str
     metrics: dict[str, float]
 
+
 class CheckpointManager:
     """Manages atomic saves, thread-safe indexing, and automatic self-healing pruned file states."""
 
     def __init__(self, directory: str | Path = "checkpoints", keep_last: int = 20, permanent_every: int = 50) -> None:
+        if keep_last <= 0 or permanent_every <= 0:
+            raise ValueError("keep_last and permanent_every must be positive")
         self.directory = Path(directory)
         self.keep_last = keep_last
         self.permanent_every = permanent_every
@@ -91,10 +95,24 @@ class CheckpointManager:
             if not self.index_path.exists():
                 return self._reconstruct_index()
             try:
-                return json.loads(self.index_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+                value = json.loads(self.index_path.read_text(encoding="utf-8"))
+                if not isinstance(value, list) or not all(self._valid_index_item(item) for item in value):
+                    raise ValueError("checkpoint index has an invalid schema")
+                return value
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError, TypeError):
                 # Automatic Self-Healing: Rebuild database if corrupted
                 return self._reconstruct_index()
+
+    @staticmethod
+    def _valid_index_item(item: object) -> bool:
+        return (
+            isinstance(item, dict)
+            and isinstance(item.get("iteration"), int)
+            and isinstance(item.get("elo"), (int, float))
+            and isinstance(item.get("path"), str)
+            and isinstance(item.get("created_at"), str)
+            and isinstance(item.get("metrics"), dict)
+        )
 
     def _reconstruct_index(self) -> list[dict]:
         """Scans filesystem and repairs the index schema if index.json is corrupt or deleted."""
@@ -137,7 +155,7 @@ class CheckpointManager:
     def _prune(self, index: list[dict]) -> None:
         with self._lock:
             # Mark newest checkpoints and permanent multiples as protected
-            protected = {item["path"] for item in index[-self.keep_last:]}
+            protected = {item["path"] for item in index[-self.keep_last :]}
             protected.update(item["path"] for item in index if item["iteration"] % self.permanent_every == 0)
 
             for item in index:

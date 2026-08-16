@@ -8,20 +8,24 @@ import { Button } from "@/components/Button";
 import { ZeroChessBoard, kingSquare } from "@/components/ChessBoard";
 
 type TrainingGame = {
-  id: string;
-  timestamp: string;
-  game_number: number;
-  generation: number;
+  id?: string;
+  timestamp?: string;
+  game_number?: number;
+  game_index?: number;
+  generation?: number;
+  batch_index?: number;
   result: string;
-  elo_after: number;
-  elo_delta: number;
-  rated_side: string;
-  replay_size: number;
-  train_step: number;
-  ply_count: number;
-  moves_san: string[];
-  loss: number;
-  pgn: string;
+  elo_after?: number;
+  elo_delta?: number;
+  rated_side?: string;
+  replay_size?: number;
+  train_step?: number;
+  ply_count?: number;
+  plies?: number;
+  moves_san?: string[];
+  moves?: string[];
+  loss?: number;
+  pgn?: string;
 };
 
 export default function HistoryPage() {
@@ -40,18 +44,24 @@ export default function HistoryPage() {
 
   async function loadHistory() {
     try {
-      const response = await fetch("http://localhost:8765/history?limit=100", { cache: "no-store" });
+      const apiBase = process.env.NEXT_PUBLIC_ZERO_API_URL ?? "http://localhost:8765";
+      const response = await fetch(`${apiBase}/history?limit=100`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`history request failed: ${response.status}`);
       const payload = (await response.json()) as { games: TrainingGame[] };
-      setGames(payload.games);
-      setSelectedId((current) => current ?? payload.games[0]?.id ?? null);
+      const normalized = payload.games.map(normalizeGame);
+      setGames(normalized);
+      setSelectedId((current) => current ?? normalized[0]?.id ?? null);
+    } catch {
+      setGames([]);
+      setSelectedId(null);
     } finally {
       setLoading(false);
     }
   }
 
   function selectGame(game: TrainingGame) {
-    setSelectedId(game.id);
-    setPly(game.ply_count);
+    setSelectedId(game.id ?? null);
+    setPly(game.ply_count ?? game.plies ?? gameMoves(game).length);
   }
 
   return (
@@ -75,13 +85,13 @@ export default function HistoryPage() {
                 className={`w-full rounded-md px-3 py-3 text-left ${selected?.id === game.id ? "bg-zero-accent text-white" : "bg-zero-panel2 text-zinc-200 hover:bg-[#3c3935]"}`}
               >
                 <div className="flex items-center justify-between text-sm font-semibold">
-                  <span>Game {game.game_number}</span>
+                   <span>Game {game.game_number ?? game.game_index ?? 0}</span>
                   <span>{game.result}</span>
                 </div>
                 <div className="mt-1 text-xs opacity-80">
-                  Gen {game.generation} / Elo {game.elo_after.toFixed(1)} ({game.elo_delta >= 0 ? "+" : ""}{game.elo_delta.toFixed(1)})
+                   Gen {game.generation ?? game.batch_index ?? 0} / Elo {(game.elo_after ?? 0).toFixed(1)} ({(game.elo_delta ?? 0) >= 0 ? "+" : ""}{(game.elo_delta ?? 0).toFixed(1)})
                 </div>
-                <div className="mt-1 truncate text-xs opacity-70">{game.moves_san.slice(0, 10).join(" ")}</div>
+                <div className="mt-1 truncate text-xs opacity-70">{gameMoves(game).slice(0, 10).join(" ")}</div>
               </button>
             ))}
             {!games.length && <div className="rounded-md bg-zero-panel2 px-3 py-4 text-sm text-zinc-400">No saved training games yet.</div>}
@@ -92,12 +102,12 @@ export default function HistoryPage() {
           <div className="rounded-md bg-zero-panel px-4 py-3">
             <div className="flex items-center justify-between">
               <div>
-                <div className="text-sm font-semibold">{selected ? `Game ${selected.game_number}` : "No game selected"}</div>
-                <div className="text-xs text-zinc-400">{selected ? `${selected.ply_count} plies / ${selected.result}` : "Start training to populate history"}</div>
+                 <div className="text-sm font-semibold">{selected ? `Game ${selected.game_number ?? selected.game_index ?? 0}` : "No game selected"}</div>
+                 <div className="text-xs text-zinc-400">{selected ? `${selected.ply_count ?? selected.plies ?? gameMoves(selected).length} plies / ${selected.result}` : "Start training to populate history"}</div>
               </div>
               <div className="text-right text-xs text-zinc-400">
-                <div>Replay {Math.min(ply, selected?.ply_count ?? 0)} / {selected?.ply_count ?? 0}</div>
-                <div>Loss {selected?.loss.toFixed(3) ?? "0.000"}</div>
+                 <div>Replay {Math.min(ply, selected ? gameLength(selected) : 0)} / {selected ? gameLength(selected) : 0}</div>
+                 <div>Loss {(selected?.loss ?? 0).toFixed(3)}</div>
               </div>
             </div>
           </div>
@@ -121,7 +131,7 @@ export default function HistoryPage() {
             <Button disabled={!selected} onClick={() => setPly(0)}>
               Start
             </Button>
-            <Button icon={<ChevronRight size={17} />} disabled={!selected || ply >= selected.ply_count} onClick={() => setPly((value) => Math.min(selected?.ply_count ?? 0, value + 1))}>
+             <Button icon={<ChevronRight size={17} />} disabled={!selected || ply >= (selected ? gameLength(selected) : 0)} onClick={() => setPly((value) => Math.min(selected ? gameLength(selected) : 0, value + 1))}>
               Next
             </Button>
           </div>
@@ -140,12 +150,39 @@ function buildReplay(game: TrainingGame | null, ply: number) {
   const chess = new Chess();
   let lastMove: Move | null = null;
   if (!game) return { game: chess, lastMove };
-  for (const san of game.moves_san.slice(0, Math.max(0, Math.min(ply, game.ply_count)))) {
+  for (const notation of gameMoves(game).slice(0, Math.max(0, Math.min(ply, gameLength(game))))) {
     try {
-      lastMove = chess.move(san) as Move;
+      lastMove = chess.move(notation) as Move;
     } catch {
-      break;
+      if (!/^[a-h][1-8][a-h][1-8][qrbn]?$/i.test(notation)) break;
+      try {
+        lastMove = chess.move({
+          from: notation.slice(0, 2),
+          to: notation.slice(2, 4),
+          promotion: notation[4]?.toLowerCase() as "q" | "r" | "b" | "n" | undefined
+        }) as Move;
+      } catch {
+        break;
+      }
     }
   }
   return { game: chess, lastMove };
+}
+
+function gameMoves(game: TrainingGame): string[] {
+  return game.moves_san ?? game.moves ?? [];
+}
+
+function gameLength(game: TrainingGame): number {
+  return game.ply_count ?? game.plies ?? gameMoves(game).length;
+}
+
+function normalizeGame(game: TrainingGame, index: number): TrainingGame {
+  return {
+    ...game,
+    id: game.id ?? `${game.batch_index ?? 0}-${game.game_index ?? index}`,
+    game_number: game.game_number ?? game.game_index ?? index + 1,
+    ply_count: game.ply_count ?? game.plies ?? gameMoves(game).length,
+    moves_san: game.moves_san ?? game.moves ?? []
+  };
 }

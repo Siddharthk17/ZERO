@@ -69,10 +69,7 @@ def test_network_evaluator_receives_history_from_mcts() -> None:
 
         def evaluate_batch(self, boards, device, histories=None):
             self.history_lengths.extend(len(history or []) for history in (histories or []))
-            return [
-                ({move: 1.0 for move in board.legal_moves()}, 0.0, 0.0)
-                for board in boards
-            ]
+            return [({move: 1.0 for move in board.legal_moves()}, 0.0, 0.0) for board in boards]
 
     board = Board()
     previous = board.copy()
@@ -86,6 +83,36 @@ def test_network_evaluator_receives_history_from_mcts() -> None:
     )
     assert model.history_lengths
     assert max(model.history_lengths) >= 1
+
+
+def test_shared_batch_evaluator_preserves_history() -> None:
+    from zero_chess.mcts import MCTS, NetworkEvaluator, SharedBatchEvaluator
+
+    class CaptureModel:
+        def __init__(self) -> None:
+            self.history_lengths: list[int] = []
+
+        def eval(self) -> None:
+            return None
+
+        def evaluate_batch(self, boards, device, histories=None):
+            self.history_lengths.extend(len(history or []) for history in (histories or []))
+            return [({move: 1.0 for move in board.legal_moves()}, 0.0, 0.0) for board in boards]
+
+    model = CaptureModel()
+    evaluator = SharedBatchEvaluator(
+        NetworkEvaluator(model, "cpu"), device="cpu", max_batch_size=2, max_wait_ms=0
+    )
+    try:
+        board = Board()
+        previous = board.copy()
+        board.push_uci("e2e4")
+        MCTS(evaluator, batch_size=1, add_noise=False).search(
+            board, num_simulations=1, add_noise=False, history=[previous]
+        )
+        assert max(model.history_lengths) >= 1
+    finally:
+        evaluator.close()
 
 
 def test_arena_gate_reports_balanced_uniform_match() -> None:
@@ -129,6 +156,15 @@ def test_truncated_targets_train_value_without_wdl_label() -> None:
     assert metrics["terminal_target_fraction"] == 0.0
 
 
+def test_training_run_deadline_survives_restart(tmp_path) -> None:
+    from train_master import _load_run_state
+
+    path = tmp_path / "run_state.json"
+    first = _load_run_state(path, 1.0, False)
+    second = _load_run_state(path, 1.0, False)
+    assert second == first
+
+
 def test_two_hot_target_uses_input_dtype_and_validates_bin_count() -> None:
     torch = pytest.importorskip("torch")
     from zero_chess.training import compute_two_hot_target
@@ -139,3 +175,9 @@ def test_two_hot_target_uses_input_dtype_and_validates_bin_count() -> None:
     assert torch.allclose(encoded.sum(dim=1), torch.ones(1, dtype=torch.float64))
     with pytest.raises(ValueError, match="at least 2"):
         compute_two_hot_target(target, num_bins=1)
+
+
+def test_truncated_experience_value_uses_q_only() -> None:
+    board = Board()
+    exp = Experience(board.fen(), {}, (1.0, 0.0, 0.0), target_kind="truncated", q_mcts=-0.25)
+    assert exp.value == pytest.approx(-0.25)

@@ -7,6 +7,8 @@ change the game-theoretic objective used by self-play or optimisation.
 
 from __future__ import annotations
 
+import math
+
 WIN_VALUE = 1.0
 DRAW_VALUE = 0.0
 LOSS_VALUE = -1.0
@@ -25,9 +27,14 @@ def apply_contempt(value: float, contempt: float = 0.10) -> float:
     minimax backup.
     """
     value = float(value)
+    if not math.isfinite(value):
+        raise ValueError("contempt value must be finite")
+    contempt = float(contempt)
+    if not math.isfinite(contempt):
+        raise ValueError("contempt offset must be finite")
     if -0.15 <= value <= 0.15:
-        return max(LOSS_VALUE, min(WIN_VALUE, value + float(contempt)))
-    return value
+        value += contempt
+    return max(LOSS_VALUE, min(WIN_VALUE, value))
 
 
 def game_result_to_values(result: str) -> tuple[float, float]:

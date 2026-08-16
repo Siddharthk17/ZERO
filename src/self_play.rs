@@ -5,11 +5,12 @@
 use cozy_chess::{Board, GameStatus, Move};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::encoding::{move_to_policy_index, HistoryPosition};
+use crate::encoding::{move_to_policy_index, standard_uci, HistoryPosition};
 use crate::evaluator::SharedGpuEvaluator;
-use crate::mcts::{is_dead_position, Mcts, MctsError, SearchConfig};
+use crate::mcts::{is_claimable_draw, is_dead_position, Mcts, MctsError, SearchConfig};
 
 #[derive(Clone, Copy)]
 pub struct SelfPlayConfig {
@@ -155,7 +156,10 @@ fn play_game(
             GameStatus::Ongoing => {}
         }
         let repetitions = repetition_count(&board, &history);
-        if repetitions >= 3 || is_dead_position(&board) || board.halfmove_clock() >= 100 {
+        if is_claimable_draw(&board, &history, &[], repetitions)
+            || is_dead_position(&board)
+            || board.halfmove_clock() >= 100
+        {
             return finalize_draw(pending, played_moves, "draw");
         }
         let is_full_search = rng.gen_bool(config.full_search_probability);
@@ -205,7 +209,7 @@ fn play_game(
                 ply,
             });
         }
-        played_moves.push(chess_move.to_string());
+        played_moves.push(standard_uci(&board, chess_move));
         if history.len() == history.capacity() {
             // Game history is bounded by max_plies, so this only occurs if a
             // caller passes a pathological zero capacity (which Vec disallows).
@@ -227,7 +231,7 @@ fn play_game(
             }
             GameStatus::Drawn => return finalize_draw(pending, played_moves, "draw"),
             GameStatus::Ongoing
-                if next_repetitions >= 3
+                if is_claimable_draw(&board, &history, &[], next_repetitions)
                     || is_dead_position(&board)
                     || board.halfmove_clock() >= 100 =>
             {
@@ -328,6 +332,11 @@ fn finalize(
         1.0
     };
     let total_plies = moves.len();
+    let by_ply: HashMap<usize, usize> = positions
+        .iter()
+        .enumerate()
+        .map(|(index, position)| (position.ply, index))
+        .collect();
     let mut experiences = Vec::with_capacity(positions.len());
     for position in &positions {
         let value = if position.side_to_move_is_white {
@@ -336,14 +345,12 @@ fn finalize(
             -white_value
         };
         let moves_left = normalized_moves_left(total_plies, position.ply);
-        let opponent_policy = positions
-            .iter()
-            .find(|candidate| candidate.ply == position.ply + 1)
-            .map(|candidate| candidate.policy.clone());
-        let opponent_legal_policy = positions
-            .iter()
-            .find(|candidate| candidate.ply == position.ply + 1)
-            .map(|candidate| candidate.legal_policy.clone());
+        let opponent_position = by_ply
+            .get(&(position.ply + 1))
+            .and_then(|index| positions.get(*index));
+        let opponent_policy = opponent_position.map(|candidate| candidate.policy.clone());
+        let opponent_legal_policy =
+            opponent_position.map(|candidate| candidate.legal_policy.clone());
         experiences.push(Experience {
             fen: position.fen.clone(),
             policy: position.policy.clone(),
@@ -374,6 +381,11 @@ fn finalize_draw(
     reason: &'static str,
 ) -> Result<CompletedGame, MctsError> {
     let total_plies = moves.len();
+    let by_ply: HashMap<usize, usize> = positions
+        .iter()
+        .enumerate()
+        .map(|(index, position)| (position.ply, index))
+        .collect();
     let target_kind = if reason == "max_plies" {
         "truncated"
     } else {
@@ -386,14 +398,12 @@ fn finalize_draw(
             .iter()
             .map(|position| {
                 let moves_left = normalized_moves_left(total_plies, position.ply);
-                let opponent_policy = positions
-                    .iter()
-                    .find(|candidate| candidate.ply == position.ply + 1)
-                    .map(|candidate| candidate.policy.clone());
-                let opponent_legal_policy = positions
-                    .iter()
-                    .find(|candidate| candidate.ply == position.ply + 1)
-                    .map(|candidate| candidate.legal_policy.clone());
+                let opponent_position = by_ply
+                    .get(&(position.ply + 1))
+                    .and_then(|index| positions.get(*index));
+                let opponent_policy = opponent_position.map(|candidate| candidate.policy.clone());
+                let opponent_legal_policy =
+                    opponent_position.map(|candidate| candidate.legal_policy.clone());
                 Experience {
                     fen: position.fen.clone(),
                     policy: position.policy.clone(),
@@ -422,10 +432,11 @@ fn normalized_moves_left(total_plies: usize, ply: usize) -> f32 {
 
 #[inline]
 fn repetition_count(board: &Board, history: &[HistoryPosition]) -> u8 {
-    1 + history
+    history
         .iter()
         .filter(|entry| entry.board.same_position(board))
         .count()
+        .saturating_add(1)
         .min(u8::MAX as usize) as u8
 }
 

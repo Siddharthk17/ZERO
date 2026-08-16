@@ -33,18 +33,18 @@ KNIGHT_DIRS_POLICY = (
 )
 UNDERPROMOS = ("N", "B", "R")
 
-PIECE_TO_PLANE = {
-    "P": 0, "N": 1, "B": 2, "R": 3, "Q": 4, "K": 5,
-    "p": 6, "n": 7, "b": 8, "r": 9, "q": 10, "k": 11
-}
+PIECE_TO_PLANE = {"P": 0, "N": 1, "B": 2, "R": 3, "Q": 4, "K": 5, "p": 6, "n": 7, "b": 8, "r": 9, "q": 10, "k": 11}
+
 
 def orient_square(sq: int, turn: int) -> int:
     """Rotate the square 180 degrees for Black to align perspectives."""
     return sq if turn == WHITE else 63 - sq
 
+
 def deorient_square(sq: int, turn: int) -> int:
     """Convert oriented coordinate back to actual board index."""
     return sq if turn == WHITE else 63 - sq
+
 
 def move_to_policy_index(board: Board, move: Move) -> int:
     """Map a legal move to one of 4672 AlphaZero-style policy logits."""
@@ -67,6 +67,7 @@ def move_to_policy_index(board: Board, move: Move) -> int:
     plane = QUEEN_DIRS_POLICY.index(direction) * 7 + (distance - 1)
     return plane * 64 + from_sq
 
+
 def _queen_direction(df: int, dr: int) -> tuple[tuple[int, int], int]:
     if df == 0 and dr != 0:
         direction = (0, 1 if dr > 0 else -1)
@@ -83,32 +84,36 @@ def _queen_direction(df: int, dr: int) -> tuple[tuple[int, int], int]:
         raise ValueError(f"invalid queen-like distance: {distance}")
     return direction, distance
 
+
 def legal_policy_indices(board: Board) -> dict[Move, int]:
     """Map all legal moves in the position to their policy tensor indices."""
     return {move: move_to_policy_index(board, move) for move in board.legal_moves()}
+
 
 def encode_board(board: Board, history: list[Board] | None = None, device: str | None = None):
     """Return a torch tensor of shape ``(121, 8, 8)`` oriented for the active player."""
     try:
         import torch
     except ImportError as exc:
-        raise RuntimeError("encode_board requires PyTorch; install zero-chess[train]") from exc
+        raise RuntimeError("encode_board requires PyTorch; install the project runtime dependencies") from exc
 
     planes = torch.zeros((INPUT_CHANNELS, 8, 8), dtype=torch.float32, device=device)
     return encode_board_into(planes, board, history)
+
 
 def encode_boards(boards: list[Board], histories: list[list[Board]] | None = None, device: str | None = None):
     """Batch-encode a list of boards into a tensor of shape ``(N, 121, 8, 8)``."""
     try:
         import torch
     except ImportError as exc:
-        raise RuntimeError("encode_boards requires PyTorch; install zero-chess[train]") from exc
+        raise RuntimeError("encode_boards requires PyTorch; install the project runtime dependencies") from exc
 
     histories = histories or [None] * len(boards)
     batch = torch.zeros((len(boards), INPUT_CHANNELS, 8, 8), dtype=torch.float32, device=device)
     for idx, (board, history) in enumerate(zip(boards, histories, strict=True)):
         encode_board_into(batch[idx], board, history)
     return batch
+
 
 def encode_board_into(planes, board: Board, history: list[Board] | None = None):
     """Fill pre-allocated ``planes`` tensor with the board representation."""
@@ -160,20 +165,17 @@ def encode_board_into(planes, board: Board, history: list[Board] | None = None):
         planes[extra + 8].fill_(1.0)
     return planes
 
+
 def policy_target(board: Board, visits: dict[Move, int], device: str | None = None):
     """Generate the policy target plane from MCTS statistics."""
     try:
         import torch
     except ImportError as exc:
-        raise RuntimeError("policy_target requires PyTorch; install zero-chess[train]") from exc
+        raise RuntimeError("policy_target requires PyTorch; install the project runtime dependencies") from exc
 
     target = torch.zeros(POLICY_SIZE, dtype=torch.float32, device=device)
     legal_by_move = {move: move_to_policy_index(board, move) for move in board.legal_moves()}
-    valid_visits = {
-        legal_by_move[move]: max(0, int(count))
-        for move, count in visits.items()
-        if move in legal_by_move
-    }
+    valid_visits = {legal_by_move[move]: max(0, int(count)) for move, count in visits.items() if move in legal_by_move}
     total = sum(valid_visits.values())
     if total <= 0:
         legal = board.legal_moves()
@@ -187,15 +189,17 @@ def policy_target(board: Board, visits: dict[Move, int], device: str | None = No
         target[index] = count / total
     return target
 
+
 def encode_move_mask(legal_moves: list[Move] | None, board: Board, device: str | None = None):
     """Generate a float mask indicating legal moves in the policy output shape."""
     try:
         import torch
     except ImportError as exc:
-        raise RuntimeError("encode_move_mask requires PyTorch; install zero-chess[train]") from exc
+        raise RuntimeError("encode_move_mask requires PyTorch; install the project runtime dependencies") from exc
 
     mask = torch.zeros(POLICY_SIZE, dtype=torch.float32, device=device)
     return encode_move_mask_into(mask, legal_moves, board)
+
 
 def encode_move_mask_into(mask, legal_moves: list[Move] | None, board: Board):
     """Fill pre-allocated float ``mask`` with legal move coordinates."""
@@ -203,6 +207,7 @@ def encode_move_mask_into(mask, legal_moves: list[Move] | None, board: Board):
     for move in legal_moves if legal_moves is not None else board.legal_moves():
         mask[move_to_policy_index(board, move)] = 1.0
     return mask
+
 
 def terminal_wdl(value: float) -> tuple[float, float, float]:
     """Map a terminal minimax value to its one-hot WDL target."""

@@ -17,10 +17,12 @@ from .move import Move
 @dataclass(slots=True)
 class UCIOptions:
     """UCI engine options: simulations, CPuct, checkpoint path, and device."""
+
     simulations: int = 200
     cpuct: float = 1.5
     checkpoint: str | None = None
     device: str = "cpu"
+
 
 class UCIEngine:
     """Manages the standard Universal Chess Interface protocol for zero-latency GUI play."""
@@ -37,6 +39,8 @@ class UCIEngine:
         self._search_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._best_result: SearchResult | None = None
+        self._bestmove_emitted = False
+        self._search_token = 0
         self._position_seen = False
         self._searched = False
         self._state_lock = threading.RLock()
@@ -65,6 +69,7 @@ class UCIEngine:
             elif cmd == "setoption":
                 self._cmd_setoption(args)
             elif cmd == "ucinewgame":
+                self._cmd_stop(emit=False)
                 with self._state_lock:
                     self.board = Board()
                     self.position_history.clear()
@@ -97,6 +102,7 @@ class UCIEngine:
         print("uciok", flush=True)
 
     def _cmd_setoption(self, args: list[str]) -> None:
+        self._cmd_stop(emit=False)
         with self._state_lock:
             self._cmd_setoption_locked(args)
 
@@ -121,6 +127,7 @@ class UCIEngine:
             self._load_checkpoint()
 
     def _cmd_position(self, args: list[str]) -> None:
+        self._cmd_stop(emit=False)
         with self._state_lock:
             self._cmd_position_locked(args)
 
@@ -146,111 +153,131 @@ class UCIEngine:
         new_moves = args[idx + 1 :] if (idx < len(args) and args[idx] == "moves") else []
         base_fen = base_board.fen()
 
+        # Validate the complete command on an isolated board first. A malformed
+        # later move must never leave the live UCI position partially applied.
+        candidate_board = base_board
+        candidate_history: list[Board] = []
+        for move_str in new_moves:
+            resolved_move = self._resolve_legal_move(candidate_board, move_str)
+            candidate_history.insert(0, candidate_board.copy())
+            candidate_board._push_unchecked(resolved_move)
+
         # Check if the new state is an incremental extension of our existing active board
         if (
             self.played_moves
             and base_fen == self._base_fen
             and len(new_moves) >= len(self.played_moves)
-            and new_moves[:len(self.played_moves)] == self.played_moves
+            and new_moves[: len(self.played_moves)] == self.played_moves
         ):
             # Incremental Update (Tree Reuse Path)
             added_moves = new_moves[len(self.played_moves) :]
             for move_str in added_moves:
-                raw_move = Move.from_uci(move_str)
-                resolved_move = None
-                for legal in self.board.legal_moves():
-                    if (
-                        legal.from_sq == raw_move.from_sq
-                        and legal.to_sq == raw_move.to_sq
-                        and legal.promotion == raw_move.promotion
-                    ):
-                        resolved_move = legal
-                        break
-                if resolved_move is not None:
-                    self._record_and_push(resolved_move)
-                    self.mcts.advance_to(resolved_move)
-                else:
-                    self._record_and_push_uci(move_str)
-                    self.mcts.reset()
+                resolved_move = self._resolve_legal_move(self.board, move_str)
+                self._record_and_push(resolved_move)
+                self.mcts.advance_to(resolved_move)
             self.played_moves = new_moves
         else:
             # Full Reset
-            self.board = base_board
-            self.position_history.clear()
+            self.board = candidate_board
+            self.position_history = candidate_history
             self._base_fen = base_fen
             self.mcts.reset()
-            for move_str in new_moves:
-                raw_move = Move.from_uci(move_str)
-                resolved_move = None
-                for legal in self.board.legal_moves():
-                    if (
-                        legal.from_sq == raw_move.from_sq
-                        and legal.to_sq == raw_move.to_sq
-                        and legal.promotion == raw_move.promotion
-                    ):
-                        resolved_move = legal
-                        break
-                if resolved_move is not None:
-                    self._record_and_push(resolved_move)
-                else:
-                    self._record_and_push_uci(move_str)
             self.played_moves = new_moves
+
+    @staticmethod
+    def _resolve_legal_move(board: Board, move_str: str) -> Move:
+        raw_move = Move.from_uci(move_str)
+        for legal in board.legal_moves():
+            if (
+                legal.from_sq == raw_move.from_sq
+                and legal.to_sq == raw_move.to_sq
+                and legal.promotion == raw_move.promotion
+            ):
+                return legal
+        raise ValueError(f"illegal move {move_str!r} in position {board.fen()}")
 
     def _cmd_go(self, args: list[str]) -> None:
         self._searched = True
         if "infinite" in args:
             self._start_infinite_search()
             return
-        with self._state_lock:
-            if "movetime" in args:
-                ms = int(args[args.index("movetime") + 1])
-                result = self.mcts.search_time(
-                    self.board,
-                    ms,
-                    temperature=0.0,
-                    add_noise=False,
-                    history=self.position_history,
-                )
-            elif "wtime" in args or "btime" in args:
-                ms = self._time_to_use(args)
-                result = self.mcts.search_time(
-                    self.board,
-                    ms,
-                    temperature=0.0,
-                    add_noise=False,
-                    history=self.position_history,
-                )
-            else:
-                simulations = self._simulations_for_go(args)
-                result = self.mcts.search(
-                    self.board,
-                    num_simulations=simulations,
-                    temperature=0.0,
-                    add_noise=False,
-                    history=self.position_history,
-                )
-        self._best_result = result
-        self._emit_bestmove(result)
+        self._start_finite_search(args)
+
+    def _start_finite_search(self, args: list[str]) -> None:
+        if self._search_thread and self._search_thread.is_alive():
+            self._cmd_stop(emit=False)
+        self._search_token += 1
+        token = self._search_token
+        stop_event = threading.Event()
+        self._stop_event = stop_event
+        self._best_result = None
+        self._bestmove_emitted = False
+
+        def worker() -> None:
+            with self._state_lock:
+                if "movetime" in args:
+                    ms = int(args[args.index("movetime") + 1])
+                    result = self.mcts.search_time(
+                        self.board,
+                        ms,
+                        temperature=0.0,
+                        add_noise=False,
+                        history=self.position_history,
+                            stop_event=stop_event,
+                    )
+                elif "wtime" in args or "btime" in args:
+                    ms = self._time_to_use(args)
+                    result = self.mcts.search_time(
+                        self.board,
+                        ms,
+                        temperature=0.0,
+                        add_noise=False,
+                        history=self.position_history,
+                            stop_event=stop_event,
+                    )
+                else:
+                    simulations = self._simulations_for_go(args)
+                    result = self.mcts.search(
+                        self.board,
+                        num_simulations=simulations,
+                        temperature=0.0,
+                        add_noise=False,
+                        history=self.position_history,
+                            stop_event=stop_event,
+                    )
+                if token != self._search_token:
+                    return
+                self._best_result = result
+                if not stop_event.is_set() and not self._bestmove_emitted:
+                    self._emit_bestmove(result)
+                    self._bestmove_emitted = True
+
+        self._search_thread = threading.Thread(target=worker, daemon=True)
+        self._search_thread.start()
 
     def _start_infinite_search(self) -> None:
         if self._search_thread and self._search_thread.is_alive():
             self._cmd_stop(emit=False)
             if self._search_thread.is_alive():
                 return
-        self._stop_event.clear()
+        self._search_token += 1
+        token = self._search_token
+        stop_event = threading.Event()
+        self._stop_event = stop_event
         self._best_result = None
+        self._bestmove_emitted = False
 
         def worker() -> None:
-            while not self._stop_event.is_set():
+            while not stop_event.is_set():
                 with self._state_lock:
-                    if self._stop_event.is_set():
+                    if stop_event.is_set() or token != self._search_token:
                         break
                     self._best_result = self.mcts.search(
                         self.board,
                         num_simulations=self.mcts.batch_size,
                         temperature=0.0,
                         add_noise=False,
-                        stop_event=self._stop_event,
+                        stop_event=stop_event,
                         history=self.position_history,
                     )
 
@@ -259,10 +286,12 @@ class UCIEngine:
 
     def _cmd_stop(self, emit: bool = True) -> None:
         self._stop_event.set()
+        self._search_token += 1
         if self._search_thread and self._search_thread.is_alive():
             self._search_thread.join(timeout=1.0)
-        if emit:
+        if emit and not self._bestmove_emitted:
             self._emit_bestmove(self._best_result)
+            self._bestmove_emitted = True
 
     def _emit_bestmove(self, result: SearchResult | None) -> None:
         if result is None or result.move is None:
@@ -326,10 +355,9 @@ class UCIEngine:
             )
 
     def _record_and_push(self, move: Move) -> None:
-        """Keep newest-first position history for the 121-plane input ABI."""
+        """Keep full newest-first history; encoding truncates it to seven planes."""
         self.position_history.insert(0, self.board.copy())
-        del self.position_history[7:]
-        self.board.push(move)
+        self.board._push_unchecked(move)
 
     def _record_and_push_uci(self, text: str) -> None:
         """Resolve and play UCI while preserving history for neural inputs."""
@@ -344,6 +372,7 @@ class UCIEngine:
                 return
         raise ValueError(f"illegal move {text!r} in position {self.board.fen()}")
 
+
 def main(argv: list[str] | None = None) -> None:
     """CLI entry point: start the UCI engine loop on stdin/stdout."""
     parser = argparse.ArgumentParser(add_help=False)
@@ -352,6 +381,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--simulations", type=int, default=200)
     args, _ = parser.parse_known_args(argv)
     UCIEngine(UCIOptions(args.simulations, checkpoint=args.checkpoint, device=args.device)).loop()
+
 
 if __name__ == "__main__":  # pragma: no cover
     main()

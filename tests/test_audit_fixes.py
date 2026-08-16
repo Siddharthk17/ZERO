@@ -16,13 +16,16 @@ def test_has_legal_moves_starting_position() -> None:
     board = Board()
     assert board.has_legal_moves() is True
 
+
 def test_has_legal_moves_checkmate_returns_false() -> None:
     mate = Board.from_fen("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1")
     assert mate.has_legal_moves() is False
 
+
 def test_has_legal_moves_stalemate_returns_false() -> None:
     stalemate = Board.from_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1")
     assert stalemate.has_legal_moves() is False
+
 
 def test_has_legal_moves_agrees_with_legal_moves() -> None:
     fens = [
@@ -35,10 +38,12 @@ def test_has_legal_moves_agrees_with_legal_moves() -> None:
         board = Board.from_fen(fen)
         assert board.has_legal_moves() == (len(board.legal_moves()) > 0)
 
+
 def test_has_legal_moves_only_king_can_move() -> None:
     board = Board.from_fen("4k3/8/8/1B6/8/8/8/4R2K b - - 0 1")
     assert board.has_legal_moves() is True
     assert all(m.from_sq == parse_square("e8") for m in board.legal_moves())
+
 
 # outcome consistency
 def test_outcome_uses_has_legal_moves_consistency() -> None:
@@ -46,7 +51,7 @@ def test_outcome_uses_has_legal_moves_consistency() -> None:
     fens = [
         "7k/6Q1/6K1/8/8/8/8/8 b - - 0 1",  # checkmate
         "7k/5Q2/6K1/8/8/8/8/8 b - - 0 1",  # stalemate
-        "8/8/8/8/8/8/8/K6k w - - 0 1",      # insufficient material
+        "8/8/8/8/8/8/8/K6k w - - 0 1",  # insufficient material
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",  # starting
     ]
     for fen in fens:
@@ -57,12 +62,13 @@ def test_outcome_uses_has_legal_moves_consistency() -> None:
         else:
             assert board.outcome() is None or board.outcome() == "1/2-1/2"
 
+
 # SharedBatchEvaluator close wakes pending requests
 def test_shared_batch_evaluator_close_wakes_pending() -> None:
     """Closing the evaluator while requests are pending must not hang."""
     from zero_chess.mcts import SharedBatchEvaluator, UniformEvaluator
 
-    evaluator = SharedBatchEvaluator(UniformEvaluator(), device="cpu", max_batch_size=1, max_wait_ms=10.0)
+    evaluator = SharedBatchEvaluator(UniformEvaluator(), device="cpu", max_batch_size=2, max_wait_ms=1000.0)
 
     # Submit a request from a thread to simulate a pending call
     result_holder = {"error": None}
@@ -77,12 +83,14 @@ def test_shared_batch_evaluator_close_wakes_pending() -> None:
     t.start()
     # Give the thread time to queue its request
     import time
+
     time.sleep(0.05)
 
     evaluator.close()
     t.join(timeout=2.0)
     assert not t.is_alive(), "Thread should have been woken up by close()"
     assert result_holder["error"] is not None, "Pending request should have received an error"
+
 
 # CheckpointManager cleanup
 def test_checkpoint_manager_cleanup_removes_stale_entries(tmp_path) -> None:
@@ -109,6 +117,7 @@ def test_checkpoint_manager_cleanup_removes_stale_entries(tmp_path) -> None:
     assert len(cleaned) == 4
     assert all(entry["path"] != str(stale_path) for entry in cleaned)
 
+
 def test_checkpoint_manager_save_and_latest_round_trip(tmp_path) -> None:
     from zero_chess.checkpoint import CheckpointManager
     from zero_chess.model import ModelConfig, ZeroNet
@@ -123,6 +132,7 @@ def test_checkpoint_manager_save_and_latest_round_trip(tmp_path) -> None:
     latest = mgr.latest()
     assert latest is not None
     assert latest.iteration == 42
+
 
 def test_checkpoint_manager_reconstruct_index(tmp_path) -> None:
     """If index.json is deleted, the manager should reconstruct it from files."""
@@ -143,6 +153,18 @@ def test_checkpoint_manager_reconstruct_index(tmp_path) -> None:
     iterations = sorted(item["iteration"] for item in index)
     assert iterations == [10, 20]
 
+
+def test_checkpoint_manager_self_heals_valid_json_with_invalid_schema(tmp_path) -> None:
+    from zero_chess.checkpoint import CheckpointManager
+    from zero_chess.model import ModelConfig, ZeroNet
+
+    mgr = CheckpointManager(tmp_path, keep_last=10, permanent_every=100)
+    model = ZeroNet(ModelConfig(channels=16, blocks=1))
+    mgr.save(model, iteration=10)
+    (tmp_path / "index.json").write_text("{}", encoding="utf-8")
+    assert mgr.latest() is not None
+
+
 # targets opponent_value edge cases
 def test_opponent_value_at_all_anchors() -> None:
     from zero_chess.targets import opponent_value
@@ -150,6 +172,7 @@ def test_opponent_value_at_all_anchors() -> None:
     for x, expected_y in [(-1.0, 1.0), (-0.75, 0.75), (0.0, 0.0), (0.75, -0.75), (1.0, -1.0)]:
         result = opponent_value(x)
         assert abs(result - expected_y) < 1e-9, f"opponent_value({x}) = {result}, expected {expected_y}"
+
 
 def test_opponent_value_continuous() -> None:
     """opponent_value is exact negation, hence continuous with no jumps."""
@@ -164,11 +187,13 @@ def test_opponent_value_continuous() -> None:
             f"Discontinuity at midpoint {mid}: v0={v0}, vm={vm}, v1={v1}"
         )
 
+
 def test_opponent_value_is_exact_negation_outside_network_range() -> None:
     from zero_chess.targets import opponent_value
 
     assert opponent_value(-100.0) == 100.0
     assert opponent_value(100.0) == -100.0
+
 
 def test_apply_contempt_boundaries() -> None:
     from zero_chess.targets import apply_contempt
@@ -182,6 +207,8 @@ def test_apply_contempt_boundaries() -> None:
     assert apply_contempt(-0.16) == pytest.approx(-0.16)
     assert apply_contempt(1.0) == pytest.approx(1.0)
     assert apply_contempt(-1.0) == pytest.approx(-1.0)
+    assert apply_contempt(2.0) == pytest.approx(1.0)
+
 
 # encoding edge cases
 def test_encode_boards_empty_list() -> None:
@@ -191,6 +218,7 @@ def test_encode_boards_empty_list() -> None:
     batch = encode_boards([])
     assert batch.shape == (0, INPUT_CHANNELS, 8, 8)
 
+
 def test_policy_target_empty_visits() -> None:
     pytest.importorskip("torch")
     from zero_chess.encoding import POLICY_SIZE, policy_target
@@ -199,6 +227,7 @@ def test_policy_target_empty_visits() -> None:
     target = policy_target(board, {})
     assert target.shape == (POLICY_SIZE,)
     assert abs(target.sum().item() - 1.0) < 1e-6
+
 
 def test_policy_target_with_visits() -> None:
     pytest.importorskip("torch")
@@ -210,6 +239,7 @@ def test_policy_target_with_visits() -> None:
     target = policy_target(board, visits)
     assert abs(target.sum().item() - 1.0) < 1e-6
 
+
 # move edge cases
 def test_move_from_uci_invalid_length() -> None:
 
@@ -217,6 +247,7 @@ def test_move_from_uci_invalid_length() -> None:
         Move.from_uci("e2e4e")
     with pytest.raises(ValueError):
         Move.from_uci("e2")
+
 
 def test_move_encode_decode_round_trip() -> None:
 
@@ -234,10 +265,12 @@ def test_move_encode_decode_round_trip() -> None:
         assert decoded.promotion == move.promotion
         assert decoded.flags == move.flags
 
+
 def test_move_lowercase_promotion_normalized() -> None:
 
     move = Move(52, 60, "q")
     assert move.promotion == "Q"
+
 
 # replay edge cases
 def test_replay_empty_raises_on_sample() -> None:
@@ -247,6 +280,7 @@ def test_replay_empty_raises_on_sample() -> None:
     with pytest.raises(ValueError):
         replay.sample(1)
 
+
 def test_replay_anneal_beta() -> None:
     from zero_chess.replay import PrioritizedReplayBuffer
 
@@ -254,6 +288,7 @@ def test_replay_anneal_beta() -> None:
     assert replay.anneal_beta(0) == pytest.approx(0.4)
     assert replay.anneal_beta(500_000) == pytest.approx(1.0)
     assert replay.anneal_beta(250_000) == pytest.approx(0.7)
+
 
 def test_replay_save_load_round_trip(tmp_path) -> None:
     from zero_chess.replay import Experience, PrioritizedReplayBuffer
@@ -271,6 +306,7 @@ def test_replay_save_load_round_trip(tmp_path) -> None:
     assert len(loaded) == 5
     assert loaded.hot_size == 5
 
+
 # mcts edge cases
 def test_mcts_search_terminal_position() -> None:
     """MCTS on a terminal position should handle it gracefully."""
@@ -281,6 +317,7 @@ def test_mcts_search_terminal_position() -> None:
     # Checkmate position: root may not be expanded, move should be None or from empty children
     assert result.visits == {}
 
+
 def test_mcts_reset_clears_transposition_table() -> None:
     from zero_chess.mcts import MCTS, UniformEvaluator
 
@@ -290,6 +327,7 @@ def test_mcts_reset_clears_transposition_table() -> None:
     mcts.reset()
     assert len(mcts.transposition_table) == 0
 
+
 # websocket parse_info
 def test_parse_info_cp_score() -> None:
     from zero_chess.websocket_server import parse_info
@@ -298,11 +336,13 @@ def test_parse_info_cp_score() -> None:
     assert eval_val == pytest.approx(0.5)
     assert nodes == 100
 
+
 def test_parse_info_mate_score() -> None:
     from zero_chess.websocket_server import parse_info
 
     eval_val, _ = parse_info("info depth 5 score mate 3")
     assert eval_val == 100.0
+
 
 def test_parse_info_missing_fields() -> None:
     from zero_chess.websocket_server import parse_info

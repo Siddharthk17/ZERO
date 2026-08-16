@@ -45,10 +45,7 @@ def test_wdl_train_step_and_long_horizon_schedule() -> None:
     policy = {move.uci(): 1.0 for move in board.legal_moves()}
     from zero_chess.replay import Experience
 
-    replay.extend([
-        Experience(board.fen(), policy, terminal_wdl_target(DRAW_VALUE))
-        for _ in range(4)
-    ])
+    replay.extend([Experience(board.fen(), policy, terminal_wdl_target(DRAW_VALUE)) for _ in range(4)])
     config = TrainConfig(batch_size=4, device="cpu", mixed_precision=False)
     optimizer = make_optimizer(model, config)
     scheduler = ContinuousLRScheduler(

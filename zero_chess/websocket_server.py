@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -19,9 +20,11 @@ from .board import Board
 @dataclass(slots=True)
 class UCIResult:
     """Result from a UCI best-move query: move string, evaluation, and node count."""
+
     move: str
     evaluation: float = 0.0
     nodes: int = 0
+
 
 class UCIProcess:
     """Manages an asynchronous, self-healing UCI subprocess wrapper."""
@@ -31,20 +34,23 @@ class UCIProcess:
             sys.executable,
             "-m",
             "zero_chess.uci",
-            "--checkpoint",
-            "checkpoints/zero_x/accepted.pt",
             "--device",
-            "cuda",
+            "cpu",
         ]
         self.process: asyncio.subprocess.Process | None = None
         self.lock = asyncio.Lock()
+        self.require_checkpoint = True
+        self.checkpoint_path = Path("checkpoints/zero_x/accepted.pt")
 
     async def ensure(self) -> asyncio.subprocess.Process:
         """Verify the subprocess status, spinning up a fresh handle if dead."""
         if self.process and self.process.returncode is None:
             return self.process
 
-        await self.close()
+        if self.require_checkpoint and not self.checkpoint_path.exists():
+            raise RuntimeError(f"production checkpoint is missing: {self.checkpoint_path}")
+
+        await self._close_unlocked()
         self.process = await asyncio.create_subprocess_exec(
             *self.command,
             stdin=asyncio.subprocess.PIPE,
@@ -62,7 +68,7 @@ class UCIProcess:
         if not isinstance(fen, str) or len(fen) > 256 or "\n" in fen or "\r" in fen:
             raise ValueError("invalid FEN payload")
         Board.from_fen(fen)
-        move_time = max(100, int(move_time))
+        move_time = min(120_000, max(100, int(move_time)))
         async with self.lock:
             await self.ensure()
             await self._send(f"position fen {fen}")
@@ -82,16 +88,22 @@ class UCIProcess:
 
     async def close(self) -> None:
         """Atomic teardown of the background subprocess to release locked resources."""
-        if self.process:
+        async with self.lock:
+            await self._close_unlocked()
+
+    async def _close_unlocked(self) -> None:
+        process = self.process
+        self.process = None
+        if process:
             try:
-                self.process.terminate()
-                await asyncio.wait_for(self.process.wait(), timeout=1.0)
+                process.terminate()
+                await asyncio.wait_for(process.wait(), timeout=1.0)
             except Exception:
                 try:
-                    self.process.kill()
+                    process.kill()
+                    await asyncio.wait_for(process.wait(), timeout=1.0)
                 except Exception:
                     pass
-            self.process = None
 
     async def _send(self, command: str) -> None:
         process = self.process
@@ -101,7 +113,7 @@ class UCIProcess:
             process.stdin.write((command + "\n").encode())
             await process.stdin.drain()
         except Exception as exc:
-            await self.close()
+            await self._close_unlocked()
             raise RuntimeError("failed to transmit command to subprocess") from exc
 
     async def _read_line(self) -> str:
@@ -111,17 +123,18 @@ class UCIProcess:
         try:
             data = await process.stdout.readline()
             if not data:
-                await self.close()
+                await self._close_unlocked()
                 raise RuntimeError("UCI process reached EOF")
             return data.decode(errors="replace").strip()
         except Exception as exc:
-            await self.close()
+            await self._close_unlocked()
             raise RuntimeError("failed to read stream from subprocess") from exc
 
     async def _read_until(self, token: str, timeout: float) -> None:
         while True:
             if await asyncio.wait_for(self._read_line(), timeout=timeout) == token:
                 return
+
 
 def parse_info(line: str) -> tuple[float | None, int | None]:
     """Parse a UCI 'info' line and return (evaluation, nodes) or (None, None) if absent."""
@@ -145,20 +158,28 @@ def parse_info(line: str) -> tuple[float | None, int | None]:
 
 engine = UCIProcess()
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Safely terminate the background engine process when FastAPI shuts down."""
     yield
     await engine.close()
 
+
 app = FastAPI(title="ZERO Engine WebSocket", lifespan=lifespan)
+allowed_origins = [
+    origin.strip()
+    for origin in os.environ.get("ZERO_ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 def _tail_file_lines(path: Path, max_lines: int = 500) -> list[str]:
     """Optimized binary seek tail reader to prevent RAM exhaustion on large FEN logs."""
@@ -182,7 +203,7 @@ def _tail_file_lines(path: Path, max_lines: int = 500) -> list[str]:
 
             while b"\n" in buffer:
                 newline_index = buffer.rindex(b"\n")
-                line = buffer[newline_index + 1:]
+                line = buffer[newline_index + 1 :]
                 if line:
                     lines.append(bytes(line))
                 buffer = buffer[:newline_index]
@@ -197,6 +218,7 @@ def _tail_file_lines(path: Path, max_lines: int = 500) -> list[str]:
     lines.reverse()
     return [line.decode("utf-8") for line in lines[-max_lines:]]
 
+
 @app.get("/history")
 def training_history(limit: int = 50) -> dict[str, list[dict]]:
     """Return recent training game records from the JSONL log, without PGN payloads."""
@@ -209,17 +231,22 @@ def training_history(limit: int = 50) -> dict[str, list[dict]]:
     for line in selected:
         try:
             record = json.loads(line)
-            record.pop("pgn", None)
-            games.append(record)
+            if isinstance(record, dict):
+                games.append(record)
         except json.JSONDecodeError:
             continue
     games.reverse()
     return {"games": games}
 
+
 @app.websocket("/")
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
     """WebSocket endpoint: receive FEN positions, return best moves from the UCI engine."""
+    origin = websocket.headers.get("origin")
+    if origin and origin not in allowed_origins:
+        await websocket.close(code=1008, reason="origin is not allowed")
+        return
     await websocket.accept()
     try:
         while True:
@@ -236,6 +263,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         return
 
+
 def main(argv: list[str] | None = None) -> None:
     """CLI entry point: start the FastAPI WebSocket server bridging to the UCI engine."""
     parser = argparse.ArgumentParser(description="Run ZERO WebSocket engine bridge.")
@@ -245,20 +273,31 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--simulations", type=int, default=200)
     args = parser.parse_args(argv)
-    engine.command = [
-        sys.executable,
-        "-m",
-        "zero_chess.uci",
-        "--checkpoint",
-        args.checkpoint,
-        "--device",
-        args.device,
-        "--simulations",
-        str(args.simulations),
-    ]
+    engine.require_checkpoint = True
+    engine.checkpoint_path = Path(args.checkpoint)
+    selected_device = args.device
+    if selected_device.startswith("cuda"):
+        try:
+            import torch
+
+            if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
+                selected_device = "cpu"
+        except ImportError:
+            selected_device = "cpu"
+    engine.command = [sys.executable, "-m", "zero_chess.uci"]
+    engine.command.extend(["--checkpoint", args.checkpoint])
+    engine.command.extend(
+        [
+            "--device",
+            selected_device,
+            "--simulations",
+            str(args.simulations),
+        ]
+    )
     import uvicorn
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+
 
 if __name__ == "__main__":
     main()

@@ -18,7 +18,6 @@ def game_result_to_value(result: str, perspective: int) -> float:
     return game_result_to_values(result)[perspective]
 
 
-
 def test_outcome_values_are_pure_zero_sum() -> None:
     assert game_result_to_value("1-0", 0) == WIN_VALUE
     assert game_result_to_value("1-0", 1) == LOSS_VALUE
@@ -53,4 +52,3 @@ def test_uci_time_pressure_aggression() -> None:
 
     less_time = engine._time_to_use(["wtime", "1000", "btime", "80000", "winc", "0", "binc", "0"])
     assert less_time == 150
-

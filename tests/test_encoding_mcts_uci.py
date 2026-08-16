@@ -24,6 +24,14 @@ def test_uci_position_command() -> None:
     assert engine.board.fen().startswith("rnbqkbnr/pppp1ppp/8/4p3/4P3")
 
 
+def test_uci_invalid_position_command_is_transactional() -> None:
+    engine = UCIEngine()
+    engine.handle("position startpos moves e2e4")
+    before = engine.board.fen()
+    engine.handle("position startpos moves e2e4 e7e5 a1a1")
+    assert engine.board.fen() == before
+
+
 def test_uci_does_not_reuse_tree_across_different_base_positions() -> None:
     engine = UCIEngine()
     engine.handle("position startpos moves e2e4")

@@ -41,7 +41,7 @@ export default function WatchPage() {
 
   // Connect socket
   useEffect(() => {
-    engine.connect();
+    void engine.connect().catch(() => setOnline(false));
     return engine.subscribe(setOnline);
   }, [engine]);
 
@@ -63,9 +63,13 @@ export default function WatchPage() {
 
     const timer = window.setTimeout(() => {
       setThinking(true);
+      const requestedGame = gameRef.current;
+      const requestedFen = requestedGame.fen();
+      const requestedTurn = requestedGame.turn();
       engine
-        .requestBestMove({ fen: game.fen(), move_time: Math.max(100, Math.floor(1000 / speed)) })
+        .requestBestMove({ fen: requestedFen, move_time: Math.max(100, Math.floor(1000 / speed)) })
         .then((response) => {
+          if (gameRef.current !== requestedGame || requestedGame.fen() !== requestedFen) return;
           if (response.move && response.move !== "0000") {
             const from = response.move.slice(0, 2) as Square;
             const to = response.move.slice(2, 4) as Square;
@@ -78,14 +82,16 @@ export default function WatchPage() {
                 else chessAudio.playMove();
                 if (game.isCheck()) chessAudio.playCheck();
               }
-              setEvaluation(response.evaluation);
+              setEvaluation(requestedTurn === "w" ? response.evaluation : -response.evaluation);
               setFen(game.fen());
               setHistory(game.history({ verbose: true }) as Move[]);
             }
           }
         })
         .catch(() => setOnline(false))
-        .finally(() => setThinking(false));
+        .finally(() => {
+          if (gameRef.current === requestedGame) setThinking(false);
+        });
     }, 550 / speed);
     return () => window.clearTimeout(timer);
   }, [fen, online, thinking, speed, gameKey, engine, soundEnabled, game]);
@@ -95,6 +101,7 @@ export default function WatchPage() {
     setFen(gameRef.current.fen());
     setHistory([]);
     setEvaluation(0);
+    setThinking(false);
     setGameKey((value) => value + 1);
   }
 
@@ -154,7 +161,7 @@ export default function WatchPage() {
                 </div>
                 <div className="flex items-center gap-1.5 mt-0.5">
                   <div className="flex text-lg leading-none tracking-tight select-none">
-                    {captured.b.map((p, idx) => (
+                    {captured.w.map((p, idx) => (
                       <span key={`zb-cap-${p}-${idx}`} className="text-zinc-500">
                         {symbols.b[p]}
                       </span>
@@ -205,7 +212,7 @@ export default function WatchPage() {
                 </div>
                 <div className="flex items-center gap-1.5 mt-0.5">
                   <div className="flex text-lg leading-none tracking-tight select-none">
-                    {captured.w.map((p, idx) => (
+                    {captured.b.map((p, idx) => (
                       <span key={`zw-cap-${p}-${idx}`} className="text-zinc-300">
                         {symbols.w[p]}
                       </span>

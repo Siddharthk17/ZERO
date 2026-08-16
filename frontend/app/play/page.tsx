@@ -22,6 +22,8 @@ const symbols: Record<"w" | "b", Record<string, string>> = {
 
 export default function PlayPage() {
   const gameRef = useRef(new Chess());
+  const gameEpoch = useRef(0);
+  const engineTimer = useRef<number | null>(null);
   const engine = useMemo(() => getEngineSocket(), []);
   
   // Game state
@@ -44,6 +46,10 @@ export default function PlayPage() {
   const [orientation, setOrientation] = useState<"white" | "black">("white");
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [activeTab, setActiveTab] = useState<"setup" | "moves">("setup");
+  const gameStartedRef = useRef(gameStarted);
+  const resultRef = useRef(result);
+  gameStartedRef.current = gameStarted;
+  resultRef.current = result;
 
   const game = gameRef.current;
   const legalMoves = selected ? legalTargets(game, selected) : [];
@@ -53,9 +59,15 @@ export default function PlayPage() {
 
   // Connect to engine socket
   useEffect(() => {
-    engine.connect();
+    void engine.connect().catch(() => setOnline(false));
     return engine.subscribe(setOnline);
   }, [engine]);
+
+  useEffect(() => {
+    return () => {
+      if (engineTimer.current !== null) window.clearTimeout(engineTimer.current);
+    };
+  }, []);
 
   // Handle countdown timer
   useEffect(() => {
@@ -64,6 +76,7 @@ export default function PlayPage() {
       if (game.turn() === "w") {
         setWhiteClock((value) => {
           if (value <= 1) {
+            gameEpoch.current += 1;
             setResult("Time Out (Black wins)");
             if (soundEnabled) chessAudio.playGameOver();
             return 0;
@@ -73,6 +86,7 @@ export default function PlayPage() {
       } else {
         setBlackClock((value) => {
           if (value <= 1) {
+            gameEpoch.current += 1;
             setResult("Time Out (White wins)");
             if (soundEnabled) chessAudio.playGameOver();
             return 0;
@@ -105,14 +119,27 @@ export default function PlayPage() {
 
   // Trigger engine calculation
   function maybeEngineMove() {
+    engineTimer.current = null;
+    if (!gameStartedRef.current || resultRef.current) {
+      setThinking(false);
+      return;
+    }
     const requestedGame = gameRef.current;
+    const requestedEpoch = gameEpoch.current;
     const requestedFen = requestedGame.fen();
-    if (!online || requestedGame.isGameOver()) return;
+    if (!engine.isOnline() || requestedGame.isGameOver()) {
+      setThinking(false);
+      return;
+    }
     setThinking(true);
     engine
       .requestBestMove({ fen: requestedFen, move_time: 1000 })
       .then((response) => {
-        if (gameRef.current !== requestedGame || requestedGame.fen() !== requestedFen) return;
+        if (
+          gameEpoch.current !== requestedEpoch ||
+          gameRef.current !== requestedGame ||
+          requestedGame.fen() !== requestedFen
+        ) return;
         if (response.move && response.move !== "0000") {
           const from = response.move.slice(0, 2) as Square;
           const to = response.move.slice(2, 4) as Square;
@@ -130,7 +157,14 @@ export default function PlayPage() {
         }
       })
       .catch(() => setOnline(false))
-      .finally(() => setThinking(false));
+      .finally(() => {
+        if (gameEpoch.current === requestedEpoch && gameRef.current === requestedGame) setThinking(false);
+      });
+  }
+
+  function scheduleEngineMove(delay: number) {
+    if (engineTimer.current !== null) window.clearTimeout(engineTimer.current);
+    engineTimer.current = window.setTimeout(maybeEngineMove, delay);
   }
 
   // Move validation and routing
@@ -141,7 +175,7 @@ export default function PlayPage() {
     const piece = game.get(from);
     if (!piece || piece.color !== playerColor) return false;
     
-    if (online && (thinking || game.turn() !== playerColor)) return false;
+    if (game.turn() !== playerColor || (online && thinking)) return false;
     
     const move = game.move({ from, to, promotion: promotion ?? "q" });
     if (!move) {
@@ -159,7 +193,7 @@ export default function PlayPage() {
     
     // Switch turn to engine
     if (!game.isGameOver()) {
-      window.setTimeout(maybeEngineMove, 300);
+      scheduleEngineMove(300);
     }
     return true;
   }
@@ -178,7 +212,7 @@ export default function PlayPage() {
 
   function onSquareClick(square: Square) {
     if (!gameStarted || game.isGameOver()) return;
-    if (online && (thinking || game.turn() !== playerColor)) return;
+    if (game.turn() !== playerColor || (online && thinking)) return;
     
     if (selected) {
       if (legalMoves.some((move) => move.to === square)) {
@@ -202,6 +236,8 @@ export default function PlayPage() {
 
   // Start new matchup
   function startGame(colorSelection: "w" | "b") {
+    if (engineTimer.current !== null) window.clearTimeout(engineTimer.current);
+    gameEpoch.current += 1;
     gameRef.current = new Chess();
     setFen(gameRef.current.fen());
     setHistory([]);
@@ -219,19 +255,29 @@ export default function PlayPage() {
     // If starting as Black, White engine moves first
     if (colorSelection === "b") {
       setThinking(true);
-      window.setTimeout(maybeEngineMove, 500);
+      scheduleEngineMove(500);
     }
   }
 
   function resign() {
     if (!gameStarted || result) return;
+    if (engineTimer.current !== null) window.clearTimeout(engineTimer.current);
+    gameEpoch.current += 1;
+    setThinking(false);
     setResult("Resignation (ZERO wins)");
     if (soundEnabled) chessAudio.playGameOver();
   }
 
   function rematch() {
+    if (engineTimer.current !== null) window.clearTimeout(engineTimer.current);
+    gameEpoch.current += 1;
+    gameRef.current = new Chess();
     setGameStarted(false);
     setActiveTab("setup");
+    setFen(gameRef.current.fen());
+    setHistory([]);
+    setSelected(null);
+    setThinking(false);
     setResult(null);
   }
 
@@ -247,14 +293,14 @@ export default function PlayPage() {
   const opponentName = playerColor === "w" ? "ZERO (Engine)" : "You";
   const opponentRating = playerColor === "w" ? "2450" : "1500";
   const opponentClock = playerColor === "w" ? blackClock : whiteClock;
-  const opponentCaptured = playerColor === "w" ? captured.b : captured.w;
+  const opponentCaptured = playerColor === "w" ? captured.w : captured.b;
   const opponentAdvantage = playerColor === "w" ? materialDiff.blackAdvantage : materialDiff.whiteAdvantage;
   const opponentClockActive = gameStarted && !result && (playerColor === "w" ? game.turn() === "b" : game.turn() === "w");
 
   const playerName = playerColor === "w" ? "You" : "ZERO (Engine)";
   const playerRating = playerColor === "w" ? "1500" : "2450";
   const playerClock = playerColor === "w" ? whiteClock : blackClock;
-  const playerCaptured = playerColor === "w" ? captured.w : captured.b;
+  const playerCaptured = playerColor === "w" ? captured.b : captured.w;
   const playerAdvantage = playerColor === "w" ? materialDiff.whiteAdvantage : materialDiff.blackAdvantage;
   const playerClockActive = gameStarted && !result && (playerColor === "w" ? game.turn() === "w" : game.turn() === "b");
 
