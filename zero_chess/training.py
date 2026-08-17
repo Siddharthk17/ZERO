@@ -6,7 +6,6 @@ import concurrent.futures
 import json
 import math
 import os
-import random
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -82,9 +81,7 @@ class TrainConfig:
         if self.batch_size <= 0 or self.total_steps <= 0 or self.warmup_steps < 0:
             raise ValueError("training step counts and batch_size must be valid")
         if self.opponent_policy_loss_weight > 0.0:
-            raise ValueError(
-                "opponent_policy_loss_weight is disabled until the target stores the conditioning move"
-            )
+            raise ValueError("opponent_policy_loss_weight is disabled until the target stores the conditioning move")
 
 
 class ContinuousLRScheduler:
@@ -139,6 +136,7 @@ class TrainingLogger:
                 "material_loss",
                 "moves_left_loss",
                 "opponent_policy_loss",
+                "policy_target_weight",
                 "value_error",
             )
             if any(key in row for row in self.window)
@@ -214,6 +212,35 @@ def _encode_experience(exp: Experience) -> tuple[torch.Tensor, torch.Tensor]:
 
     mask = encode_move_mask(legal, board, device="cpu")
     return planes, mask
+
+
+def _encode_batch(experiences: list[Experience]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Encode a batch through Rust when the native extension is available."""
+    try:
+        from .rust_bridge import _engine
+
+        native = _engine()
+        encode_native = getattr(native, "encode_training_batch")
+    except (AttributeError, ImportError, OSError, RuntimeError):
+        encoded = list(_ENCODING_EXECUTOR.map(_encode_experience, experiences))
+        return torch.stack([row[0] for row in encoded]), torch.stack([row[1] for row in encoded])
+
+    input_bytes, mask_bytes = encode_native(
+        [exp.fen for exp in experiences],
+        [list(exp.history_fens) for exp in experiences],
+        [exp.repetitions for exp in experiences],
+        [list(exp.history_repetitions) for exp in experiences],
+    )
+    input_tensor = torch.frombuffer(input_bytes, dtype=torch.float32).clone()
+    mask_tensor = torch.frombuffer(mask_bytes, dtype=torch.uint8).clone()
+    expected_inputs = len(experiences) * 121 * 8 * 8
+    expected_mask = len(experiences) * POLICY_SIZE
+    if input_tensor.numel() != expected_inputs or mask_tensor.numel() != expected_mask:
+        raise RuntimeError("native training encoder returned an invalid buffer size")
+    return (
+        input_tensor.reshape(len(experiences), 121, 8, 8),
+        mask_tensor.reshape(len(experiences), POLICY_SIZE).to(dtype=torch.float32),
+    )
 
 
 def _policy_from_exp(exp: Experience) -> torch.Tensor:
@@ -302,19 +329,23 @@ def _augment_batch(
     opponent_policy_targets: torch.Tensor,
     opponent_mask: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if random.random() < 0.5:
-        x_flipped = torch.flip(x, dims=[-1]).clone()
-
+    flip = torch.rand(x.shape[0]) < 0.5
+    if flip.any():
+        x_flipped = torch.flip(x[flip], dims=[-1]).clone()
         extra = 8 * 14
         x_flipped[:, [extra + 1, extra + 2]] = x_flipped[:, [extra + 2, extra + 1]].clone()
         x_flipped[:, [extra + 3, extra + 4]] = x_flipped[:, [extra + 4, extra + 3]].clone()
+        x = x.clone()
+        x[flip] = x_flipped
 
-        policy_flipped = _flip_policy_horizontally(policy_targets)
-        mask_flipped = _flip_policy_horizontally(move_mask)
-        opponent_policy_flipped = _flip_policy_horizontally(opponent_policy_targets)
-        opponent_mask_flipped = _flip_policy_horizontally(opponent_mask)
-
-        return x_flipped, mask_flipped, policy_flipped, opponent_policy_flipped, opponent_mask_flipped
+        move_mask = move_mask.clone()
+        move_mask[flip] = _flip_policy_horizontally(move_mask[flip])
+        policy_targets = policy_targets.clone()
+        policy_targets[flip] = _flip_policy_horizontally(policy_targets[flip])
+        opponent_policy_targets = opponent_policy_targets.clone()
+        opponent_policy_targets[flip] = _flip_policy_horizontally(opponent_policy_targets[flip])
+        opponent_mask = opponent_mask.clone()
+        opponent_mask[flip] = _flip_policy_horizontally(opponent_mask[flip])
     return x, move_mask, policy_targets, opponent_policy_targets, opponent_mask
 
 
@@ -334,9 +365,7 @@ def train_step(
     model.train()
     beta = replay.anneal_beta(iteration, config.total_steps)
     batch = replay.sample_with_weights(config.batch_size, beta=beta)
-    encoded = list(_ENCODING_EXECUTOR.map(_encode_experience, batch.experiences))
-    x = torch.stack([row[0] for row in encoded])
-    mask = torch.stack([row[1] for row in encoded])
+    x, mask = _encode_batch(batch.experiences)
     policy_targets = torch.stack([_policy_from_exp(exp) for exp in batch.experiences])
     opponent_mask = torch.stack([_opponent_move_mask(exp) for exp in batch.experiences])
     wdl_targets = torch.tensor([exp.wdl for exp in batch.experiences], dtype=torch.float32)
@@ -354,6 +383,7 @@ def train_step(
     moves_left_targets = torch.tensor([[exp.moves_left] for exp in batch.experiences], dtype=torch.float32)
     opponent_policy_targets = torch.zeros((len(batch.experiences), POLICY_SIZE), dtype=torch.float32)
     opponent_policy_available = torch.zeros(len(batch.experiences), dtype=torch.float32)
+    policy_target_weights = torch.tensor([exp.policy_weight for exp in batch.experiences], dtype=torch.float32)
     for row, exp in enumerate(batch.experiences):
         if exp.opponent_policy:
             for index, probability in exp.opponent_policy.items():
@@ -367,9 +397,7 @@ def train_step(
 
     device = torch.device(config.device)
     model_device = next(model.parameters()).device
-    if model_device.type != device.type or (
-        device.index is not None and model_device.index != device.index
-    ):
+    if model_device.type != device.type or (device.index is not None and model_device.index != device.index):
         raise ValueError(f"model is on {model_device}, but training device is {device}")
     tensors = (
         x,
@@ -382,6 +410,7 @@ def train_step(
         moves_left_targets,
         opponent_policy_targets,
         opponent_policy_available,
+        policy_target_weights,
         sample_weights,
         terminal_targets,
     )
@@ -400,6 +429,7 @@ def train_step(
         moves_left_targets,
         opponent_policy_targets,
         opponent_policy_available,
+        policy_target_weights,
         sample_weights,
         terminal_targets,
     ) = tensors
@@ -426,16 +456,18 @@ def train_step(
             dim=-1
         )
 
-        policy_loss = _weighted_mean(policy_loss_vec, sample_weights)
+        policy_loss = _weighted_mean(policy_loss_vec, sample_weights * policy_target_weights)
         value_loss = _weighted_mean(value_loss_vec, sample_weights)
         wdl_loss = _weighted_mean(wdl_loss_vec, sample_weights * terminal_targets.squeeze(-1).float())
         material_loss = _weighted_mean(material_loss_vec, sample_weights)
         moves_left_loss = _weighted_mean(moves_left_loss_vec, sample_weights)
         opponent_denominator = (
-            (sample_weights * opponent_policy_available).sum().clamp_min(torch.finfo(sample_weights.dtype).eps)
+            (sample_weights * opponent_policy_available * policy_target_weights)
+            .sum()
+            .clamp_min(torch.finfo(sample_weights.dtype).eps)
         )
         opponent_policy_loss = (
-            opponent_policy_loss_vec * sample_weights * opponent_policy_available
+            opponent_policy_loss_vec * sample_weights * opponent_policy_available * policy_target_weights
         ).sum() / opponent_denominator
 
         loss = (
@@ -468,7 +500,7 @@ def train_step(
         ).sum(dim=-1)
         replay.update_priorities(
             batch.indices,
-            (value_errors + policy_kl).float().cpu().tolist(),
+            (value_errors + policy_kl * policy_target_weights).float().cpu().tolist(),
             batch.generations,
         )
 
@@ -481,6 +513,7 @@ def train_step(
         "material_loss": float(material_loss.detach().cpu()),
         "moves_left_loss": float(moves_left_loss.detach().cpu()),
         "opponent_policy_loss": float(opponent_policy_loss.detach().cpu()),
+        "policy_target_weight": float(policy_target_weights.detach().mean().cpu()),
         "policy_entropy": float(entropy.detach().cpu()),
         "value_error": float((value_pred - hybrid_value_targets.squeeze(-1)).abs().mean().detach().cpu()),
         "grad_norm": float(min(float(grad_norm.detach().cpu()), config.grad_clip)),

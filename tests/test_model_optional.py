@@ -4,7 +4,7 @@ torch = pytest.importorskip("torch")
 
 from zero_chess import Board
 from zero_chess.encoding import INPUT_CHANNELS, POLICY_SIZE, encode_board, encode_move_mask
-from zero_chess.model import ConvResidualBlock, ModelConfig, ZeroNet, _TorchScriptDeploymentWrapper
+from zero_chess.model import ConvResidualBlock, ModelConfig, ZeroNet, _TorchScriptDeploymentWrapper, export_torchscript
 
 
 def test_tiny_model_forward_shapes() -> None:
@@ -47,6 +47,17 @@ def test_deployment_wrapper_uses_the_training_value_definition() -> None:
         trained = model(x, mask)
     assert torch.allclose(deployed_wdl, trained["wdl"])
     assert torch.allclose(deployed_value, trained["value"])
+
+
+def test_torchscript_export_supports_dynamic_batch(tmp_path) -> None:
+    model = ZeroNet(ModelConfig(channels=8, blocks=1, policy_channels=2)).eval()
+    path = export_torchscript(tmp_path / "deployment.ts", model, "cpu")
+    deployment = torch.jit.load(str(path), map_location="cpu")
+    with torch.inference_mode():
+        policy, value, wdl = deployment(torch.zeros(3, 121, 8, 8), torch.ones(3, POLICY_SIZE))
+    assert policy.shape == (3, POLICY_SIZE)
+    assert value.shape == (3, 1)
+    assert wdl.shape == (3, 3)
 
 
 def test_tower_block_pattern() -> None:

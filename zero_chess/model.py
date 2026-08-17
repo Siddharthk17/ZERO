@@ -351,7 +351,14 @@ def export_torchscript(path: str | Path, model: ZeroNet, device: str | torch.dev
     tmp_path = path.with_suffix(".tmp")
 
     with torch.inference_mode():
-        traced = torch.jit.trace(deployment, (example_x, example_mask), check_trace=False)
+        traced = torch.jit.trace(deployment, (example_x, example_mask), check_trace=True)
+        validation_x = torch.zeros((2, model.config.input_channels, 8, 8), device=dev, dtype=dtype)
+        validation_mask = torch.ones((2, model.config.policy_size), device=dev, dtype=torch.float32)
+        policy, value, wdl = traced(validation_x, validation_mask)
+        if policy.shape != (2, model.config.policy_size) or value.shape != (2, 1) or wdl.shape != (2, 3):
+            raise RuntimeError("TorchScript export failed dynamic-batch validation")
+        if not all(torch.isfinite(output).all().item() for output in (policy, value, wdl)):
+            raise RuntimeError("TorchScript export produced non-finite validation outputs")
         traced.save(str(tmp_path))
     tmp_path.replace(path)
     digest = hashlib.sha256(path.read_bytes()).hexdigest()

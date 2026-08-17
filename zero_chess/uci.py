@@ -174,7 +174,7 @@ class UCIEngine:
             for move_str in added_moves:
                 resolved_move = self._resolve_legal_move(self.board, move_str)
                 self._record_and_push(resolved_move)
-                self.mcts.advance_to(resolved_move)
+                self.mcts.advance_to(resolved_move, history=self.position_history)
             self.played_moves = new_moves
         else:
             # Full Reset
@@ -223,7 +223,7 @@ class UCIEngine:
                         temperature=0.0,
                         add_noise=False,
                         history=self.position_history,
-                            stop_event=stop_event,
+                        stop_event=stop_event,
                     )
                 elif "wtime" in args or "btime" in args:
                     ms = self._time_to_use(args)
@@ -233,7 +233,7 @@ class UCIEngine:
                         temperature=0.0,
                         add_noise=False,
                         history=self.position_history,
-                            stop_event=stop_event,
+                        stop_event=stop_event,
                     )
                 else:
                     simulations = self._simulations_for_go(args)
@@ -243,7 +243,7 @@ class UCIEngine:
                         temperature=0.0,
                         add_noise=False,
                         history=self.position_history,
-                            stop_event=stop_event,
+                        stop_event=stop_event,
                     )
                 if token != self._search_token:
                     return

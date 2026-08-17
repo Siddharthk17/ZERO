@@ -14,7 +14,7 @@ from pathlib import Path
 
 import torch
 
-from zero_chess.arena import gate_checkpoints
+from zero_chess.arena import accept_gate_result, gate_checkpoints
 from zero_chess.checkpoint import CheckpointManager
 from zero_chess.model import (
     ModelConfig,
@@ -120,6 +120,7 @@ class ContinuousSelfPlayWorker(threading.Thread):
                     batch_size=self.args.eval_batch_size,
                     device=self.args.device,
                     seed=(self.args.seed + iteration * 1000) % 1_000_000,
+                    fast_search_weight=self.args.fast_search_weight,
                 )
                 if self._stop_requested.is_set():
                     break
@@ -168,9 +169,7 @@ class ContinuousSelfPlayWorker(threading.Thread):
                 and self.active_since is not None
                 and time.monotonic() - self.active_since > self.args.self_play_timeout
             ):
-                self.fatal_error = (
-                    f"native self-play stalled for more than {self.args.self_play_timeout:.0f} seconds"
-                )
+                self.fatal_error = f"native self-play stalled for more than {self.args.self_play_timeout:.0f} seconds"
             return self.fatal_error
 
 
@@ -181,6 +180,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--days", type=float, default=31.0)
     parser.add_argument("--games-per-batch", "--games-per-iteration", dest="games_per_batch", type=int, default=128)
     parser.add_argument("--simulations", type=int, default=400)
+    parser.add_argument("--fast-search-weight", type=float, default=0.25)
     parser.add_argument("--eval-batch-size", type=int, default=256)
     parser.add_argument("--training-batch-size", type=int, default=1024)
     parser.add_argument("--channels", type=int, default=256)
@@ -192,9 +192,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--replay-path", type=Path, default=Path("checkpoints/zero_x/replay.pkl"))
     parser.add_argument("--history-path", type=Path, default=Path("data/training_games.jsonl"))
     parser.add_argument("--candidate-interval", type=int, default=5_000)
-    parser.add_argument("--gate-games", type=int, default=40)
+    parser.add_argument("--gate-games", type=int, default=80)
     parser.add_argument("--gate-simulations", type=int, default=64)
     parser.add_argument("--gate-device", default="cpu")
+    parser.add_argument("--gate-batch-size", type=int, default=8)
+    parser.add_argument("--gate-workers", type=int, default=0, help="0 selects min(games, 24) native gate workers")
+    parser.add_argument("--gate-min-score", type=float, default=0.50)
+    parser.add_argument("--gate-lower-bound", type=float, default=0.45)
     parser.add_argument("--replay-save-interval", type=int, default=5_000)
     parser.add_argument("--shutdown-timeout", type=float, default=300.0)
     parser.add_argument("--self-play-timeout", type=float, default=600.0)
@@ -217,6 +221,8 @@ def main() -> None:
         raise SystemExit("--games-per-batch must be positive")
     if args.simulations <= 0:
         raise SystemExit("--simulations must be positive")
+    if not 0.0 <= args.fast_search_weight <= 1.0:
+        raise SystemExit("--fast-search-weight must be in 0..=1")
     if not 1 <= args.eval_batch_size <= 256:
         raise SystemExit("--eval-batch-size must be in 1..=256")
     if args.training_batch_size <= 0:
@@ -241,6 +247,14 @@ def main() -> None:
         raise SystemExit("--gate-games must be a positive even number")
     if args.gate_simulations <= 0:
         raise SystemExit("--gate-simulations must be positive")
+    if not 1 <= args.gate_batch_size <= 256:
+        raise SystemExit("--gate-batch-size must be in 1..=256")
+    if not 0 <= args.gate_workers <= 24:
+        raise SystemExit("--gate-workers must be in 0..=24")
+    if not 0.0 <= args.gate_min_score <= 1.0:
+        raise SystemExit("--gate-min-score must be in 0..=1")
+    if not 0.0 <= args.gate_lower_bound <= args.gate_min_score:
+        raise SystemExit("--gate-lower-bound must be in 0..=--gate-min-score")
 
     configure_blackwell(args.device)
     if torch.device(args.device).type == "cuda" and not torch.cuda.is_available():
@@ -439,9 +453,16 @@ def main() -> None:
                             device=args.gate_device,
                             seed=args.seed + step,
                             log_path="logs/gate.jsonl",
+                            incumbent_deployment_path=(deployment_path if args.gate_device == args.device else None),
+                            batch_size=args.gate_batch_size,
+                            workers=args.gate_workers,
                         )
                         gate_metrics = gate.as_dict()
-                        accepted = gate.score_low > 0.5
+                        accepted = accept_gate_result(
+                            gate,
+                            min_score=args.gate_min_score,
+                            min_lower_bound=args.gate_lower_bound,
+                        )
                         print(
                             f"\n[GATE step={step}] score={gate.score_fraction:.3f} "
                             f"CI=[{gate.score_low:.3f},{gate.score_high:.3f}] "

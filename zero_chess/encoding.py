@@ -41,11 +41,6 @@ def orient_square(sq: int, turn: int) -> int:
     return sq if turn == WHITE else 63 - sq
 
 
-def deorient_square(sq: int, turn: int) -> int:
-    """Convert oriented coordinate back to actual board index."""
-    return sq if turn == WHITE else 63 - sq
-
-
 def move_to_policy_index(board: Board, move: Move) -> int:
     """Map a legal move to one of 4672 AlphaZero-style policy logits."""
     from_sq = orient_square(move.from_sq, board.turn)

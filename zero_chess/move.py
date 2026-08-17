@@ -13,13 +13,10 @@ QUEEN_CASTLE = 1 << 3
 EN_PASSANT = 1 << 4
 PROMOTION = 1 << 5
 
-PROMO_TO_CODE = {None: 0, "N": 1, "B": 2, "R": 3, "Q": 4}
-CODE_TO_PROMO = {v: k for k, v in PROMO_TO_CODE.items()}
-
 
 @dataclass(frozen=True, slots=True)
 class Move:
-    """Represents a lightweight, immutable, bit-packed chess move."""
+    """Represents a lightweight, immutable chess move."""
 
     from_sq: int
     to_sq: int
@@ -57,20 +54,6 @@ class Move:
     def is_castling(self) -> bool:
         """Check if the move is castling."""
         return bool(self.flags & (KING_CASTLE | QUEEN_CASTLE))
-
-    def encode(self) -> int:
-        """Pack move attributes into a 32-bit integer."""
-        promo = PROMO_TO_CODE[self.promotion]
-        return self.from_sq | (self.to_sq << 6) | (promo << 12) | (self.flags << 16)
-
-    @classmethod
-    def decode(cls, value: int) -> "Move":
-        """Unpack a 32-bit integer back into a structured Move object."""
-        from_sq = value & 0x3F
-        to_sq = (value >> 6) & 0x3F
-        promo = CODE_TO_PROMO[(value >> 12) & 0x7]
-        flags = value >> 16
-        return cls(from_sq, to_sq, promo, flags)
 
     def uci(self) -> str:
         """Return the standard Universal Chess Interface (UCI) string (e.g. 'e2e4')."""

@@ -14,10 +14,13 @@ use crate::mcts::{is_claimable_draw, is_dead_position, Mcts, MctsError, SearchCo
 
 #[derive(Clone, Copy)]
 pub struct SelfPlayConfig {
-    /// Simulation budget for the policy-labelled, full-search PCR plies.
+    /// Simulation budget for high-confidence PCR plies.
     pub simulations: u32,
     pub fast_simulations: u32,
     pub full_search_probability: f64,
+    /// Relative confidence assigned to policy targets produced by fast PCR
+    /// searches. Full-search targets always use weight `1.0`.
+    pub fast_search_weight: f32,
     pub search_batch_size: usize,
     pub max_plies: usize,
     pub workers: usize,
@@ -30,6 +33,7 @@ impl Default for SelfPlayConfig {
             simulations: 400,
             fast_simulations: 35,
             full_search_probability: 0.20,
+            fast_search_weight: 0.25,
             search_batch_size: 64,
             max_plies: 512,
             workers: 24,
@@ -45,6 +49,10 @@ pub struct Experience {
     /// position has at most 218 legal moves, so transferring a dense 4,672
     /// float vector through PyO3 would waste bandwidth and RAM.
     pub policy: Vec<(u16, f32)>,
+    /// Confidence weight for the policy target produced by this search.
+    /// Fast PCR positions remain useful training data, but their policy target
+    /// is noisier than a full-search target.
+    pub policy_weight: f32,
     pub value: f32,
     pub wdl: [f32; 3],
     /// Terminal targets are valid for WDL training; truncated targets are not.
@@ -54,8 +62,8 @@ pub struct Experience {
     pub moves_left: f32,
     /// Occurrence count for `fen` at the time it was evaluated.
     pub repetitions: u8,
-    /// Policy target for the immediately following full-search ply, when it
-    /// exists. Its coordinates use that opponent-to-move position's frame.
+    /// Policy target for the immediately following ply, when it exists. Its
+    /// coordinates use that opponent-to-move position's frame.
     pub opponent_policy: Option<Vec<(u16, f32)>>,
     pub opponent_legal_policy: Option<Vec<u16>>,
     pub history_fens: Vec<String>,
@@ -77,6 +85,7 @@ struct PendingPosition {
     history_fens: Vec<String>,
     history_repetitions: Vec<u8>,
     policy: Vec<(u16, f32)>,
+    policy_weight: f32,
     legal_policy: Vec<u16>,
     q_mcts: f32,
     material: (f32, f32),
@@ -101,6 +110,11 @@ pub fn generate_self_play(
     {
         return Err(MctsError::InvalidConfig(
             "full_search_probability must be in [0, 1]",
+        ));
+    }
+    if !config.fast_search_weight.is_finite() || !(0.0..=1.0).contains(&config.fast_search_weight) {
+        return Err(MctsError::InvalidConfig(
+            "fast_search_weight must be finite and in [0, 1]",
         ));
     }
     if config.search_batch_size == 0 || config.search_batch_size > crate::mcts::MAX_BATCH {
@@ -183,32 +197,36 @@ fn play_game(
         let Some(chess_move) = result.best_move else {
             return finalize_draw(pending, played_moves, "no_legal_move");
         };
-        // Record training experience ONLY for full-search moves to keep policy targets ultra-clean
-        if is_full_search {
-            let policy = sparse_policy(&board, &result.visits);
-            let legal_policy = legal_policy_indices(&board);
-            let material = piece_material(&board);
-            pending.push(PendingPosition {
-                fen: board.to_string(),
-                history_fens: history
-                    .iter()
-                    .take(7)
-                    .map(|entry| entry.board.to_string())
-                    .collect(),
-                history_repetitions: history
-                    .iter()
-                    .take(7)
-                    .map(|entry| entry.repetitions)
-                    .collect(),
-                policy,
-                legal_policy,
-                q_mcts: result.root_value,
-                material,
-                repetitions,
-                side_to_move_is_white: board.side_to_move() == cozy_chess::Color::White,
-                ply,
-            });
-        }
+        // PCR retains every position. Fast searches use a reduced target
+        // confidence rather than throwing away the generated game data.
+        let policy = sparse_policy(&board, &result.visits);
+        let legal_policy = legal_policy_indices(&board);
+        let material = piece_material(&board);
+        pending.push(PendingPosition {
+            fen: board.to_string(),
+            history_fens: history
+                .iter()
+                .take(7)
+                .map(|entry| entry.board.to_string())
+                .collect(),
+            history_repetitions: history
+                .iter()
+                .take(7)
+                .map(|entry| entry.repetitions)
+                .collect(),
+            policy,
+            policy_weight: if is_full_search {
+                1.0
+            } else {
+                config.fast_search_weight
+            },
+            legal_policy,
+            q_mcts: result.root_value,
+            material,
+            repetitions,
+            side_to_move_is_white: board.side_to_move() == cozy_chess::Color::White,
+            ply,
+        });
         played_moves.push(standard_uci(&board, chess_move));
         if history.len() == history.capacity() {
             // Game history is bounded by max_plies, so this only occurs if a
@@ -354,6 +372,7 @@ fn finalize(
         experiences.push(Experience {
             fen: position.fen.clone(),
             policy: position.policy.clone(),
+            policy_weight: position.policy_weight,
             value,
             wdl: value_to_wdl(value),
             target_kind: "terminal",
@@ -407,6 +426,7 @@ fn finalize_draw(
                 Experience {
                     fen: position.fen.clone(),
                     policy: position.policy.clone(),
+                    policy_weight: position.policy_weight,
                     value: 0.0,
                     wdl: [0.0, 1.0, 0.0],
                     target_kind,
@@ -432,9 +452,12 @@ fn normalized_moves_left(total_plies: usize, ply: usize) -> f32 {
 
 #[inline]
 fn repetition_count(board: &Board, history: &[HistoryPosition]) -> u8 {
+    let position_hash = board.hash_without_ep();
     history
         .iter()
-        .filter(|entry| entry.board.same_position(board))
+        .filter(|entry| {
+            entry.board.hash_without_ep() == position_hash && entry.board.same_position(board)
+        })
         .count()
         .saturating_add(1)
         .min(u8::MAX as usize) as u8
@@ -448,5 +471,45 @@ fn value_to_wdl(value: f32) -> [f32; 3] {
         [0.0, 0.0, 1.0]
     } else {
         [0.0, 1.0, 0.0]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn fast_search_weight_is_validated() {
+        let evaluator = SharedGpuEvaluator::uniform(1, 1, Duration::ZERO);
+        let config = SelfPlayConfig {
+            fast_search_weight: f32::NAN,
+            ..SelfPlayConfig::default()
+        };
+        let result = generate_self_play(evaluator.clone(), 0, config, 0);
+        assert!(matches!(result, Err(MctsError::InvalidConfig(_))));
+        evaluator.shutdown();
+    }
+
+    #[test]
+    fn finalized_targets_preserve_policy_weight() {
+        let position = PendingPosition {
+            fen: "8/8/8/8/8/8/8/K6k w - - 0 1".to_owned(),
+            history_fens: Vec::new(),
+            history_repetitions: Vec::new(),
+            policy: vec![(0, 1.0)],
+            policy_weight: 0.25,
+            legal_policy: vec![0],
+            q_mcts: 0.0,
+            material: (0.0, 0.0),
+            repetitions: 1,
+            side_to_move_is_white: true,
+            ply: 0,
+        };
+        let game =
+            finalize_draw(vec![position], Vec::new(), "max_plies").expect("target finalization");
+        assert_eq!(game.experiences[0].policy_weight, 0.25);
+        assert_eq!(game.experiences[0].target_kind, "truncated");
     }
 }

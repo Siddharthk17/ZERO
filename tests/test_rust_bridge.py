@@ -40,6 +40,44 @@ def test_native_extension_board_smoke_when_built() -> None:
     assert castle.fen().startswith("r3k2r/8/8/8/8/8/8/R4RK1 b")
 
 
+def test_native_bulk_training_encoder_matches_python_when_built() -> None:
+    import importlib
+
+    import torch
+
+    from zero_chess.encoding import encode_board, encode_move_mask
+
+    try:
+        engine = importlib.import_module("zero_rust_engine")
+    except ImportError:
+        try:
+            engine = importlib.import_module("zero_chess.zero_rust_engine")
+        except ImportError:
+            import pytest
+
+            pytest.skip("native extension is not built")
+    if not hasattr(engine, "encode_training_batch"):
+        import pytest
+
+        pytest.skip("native extension predates the bulk training encoder")
+
+    board = Board.starting_position()
+    previous = board.copy()
+    board.push_uci("e2e4")
+    input_bytes, mask_bytes = engine.encode_training_batch(
+        [board.fen()],
+        [[previous.fen()]],
+        [1],
+        [[1]],
+    )
+    native_input = torch.frombuffer(input_bytes, dtype=torch.float32).clone()
+    native_mask = torch.frombuffer(mask_bytes, dtype=torch.uint8).clone()
+    expected_input = encode_board(board, history=[previous]).flatten()
+    expected_mask = encode_move_mask(board.legal_moves(), board)
+    assert torch.equal(native_input, expected_input)
+    assert torch.equal(native_mask.to(dtype=torch.float32), expected_mask)
+
+
 def test_sparse_rust_policy_is_checked_against_legal_moves() -> None:
     board = Board.starting_position()
     move = next(move for move in board.legal_moves() if move.uci() == "e2e4")

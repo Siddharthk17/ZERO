@@ -37,6 +37,32 @@ def test_experience_accepts_truncated_targets_without_relabeling_them() -> None:
         Experience(board.fen(), {}, (0.0, 1.0, 0.0), target_kind="unknown")
 
 
+def test_native_policy_indices_skip_redundant_legal_move_validation() -> None:
+    board = Board()
+    move = board.legal_moves()[0]
+    from zero_chess.encoding import move_to_policy_index
+
+    exp = Experience(
+        board.fen(),
+        {move_to_policy_index(board, move): 1.0},
+        (0.0, 1.0, 0.0),
+        policy_validated=True,
+        policy_weight=0.25,
+    )
+    assert exp.policy == {move_to_policy_index(board, move): 1.0}
+    assert exp.policy_weight == 0.25
+
+
+def test_legacy_experience_state_defaults_new_pcr_fields() -> None:
+    board = Board()
+    exp = Experience(board.fen(), {}, (0.0, 1.0, 0.0))
+    state = {name: getattr(exp, name) for name in exp.__slots__ if name not in {"policy_weight", "policy_validated"}}
+    restored = object.__new__(Experience)
+    restored.__setstate__((None, state))
+    assert restored.policy_weight == 1.0
+    assert restored.policy_validated is False
+
+
 def test_model_evaluation_restores_training_mode() -> None:
     torch = pytest.importorskip("torch")
     from zero_chess.model import ModelConfig, ZeroNet
@@ -85,44 +111,15 @@ def test_network_evaluator_receives_history_from_mcts() -> None:
     assert max(model.history_lengths) >= 1
 
 
-def test_shared_batch_evaluator_preserves_history() -> None:
-    from zero_chess.mcts import MCTS, NetworkEvaluator, SharedBatchEvaluator
-
-    class CaptureModel:
-        def __init__(self) -> None:
-            self.history_lengths: list[int] = []
-
-        def eval(self) -> None:
-            return None
-
-        def evaluate_batch(self, boards, device, histories=None):
-            self.history_lengths.extend(len(history or []) for history in (histories or []))
-            return [({move: 1.0 for move in board.legal_moves()}, 0.0, 0.0) for board in boards]
-
-    model = CaptureModel()
-    evaluator = SharedBatchEvaluator(
-        NetworkEvaluator(model, "cpu"), device="cpu", max_batch_size=2, max_wait_ms=0
-    )
-    try:
-        board = Board()
-        previous = board.copy()
-        board.push_uci("e2e4")
-        MCTS(evaluator, batch_size=1, add_noise=False).search(
-            board, num_simulations=1, add_noise=False, history=[previous]
-        )
-        assert max(model.history_lengths) >= 1
-    finally:
-        evaluator.close()
-
-
 def test_arena_gate_reports_balanced_uniform_match() -> None:
-    from zero_chess.arena import play_match
+    from zero_chess.arena import accept_gate_result, play_match
     from zero_chess.mcts import UniformEvaluator
 
     result = play_match(UniformEvaluator(), UniformEvaluator(), games=2, simulations=1, max_plies=8)
     assert result.games == 2
     assert result.wins_a + result.wins_b + result.draws == 2
     assert 0.0 <= result.score_low <= result.score_fraction <= result.score_high <= 1.0
+    assert not accept_gate_result(result)
 
 
 def test_training_supports_non_default_value_bin_count() -> None:
@@ -175,9 +172,3 @@ def test_two_hot_target_uses_input_dtype_and_validates_bin_count() -> None:
     assert torch.allclose(encoded.sum(dim=1), torch.ones(1, dtype=torch.float64))
     with pytest.raises(ValueError, match="at least 2"):
         compute_two_hot_target(target, num_bins=1)
-
-
-def test_truncated_experience_value_uses_q_only() -> None:
-    board = Board()
-    exp = Experience(board.fen(), {}, (1.0, 0.0, 0.0), target_kind="truncated", q_mcts=-0.25)
-    assert exp.value == pytest.approx(-0.25)

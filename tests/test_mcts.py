@@ -97,6 +97,18 @@ def test_tree_reuse_preserves_child_stats() -> None:
     assert mcts.root.visit_count == visits
 
 
+def test_tree_reuse_does_not_cross_history_contexts() -> None:
+    board = Board()
+    mcts = MCTS(UniformEvaluator(), batch_size=2, add_noise=False)
+    result = mcts.search(board, num_simulations=4, history=[])
+    board.push(result.move)
+    previous = Board()
+    previous.push_uci("e2e4")
+    mcts.advance_to(result.move, history=[previous])
+    mcts.search(board, num_simulations=0, history=[])
+    assert mcts.root is not result.root.children[result.move]
+
+
 def test_temperature_zero_and_nonzero_selection() -> None:
     board = Board()
     moves = board.legal_moves()[:2]

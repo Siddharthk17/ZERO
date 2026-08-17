@@ -608,7 +608,9 @@ impl Mcts {
                 if branch_history.try_push(board.clone()).is_err() {
                     self.backup(&path, 0.0)?;
                     terminal_count += 1;
-                    break;
+                    // This path is already accounted for. Do not fall
+                    // through into virtual-loss or leaf submission below.
+                    continue;
                 }
                 board.play(chess_move);
                 repetitions = count_repetitions(&board, root_history, &branch_history);
@@ -983,14 +985,20 @@ pub fn is_claimable_draw(
         for chess_move in moves {
             let mut next = board.clone();
             next.play(chess_move);
+            let next_hash = next.hash_without_ep();
             let occurrences = 1
                 + history
                     .iter()
-                    .filter(|entry| entry.board.same_position(&next))
+                    .filter(|entry| {
+                        entry.board.hash_without_ep() == next_hash
+                            && entry.board.same_position(&next)
+                    })
                     .count()
                 + branch_history
                     .iter()
-                    .filter(|entry| entry.same_position(&next))
+                    .filter(|entry| {
+                        entry.hash_without_ep() == next_hash && entry.same_position(&next)
+                    })
                     .count();
             if occurrences >= 3 {
                 return true;
@@ -1045,13 +1053,16 @@ fn count_repetitions(
     root_history: &[HistoryPosition],
     branch_history: &[Board],
 ) -> u8 {
+    let position_hash = board.hash_without_ep();
     (1 + root_history
         .iter()
-        .filter(|entry| entry.board.same_position(board))
+        .filter(|entry| {
+            entry.board.hash_without_ep() == position_hash && entry.board.same_position(board)
+        })
         .count()
         + branch_history
             .iter()
-            .filter(|entry| entry.same_position(board))
+            .filter(|entry| entry.hash_without_ep() == position_hash && entry.same_position(board))
             .count())
     .min(u8::MAX as usize) as u8
 }

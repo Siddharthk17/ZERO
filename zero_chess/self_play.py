@@ -22,6 +22,7 @@ class SelfPlayConfig:
     batch_size: int = 256
     device: str = "cuda"
     seed: int | None = None
+    fast_search_weight: float = 0.25
 
 
 def generate(config: SelfPlayConfig, model_path: str) -> dict:
@@ -34,6 +35,7 @@ def generate(config: SelfPlayConfig, model_path: str) -> dict:
             batch_size=config.batch_size,
             device=config.device,
             seed=config.seed,
+            fast_search_weight=config.fast_search_weight,
         )
     )
 
@@ -46,6 +48,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int)
+    parser.add_argument("--fast-search-weight", type=float, default=0.25)
     parser.add_argument("--out", type=Path, help="Optional JSON output path")
     args = parser.parse_args(argv)
     result = generate(
@@ -55,6 +58,7 @@ def main(argv: list[str] | None = None) -> None:
             batch_size=args.batch_size,
             device=args.device,
             seed=args.seed,
+            fast_search_weight=args.fast_search_weight,
         ),
         args.model,
     )

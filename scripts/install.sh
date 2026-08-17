@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-python -m pip install -r requirements.txt
 python -m pip install -e ".[dev]"
 if [[ "${ZERO_BUILD_NATIVE:-1}" == "1" ]]; then
     export LIBTORCH_USE_PYTORCH="${LIBTORCH_USE_PYTORCH:-1}"

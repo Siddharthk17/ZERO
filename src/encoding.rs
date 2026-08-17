@@ -307,68 +307,6 @@ pub fn legal_policy_mask(board: &Board) -> PolicyMask {
     mask
 }
 
-#[must_use]
-pub const fn flip_policy_index_horizontally(index: usize) -> usize {
-    if index >= POLICY_SIZE {
-        return index;
-    }
-    let plane = index / 64;
-    let square = index & 63;
-    let flipped_square = (square & !7) | (7 - (square & 7));
-    let flipped_plane = if plane < 56 {
-        let direction = plane / 7;
-        let distance = plane % 7;
-        let reflected_direction = match direction {
-            0 => 0,
-            1 => 7,
-            2 => 6,
-            3 => 5,
-            4 => 4,
-            5 => 3,
-            6 => 2,
-            _ => 1,
-        };
-        reflected_direction * 7 + distance
-    } else if plane < 64 {
-        56 + (7 - (plane - 56))
-    } else {
-        let promotion = (plane - 64) / 3;
-        let direction = (plane - 64) % 3;
-        64 + promotion * 3 + (2 - direction)
-    };
-    flipped_plane * 64 + flipped_square
-}
-
-pub fn flip_augmentation(
-    input: &EncodedBoard,
-    policy: &[f32; POLICY_SIZE],
-    flipped_input: &mut EncodedBoard,
-    flipped_policy: &mut [f32; POLICY_SIZE],
-) {
-    for plane in 0..INPUT_CHANNELS {
-        for rank in 0..8 {
-            let row = plane * 64 + rank * 8;
-            for file in 0..8 {
-                flipped_input[row + (7 - file)] = input[row + file];
-            }
-        }
-    }
-    let extra = HISTORY * PIECE_PLANES_PER_HISTORY;
-    for square in 0..BOARD_SQUARES {
-        flipped_input.swap(
-            (extra + 1) * BOARD_SQUARES + square,
-            (extra + 2) * BOARD_SQUARES + square,
-        );
-        flipped_input.swap(
-            (extra + 3) * BOARD_SQUARES + square,
-            (extra + 4) * BOARD_SQUARES + square,
-        );
-    }
-    for (index, probability) in policy.iter().copied().enumerate() {
-        flipped_policy[flip_policy_index_horizontally(index)] = probability;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,8 +1,6 @@
-"""Tests for audit fixes: has_legal_moves, SharedBatchEvaluator close, checkpoint cleanup, edge cases."""
+"""Regression tests for chess rules, checkpoints, targets, and edge cases."""
 
 from __future__ import annotations
-
-import threading
 
 import pytest
 
@@ -61,35 +59,6 @@ def test_outcome_uses_has_legal_moves_consistency() -> None:
             assert board.outcome() is not None
         else:
             assert board.outcome() is None or board.outcome() == "1/2-1/2"
-
-
-# SharedBatchEvaluator close wakes pending requests
-def test_shared_batch_evaluator_close_wakes_pending() -> None:
-    """Closing the evaluator while requests are pending must not hang."""
-    from zero_chess.mcts import SharedBatchEvaluator, UniformEvaluator
-
-    evaluator = SharedBatchEvaluator(UniformEvaluator(), device="cpu", max_batch_size=2, max_wait_ms=1000.0)
-
-    # Submit a request from a thread to simulate a pending call
-    result_holder = {"error": None}
-
-    def submit():
-        try:
-            evaluator.evaluate_batch([Board()])
-        except Exception as exc:
-            result_holder["error"] = exc
-
-    t = threading.Thread(target=submit)
-    t.start()
-    # Give the thread time to queue its request
-    import time
-
-    time.sleep(0.05)
-
-    evaluator.close()
-    t.join(timeout=2.0)
-    assert not t.is_alive(), "Thread should have been woken up by close()"
-    assert result_holder["error"] is not None, "Pending request should have received an error"
 
 
 # CheckpointManager cleanup
@@ -247,23 +216,6 @@ def test_move_from_uci_invalid_length() -> None:
         Move.from_uci("e2e4e")
     with pytest.raises(ValueError):
         Move.from_uci("e2")
-
-
-def test_move_encode_decode_round_trip() -> None:
-
-    moves = [
-        Move(0, 16),
-        Move(4, 6, flags=4),  # KING_CASTLE
-        Move(52, 60, "Q", flags=33),  # promotion + capture
-        Move(12, 28, None, flags=2),  # double pawn
-    ]
-    for move in moves:
-        encoded = move.encode()
-        decoded = Move.decode(encoded)
-        assert decoded.from_sq == move.from_sq
-        assert decoded.to_sq == move.to_sq
-        assert decoded.promotion == move.promotion
-        assert decoded.flags == move.flags
 
 
 def test_move_lowercase_promotion_normalized() -> None:

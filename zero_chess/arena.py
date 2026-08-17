@@ -39,7 +39,7 @@ def play_match(
     evaluator_a,
     evaluator_b,
     *,
-    games: int = 40,
+    games: int = 80,
     simulations: int = 64,
     max_plies: int = 512,
     opening_random_plies: int = 4,
@@ -90,8 +90,8 @@ def play_match(
             previous = board.copy()
             board._push_unchecked(played)
             history.insert(0, previous)
-            mcts_a.advance_to(played)
-            mcts_b.advance_to(played)
+            mcts_a.advance_to(played, history=history)
+            mcts_b.advance_to(played, history=history)
 
         result = board.outcome() or "1/2-1/2"
         if result == "1/2-1/2":
@@ -135,6 +135,9 @@ def gate_checkpoints(
     opening_random_plies: int = 4,
     seed: int = 0,
     log_path: str | Path | None = None,
+    incumbent_deployment_path: str | Path | None = None,
+    batch_size: int = 8,
+    workers: int = 0,
 ) -> MatchResult:
     """Evaluate candidate A against incumbent B without changing either file."""
     result = _native_gate(
@@ -145,6 +148,9 @@ def gate_checkpoints(
         device=device,
         opening_random_plies=opening_random_plies,
         seed=seed,
+        incumbent_deployment_path=incumbent_deployment_path,
+        batch_size=batch_size,
+        workers=workers,
     )
     if log_path is not None:
         path = Path(log_path)
@@ -152,6 +158,18 @@ def gate_checkpoints(
         with path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(result.as_dict(), sort_keys=True) + "\n")
     return result
+
+
+def accept_gate_result(
+    result: MatchResult,
+    *,
+    min_score: float = 0.50,
+    min_lower_bound: float = 0.45,
+) -> bool:
+    """Apply the conservative, configurable candidate acceptance policy."""
+    if not 0.0 <= min_lower_bound <= min_score <= 1.0:
+        raise ValueError("gate score thresholds must satisfy 0 <= lower <= score <= 1")
+    return result.score_fraction >= min_score and result.score_low >= min_lower_bound
 
 
 def _native_gate(
@@ -163,6 +181,9 @@ def _native_gate(
     device: str,
     opening_random_plies: int,
     seed: int,
+    incumbent_deployment_path: str | Path | None,
+    batch_size: int,
+    workers: int,
 ) -> MatchResult:
     """Run gating through the same Rust MCTS/evaluator path as self-play."""
     try:
@@ -170,7 +191,7 @@ def _native_gate(
 
         engine = _engine()
         match_fn = getattr(engine, "evaluate_torchscript_match")
-    except (ImportError, OSError, AttributeError) as exc:
+    except (ImportError, OSError, AttributeError, RuntimeError) as exc:
         if os.environ.get("ZERO_GATE_NATIVE", "1") != "0":
             raise RuntimeError("native gate is unavailable; set ZERO_GATE_NATIVE=0 only for tests") from exc
         candidate = load_model(candidate_path, device)
@@ -186,9 +207,11 @@ def _native_gate(
 
     with tempfile.TemporaryDirectory(prefix="zero-gate-") as directory:
         candidate = load_model(candidate_path, device)
-        incumbent = load_model(incumbent_path, device)
         candidate_ts = export_torchscript(Path(directory) / "candidate.ts", candidate, device)
-        incumbent_ts = export_torchscript(Path(directory) / "incumbent.ts", incumbent, device)
+        incumbent_ts = Path(incumbent_deployment_path) if incumbent_deployment_path else None
+        if incumbent_ts is None or not incumbent_ts.exists():
+            incumbent = load_model(incumbent_path, device)
+            incumbent_ts = export_torchscript(Path(directory) / "incumbent.ts", incumbent, device)
         raw = match_fn(
             str(candidate_ts),
             str(incumbent_ts),
@@ -198,6 +221,8 @@ def _native_gate(
             seed=seed,
             max_plies=512,
             opening_random_plies=opening_random_plies,
+            batch_size=batch_size,
+            workers=workers,
         )
     wins_a = int(raw["wins_a"])
     wins_b = int(raw["wins_b"])

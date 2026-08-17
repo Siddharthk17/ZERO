@@ -5,9 +5,8 @@ from __future__ import annotations
 import math
 import random
 import time
-from collections import deque
 from dataclasses import dataclass, field
-from threading import Condition, Event, Thread, current_thread
+from threading import Event
 from typing import Protocol
 
 from .board import Board
@@ -60,157 +59,6 @@ class NetworkEvaluator:
         self, boards: list[Board], histories: list[list[Board] | None] | None = None
     ) -> list[tuple[dict[Move, float], float, float]]:
         return self.model.evaluate_batch(boards, self.device, histories=histories)
-
-
-@dataclass(slots=True)
-class _EvalRequest:
-    boards: list[Board]
-    histories: list[list[Board] | None]
-    done: Event = field(default_factory=Event)
-    results: list[tuple[dict[Move, float], float, float]] | None = None
-    error: BaseException | None = None
-
-
-class SharedBatchEvaluator:
-    """Coalesces evaluator calls from multiple self-play threads into large GPU batches."""
-
-    def __init__(
-        self,
-        model,
-        device: str = "cuda",
-        max_batch_size: int = 128,
-        max_wait_ms: float = 2.0,
-    ) -> None:
-        if max_batch_size <= 0:
-            raise ValueError("max_batch_size must be positive")
-        if max_wait_ms < 0.0:
-            raise ValueError("max_wait_ms cannot be negative")
-        self.model = model
-        self.device = device
-        self.max_batch_size = max_batch_size
-        self.max_wait_seconds = max_wait_ms / 1000.0
-        self._condition = Condition()
-        self._queue: deque[_EvalRequest] = deque()
-        self._queued_position_count = 0
-        self._closed = False
-        self.total_batches = 0
-        self.total_positions = 0
-        self.max_observed_batch = 0
-        if hasattr(self.model, "eval"):
-            self.model.eval()
-        self._worker = Thread(target=self._run, name="zero-gpu-batch-evaluator", daemon=True)
-        self._worker.start()
-
-    def evaluate_batch(
-        self,
-        boards: list[Board],
-        histories: list[list[Board] | None] | None = None,
-    ) -> list[tuple[dict[Move, float], float, float]]:
-        if not boards:
-            return []
-        if len(boards) > self.max_batch_size:
-            raise ValueError("a single evaluator request cannot exceed max_batch_size")
-        normalized_histories = list(histories) if histories is not None else [None] * len(boards)
-        if len(normalized_histories) != len(boards):
-            raise ValueError("histories must have the same length as boards")
-        request = _EvalRequest(list(boards), normalized_histories)
-        with self._condition:
-            if self._closed:
-                raise RuntimeError("SharedBatchEvaluator is closed")
-            self._queue.append(request)
-            self._queued_position_count += len(request.boards)
-            self._condition.notify_all()
-        request.done.wait()
-        if request.error is not None:
-            raise request.error
-        return request.results or []
-
-    def close(self) -> None:
-        """Signal shutdown and wake all pending requests to prevent threads from hanging."""
-        with self._condition:
-            if self._closed:
-                return
-            self._closed = True
-            for request in self._queue:
-                request.error = RuntimeError("SharedBatchEvaluator closed")
-                request.done.set()
-            self._queue.clear()
-            self._queued_position_count = 0
-            self._condition.notify_all()
-        if self._worker is not current_thread():
-            self._worker.join(timeout=5.0)
-
-    @property
-    def average_batch_size(self) -> float:
-        if self.total_batches <= 0:
-            return 0.0
-        return self.total_positions / self.total_batches
-
-    def _run(self) -> None:
-        while True:
-            requests = self._collect_requests()
-            if requests is None:
-                return
-            self._evaluate_requests(requests)
-
-    def _collect_requests(self) -> list[_EvalRequest] | None:
-        with self._condition:
-            while not self._queue and not self._closed:
-                self._condition.wait()
-            if self._closed and not self._queue:
-                return None
-
-            deadline = time.monotonic() + self.max_wait_seconds
-            while self._queued_positions() < self.max_batch_size and not self._closed:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                self._condition.wait(remaining)
-
-            requests: list[_EvalRequest] = []
-            positions = 0
-            while self._queue:
-                request = self._queue[0]
-                if requests and positions + len(request.boards) > self.max_batch_size:
-                    break
-                request = self._queue.popleft()
-                requests.append(request)
-                positions += len(request.boards)
-                self._queued_position_count -= len(request.boards)
-            return requests
-
-    def _queued_positions(self) -> int:
-        return self._queued_position_count
-
-    def _evaluate_requests(self, requests: list[_EvalRequest]) -> None:
-        flat_boards = [board for request in requests for board in request.boards]
-        flat_histories = [history for request in requests for history in request.histories]
-        try:
-            if isinstance(self.model, (UniformEvaluator, NetworkEvaluator)):
-                if isinstance(self.model, NetworkEvaluator):
-                    flat_results = self.model.evaluate_batch(flat_boards, flat_histories)
-                else:
-                    flat_results = self.model.evaluate_batch(flat_boards)
-            else:
-                flat_results = self.model.evaluate_batch(flat_boards, self.device)
-            if len(flat_results) != len(flat_boards):
-                raise RuntimeError("evaluator returned a result count different from its input batch")
-        except BaseException as exc:
-            for request in requests:
-                request.error = exc
-                request.done.set()
-            return
-
-        self.total_batches += 1
-        self.total_positions += len(flat_boards)
-        self.max_observed_batch = max(self.max_observed_batch, len(flat_boards))
-
-        offset = 0
-        for request in requests:
-            end = offset + len(request.boards)
-            request.results = flat_results[offset:end]
-            offset = end
-            request.done.set()
 
 
 @dataclass(slots=True)
@@ -554,7 +402,7 @@ class MCTS:
     def _evaluate_leaves(self, leaves: list[_Leaf]):
         boards = [leaf.board for leaf in leaves]
         histories = [leaf.history for leaf in leaves]
-        if isinstance(self.evaluator, (NetworkEvaluator, SharedBatchEvaluator)):
+        if isinstance(self.evaluator, NetworkEvaluator):
             return self.evaluator.evaluate_batch(boards, histories)
         return self.evaluator.evaluate_batch(boards)
 
@@ -680,7 +528,7 @@ class MCTS:
             self._resign_streak[board.turn] = 0
         return self._resign_streak.get(board.turn, 0) >= 10
 
-    def advance_to(self, move: Move) -> None:
+    def advance_to(self, move: Move, history: list[Board] | None = None) -> None:
         if move in self.root.children:
             self.root = self.root.children[move]
             if self.root_board is not None and move in self.root_board.legal_moves():
@@ -689,7 +537,7 @@ class MCTS:
             else:
                 self.root_board = None
             self.root_hash = None
-            self.root_context = None
+            self.root_context = _board_context(self.root_board, history) if self.root_board else None
             self._root_noise_applied = False
             self.transposition_table.clear()
             return
@@ -715,9 +563,10 @@ def _repetition_count(
 ) -> int:
     """Count the current position across external and simulated history."""
     key = board._position_key()
+    position_hash = board.zobrist_hash
     return (
         1
-        + sum(position._position_key() == key for position in history)
+        + sum(position.zobrist_hash == position_hash and position._position_key() == key for position in history)
         + sum(position_key == key for position_key in branch_positions)
     )
 

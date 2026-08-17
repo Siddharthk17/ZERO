@@ -17,11 +17,16 @@ import numpy as np
 # Policy size matches the AlphaZero 73-plane encoding (73 * 64 = 4672).
 _POLICY_SIZE = 73 * 64
 _TARGET_KINDS = {"terminal", "truncated", "adjudicated"}
-REPLAY_SCHEMA_VERSION = 2
+REPLAY_SCHEMA_VERSION = 3
 ENCODING_VERSION = "zero-x-121x73-v1"
 
 
-def _normalize_policy_keys(fen: str, policy: dict) -> dict[int, float]:
+def _normalize_policy_keys(
+    fen: str,
+    policy: dict,
+    *,
+    validate_legal: bool = True,
+) -> dict[int, float]:
     """Accept integer policy indices or UCI move strings and return ``{int: float}``.
 
     The production Rust self-play path emits sparse integer indices into the 4672-dim
@@ -36,6 +41,22 @@ def _normalize_policy_keys(fen: str, policy: dict) -> dict[int, float]:
 
     if not policy:
         return {}
+
+    # Native Rust self-play has already generated the sparse indices from the
+    # legal move mask. Validate the FEN syntax but avoid regenerating legal
+    # moves for every sample, while retaining the validating path for external
+    # callers.
+    if not validate_legal and all(not isinstance(key, str) for key in policy):
+        Board.from_fen(fen)
+        normalized: dict[int, float] = {}
+        for key, value in policy.items():
+            probability = float(value.item() if hasattr(value, "item") else value)
+            index = int(key)
+            if not isfinite(probability):
+                raise ValueError("policy target contains a non-finite probability")
+            if 0 <= index < _POLICY_SIZE:
+                normalized[index] = max(0.0, probability)
+        return normalized
 
     board = Board.from_fen(fen)
     legal_by_uci = {move.uci(): move_to_policy_index(board, move) for move in board.legal_moves()}
@@ -73,13 +94,20 @@ class Experience:
     history_fens: tuple[str, ...] = ()
     repetitions: int = 1
     history_repetitions: tuple[int, ...] = ()
+    policy_weight: float = 1.0
+    policy_validated: bool = False
 
     def __post_init__(self) -> None:
         self.fen = str(self.fen)
         self.target_kind = str(self.target_kind)
         if self.target_kind not in _TARGET_KINDS:
             raise ValueError(f"unsupported replay target kind: {self.target_kind!r}")
-        normalized_policy = _normalize_policy_keys(self.fen, self.policy)
+        self.policy_validated = bool(self.policy_validated)
+        normalized_policy = _normalize_policy_keys(
+            self.fen,
+            self.policy,
+            validate_legal=not self.policy_validated,
+        )
         normalized_policy = {
             index: max(0.0, float(value)) for index, value in normalized_policy.items() if isfinite(float(value))
         }
@@ -160,12 +188,28 @@ class Experience:
             max(1, min(255, int(value))) for value in self.history_repetitions[: len(self.history_fens)]
         )
         self.history_repetitions = history_repetitions + (1,) * (len(self.history_fens) - len(history_repetitions))
+        self.policy_weight = float(
+            self.policy_weight.item() if hasattr(self.policy_weight, "item") else self.policy_weight
+        )
+        if not isfinite(self.policy_weight):
+            raise ValueError("policy target weight must be finite")
+        self.policy_weight = min(1.0, max(0.0, self.policy_weight))
 
-    @property
-    def value(self) -> float:
-        if self.target_kind == "truncated":
-            return self.q_mcts
-        return 0.5 * (self.wdl[0] - self.wdl[2]) + 0.5 * self.q_mcts
+    def __setstate__(self, state) -> None:
+        """Load older replay records that predate weighted PCR targets."""
+        if isinstance(state, tuple) and len(state) == 2 and isinstance(state[1], dict):
+            state = state[1]
+        if not isinstance(state, dict):
+            raise ValueError("invalid replay experience state")
+        defaults = {
+            "policy_weight": 1.0,
+            "policy_validated": False,
+        }
+        for name in self.__slots__:
+            if name in state:
+                object.__setattr__(self, name, state[name])
+            elif name in defaults:
+                object.__setattr__(self, name, defaults[name])
 
 
 @dataclass(slots=True)
@@ -241,9 +285,9 @@ class PrioritizedReplayBuffer:
         self._lock = threading.Lock()
         self._save_lock = threading.Lock()
         self.metadata = {
+            **(metadata or {}),
             "schema_version": str(REPLAY_SCHEMA_VERSION),
             "encoding_version": ENCODING_VERSION,
-            **(metadata or {}),
         }
 
     def __len__(self) -> int:
@@ -252,19 +296,22 @@ class PrioritizedReplayBuffer:
 
     def add(self, exp: Experience) -> None:
         with self._lock:
-            priority = self._priority_from_error(exp.priority) if exp.priority > 0.0 else self._max_priority
-            self._max_priority = max(self._max_priority, priority)
-            if len(self.hot) < self.hot_capacity:
-                index = len(self.hot)
-                self.hot.append(exp)
-                self._generations.append(0)
-            else:
-                index = self._cursor
-                self.hot[index] = exp
-                self._generations[index] += 1
-                self._cursor = (self._cursor + 1) % self.hot_capacity
-            exp.priority = priority
-            self._tree.update(index, priority)
+            self._add_locked(exp)
+
+    def _add_locked(self, exp: Experience) -> None:
+        priority = self._priority_from_error(exp.priority) if exp.priority > 0.0 else self._max_priority
+        self._max_priority = max(self._max_priority, priority)
+        if len(self.hot) < self.hot_capacity:
+            index = len(self.hot)
+            self.hot.append(exp)
+            self._generations.append(0)
+        else:
+            index = self._cursor
+            self.hot[index] = exp
+            self._generations[index] += 1
+            self._cursor = (self._cursor + 1) % self.hot_capacity
+        exp.priority = priority
+        self._tree.update(index, priority)
 
     def sample_with_weights(self, batch_size: int, beta: float | None = None) -> SampleBatch:
         if batch_size <= 0:
@@ -343,8 +390,9 @@ class PrioritizedReplayBuffer:
 
     def extend(self, experiences: list[Experience]) -> None:
         """Add a batch of experiences sequentially."""
-        for exp in experiences:
-            self.add(exp)
+        with self._lock:
+            for exp in experiences:
+                self._add_locked(exp)
 
     def save(self, path: str | Path) -> None:
         """Persist the hot buffer and priorities to ``path`` via pickle."""

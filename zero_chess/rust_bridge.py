@@ -51,6 +51,7 @@ def generate_rust_self_play(
     batch_size: int = 256,
     device: str = "cuda",
     seed: int | None = None,
+    fast_search_weight: float = 0.25,
 ) -> Mapping[str, Any]:
     if num_games <= 0:
         raise ValueError("num_games must be positive")
@@ -58,9 +59,9 @@ def generate_rust_self_play(
         raise ValueError("simulations must be positive")
     if not 1 <= batch_size <= 256:
         raise ValueError("Rust evaluator batch_size must be in 1..=256")
-    if device != "cpu" and device != "cuda" and not (
-        device.startswith("cuda:") and device[6:].isdigit()
-    ):
+    if not 0.0 <= fast_search_weight <= 1.0:
+        raise ValueError("fast_search_weight must be in 0..=1")
+    if device != "cpu" and device != "cuda" and not (device.startswith("cuda:") and device[6:].isdigit()):
         raise ValueError("device must be cpu, cuda, or cuda:N")
     kwargs = {
         "model_path": model_path,
@@ -68,6 +69,7 @@ def generate_rust_self_play(
         "simulations": int(simulations),
         "batch_size": int(batch_size),
         "device": device,
+        "fast_search_weight": float(fast_search_weight),
     }
     if seed is not None:
         kwargs["seed"] = int(seed)
@@ -143,6 +145,8 @@ def ingest_rust_batch(replay: PrioritizedReplayBuffer, payload: Mapping[str, Any
                     history_fens=tuple(raw.get("history_fens", ())),
                     repetitions=int(raw.get("repetitions", 1)),
                     history_repetitions=tuple(raw.get("history_repetitions", ())),
+                    policy_weight=float(raw.get("policy_weight", 1.0)),
+                    policy_validated=True,
                 )
             )
     replay.extend(experiences)

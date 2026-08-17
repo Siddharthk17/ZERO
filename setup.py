@@ -21,10 +21,7 @@ class NativeBuildExt(build_ext):
         features = "libtorch,python-extension"
         environment = os.environ.copy()
         environment.setdefault("LIBTORCH_USE_PYTORCH", "1")
-        if (
-            environment.get("LIBTORCH_USE_PYTORCH") == "1"
-            and environment.get("ZERO_ALLOW_UNSUPPORTED_LIBTORCH") != "1"
-        ):
+        if environment.get("LIBTORCH_USE_PYTORCH") == "1" and environment.get("ZERO_ALLOW_UNSUPPORTED_LIBTORCH") != "1":
             raise RuntimeError(
                 "PyTorch-backed native builds require ZERO_ALLOW_UNSUPPORTED_LIBTORCH=1 "
                 "because tch 0.24.0 targets LibTorch 2.11.0"
